@@ -506,8 +506,11 @@ AV1G_FN void av1g_thresholds(int level, int sharpness, int bitdepth, int *limit,
 }
 
 /*
- * Filters the samples of one group of four along an edge.  p1 is at
- * job->p_off, p0 one stride step later, q0 two, q1 three.
+ * Filters one group of four samples along an edge.  p1 is at
+ * job->p_off + g * job->step, p0 one stride step later, q0 two, q1 three, so
+ * `g` is a *sample* offset along the edge (0, 4, 8, ...) - the kernels get a
+ * group index and have to multiply it by four.  Edge lengths are multiples of
+ * four because block boundaries are.
  */
 AV1G_FN void av1g_deblock_group(const Av1gDeblockJob *job,
                                 AV1G_GLOBAL av1g_px *plane, int g, int maxv) {

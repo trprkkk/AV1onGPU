@@ -109,8 +109,21 @@ class EngineDecoder final : public av1gpu::Decoder {
     if (!error) error = &local;
     error->clear();
 
+    FrameGeometry geom;
+    geom.width = syntax.width;
+    geom.height = syntax.height;
+    geom.bit_depth = syntax.bit_depth;
+    geom.ss_x = syntax.ss_x;
+    geom.ss_y = syntax.ss_y;
+    if (geom.width <= 0 || geom.height <= 0) {
+      *error = "frame has no size";
+      return -1;
+    }
+
     FramePlan plan;
-    if (!build_plan(syntax, &plan, error)) return -1;
+    if (!build_frame_plan(syntax, backend_->prepare(geom), options_,
+                          backend_->reference_capacity(), &plan, error))
+      return -1;
 
     int slot = -1;
     if (!backend_->decode(plan, true, out, &slot, &stats_, error)) return -1;
@@ -124,7 +137,29 @@ class EngineDecoder final : public av1gpu::Decoder {
   }
 
  private:
-  bool build_plan(const FrameSyntax& syntax, FramePlan* plan, std::string* error) {
+  std::unique_ptr<Backend> backend_;
+  BackendOptions options_;
+  DecodeStats stats_;
+  std::vector<int> held_slots_;
+};
+
+/* ------------------------------------------------------------------------- */
+/* plan building                                                              */
+/*                                                                             */
+/* This is a free function (not a member) so that tools and tests can build a  */
+/* plan for a backend they drive themselves - tests/opencl_pipeline.py uses it */
+/* to replay exactly the jobs the real backends submit.                        */
+/* ------------------------------------------------------------------------- */
+
+static int resolve_slot(const FrameSyntax& syntax, int ref_id) {
+  if (ref_id < 0) return -1;
+  if (ref_id >= static_cast<int>(syntax.reference_slots.size())) return -1;
+  return syntax.reference_slots[ref_id];
+}
+
+bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
+                      const BackendOptions& options, int reference_capacity,
+                      FramePlan* plan, std::string* error) {
     FrameGeometry geom;
     geom.width = syntax.width;
     geom.height = syntax.height;
@@ -135,7 +170,7 @@ class EngineDecoder final : public av1gpu::Decoder {
       *error = "frame has no size";
       return false;
     }
-    plan->layout = backend_->prepare(geom);
+    plan->layout = layout;
     const PlanLayout& g = plan->layout;
     plan->maxv = (1 << geom.bit_depth) - 1;
 
@@ -172,13 +207,13 @@ class EngineDecoder final : public av1gpu::Decoder {
       plan->ref_slot[i] = -1;
       if (i < static_cast<int>(syntax.reference_slots.size())) {
         const int s = syntax.reference_slots[i];
-        if (s >= 0 && s < backend_->reference_capacity()) plan->ref_slot[i] = s;
+        if (s >= 0 && s < reference_capacity) plan->ref_slot[i] = s;
       }
     }
 
     /* ---- wavefront schedule ---------------------------------------------- */
     DepGrid grid;
-    grid.init(geom.width, geom.height, options_.dependency_cell);
+    grid.init(geom.width, geom.height, options.dependency_cell);
     std::vector<int> block_wave(syntax.blocks.size(), 0);
     int max_wave = 0;
     for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
@@ -359,19 +394,9 @@ class EngineDecoder final : public av1gpu::Decoder {
 
     plan->blocks = static_cast<int>(syntax.blocks.size());
     return true;
-  }
+}
 
-  static int resolve_slot(const FrameSyntax& syntax, int ref_id) {
-    if (ref_id < 0) return -1;
-    if (ref_id >= static_cast<int>(syntax.reference_slots.size())) return -1;
-    return syntax.reference_slots[ref_id];
-  }
 
-  std::unique_ptr<Backend> backend_;
-  BackendOptions options_;
-  DecodeStats stats_;
-  std::vector<int> held_slots_;
-};
 
 } /* namespace internal */
 

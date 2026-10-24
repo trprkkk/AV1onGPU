@@ -165,6 +165,22 @@ def build_source():
     return header + "\n" + body.replace('#include "av1gpu_kernels.h"', "")
 
 
+def devices():
+    """All OpenCL devices, or an empty list when there is no usable runtime.
+
+    A container without an ICD loader makes clGetPlatformIDs raise instead of
+    returning zero platforms, which is a "not here" and not a test failure.
+    """
+    try:
+        import pyopencl as cl
+    except ImportError:
+        return []
+    try:
+        return [d for p in cl.get_platforms() for d in p.get_devices()]
+    except cl.LogicError:
+        return []
+
+
 def main():
     try:
         import numpy as np
@@ -173,11 +189,12 @@ def main():
         print("OpenCL self test skipped: %s" % exc)
         return 77
 
-    devices = [d for p in cl.get_platforms() for d in p.get_devices()]
-    if not devices:
-        print("OpenCL self test skipped: no device")
+    found = devices()
+    if not found:
+        print("OpenCL self test skipped: no OpenCL platform")
         return 77
-    device = devices[0]
+    devices_ = found
+    device = devices_[0]
     print("device: %s (%s)" % (device.name, device.version))
 
     source = build_source()
@@ -364,6 +381,47 @@ def main():
     queue.finish()
     out = download(flat_buf, flat.shape)
     check("deblock leaves flat areas alone", bool((out == flat).all()), True)
+
+    # A real edge, long enough for several groups: the kernel is launched once
+    # per group of four samples and the group helper wants a sample offset, so
+    # an edge that is more than four samples long catches an index mix-up.
+    step_of = 1
+    edge = np.full(stride * size, 24, dtype=np.uint16)
+    picture = edge.reshape(size, stride)
+    for row in range(8, 16):
+        picture[row, 6] = 40   # p1
+        picture[row, 7] = 40   # p0
+        picture[row, 8] = 48   # q0
+        picture[row, 9] = 48   # q1
+    db = DeblockJob()
+    db.p_off = 8 * stride + 6
+    db.stride = step_of          # steps across the edge
+    db.step = stride             # runs along it
+    db.len = 8                   # two groups, rows 8..15
+    db.level = 32                # limit 9, blimit 27, thresh 1
+    db.sharpness = 0
+    db.filter_len = 4            # narrow filter only
+    db.bitdepth = 8
+    dbuf = upload(np.frombuffer(db, dtype=np.uint8).copy())
+    dpref, dtotal = prefix([db.len // 4])
+    dpref_buf = upload(dpref)
+    edge_buf = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=edge)
+    launch(None, program.av1g_k_deblock, dtotal, dbuf, dpref_buf, np.int32(1),
+           np.int32(dtotal), edge_buf, np.int32(255))
+    queue.finish()
+    out = download(edge_buf, edge.shape).reshape(size, stride)
+    # f = -8 for this step edge (same formula as the host helper), so p0 and q0
+    # move one closed-form step towards each other on *every* row of the edge.
+    touched = out[8:16, 7].astype(int).tolist() + out[8:16, 8].astype(int).tolist()
+    check("deblock filters every row of a long edge",
+          bool(len(set(out[8:16, 7].astype(int).tolist())) == 1 and
+               len(set(out[8:16, 8].astype(int).tolist())) == 1 and
+               out[8, 7] == 48 and out[8, 8] == 40), True)
+    untouched = (out[:, :6] == 24).all() and (out[:, 10:] == 24).all()
+    untouched = untouched and (out[:8, 6:10] == 24).all() and (out[16:, 6:10] == 24).all()
+    # only p0/q0 move with the narrow filter, and only on the rows of the edge
+    untouched = untouched and (out[8:16, 6] == 40).all() and (out[8:16, 9] == 48).all()
+    check("deblock leaves the rest of the picture alone", bool(untouched), True)
 
     cd = CdefJob()
     cd.src_off = 8 * stride + 8

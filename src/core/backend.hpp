@@ -121,6 +121,13 @@ std::unique_ptr<Backend> create_cuda_backend(const BackendOptions& options,
 std::vector<DeviceInfo> list_opencl_devices();
 std::vector<DeviceInfo> list_cuda_devices();
 
+/* Turns decode syntax into the flat job plan a backend executes. `layout`
+ * comes from Backend::prepare() for the frame geometry, so the job offsets
+ * match the buffers that backend allocated. */
+bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
+                      const BackendOptions& options, int reference_capacity,
+                      FramePlan* plan, std::string* error);
+
 /* Runs deblock / CDEF / film grain on a host frame, exactly as the decoder
  * does. Used by encoders (including the synthetic one) so that their reference
  * frames do not drift. */

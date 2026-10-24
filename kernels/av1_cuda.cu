@@ -95,7 +95,8 @@ extern "C" __global__ void av1g_k_deblock(const Av1gDeblockJob *jobs,
                                           av1g_px *plane, int maxv) {
   AV1G_JOB_LOOKUP(job_idx, elem);
   Av1gDeblockJob job = jobs[job_idx];
-  av1g_deblock_group(&job, plane, elem, maxv);
+  /* elem is a group index; the group helper takes a sample offset */
+  av1g_deblock_group(&job, plane, elem * 4, maxv);
 }
 
 extern "C" __global__ void av1g_k_cdef(const Av1gCdefJob *jobs, const int *joff,

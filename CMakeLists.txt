@@ -117,7 +117,7 @@ endif()
 # tools and tests
 # ---------------------------------------------------------------------------
 if(AV1GPU_BUILD_TOOLS)
-  foreach(tool av1gpu_info av1gpu_bench av1gpu_play)
+  foreach(tool av1gpu_info av1gpu_bench av1gpu_play av1gpu_dump)
     add_executable(${tool} tools/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE av1gpu)
     set_target_properties(${tool} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -141,5 +141,16 @@ if(AV1GPU_BUILD_TESTS)
     add_test(NAME opencl_selftest
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_selftest.py)
     set_tests_properties(opencl_selftest PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Replays real decode plans through the OpenCL kernels and compares whole
+    # frames against the CPU reference decode. It needs the dump tool, which is
+    # only built with the tools, and pyopencl + a runtime.
+    if(TARGET av1gpu_dump)
+      add_test(NAME opencl_pipeline
+               COMMAND ${Python3_EXECUTABLE}
+                       ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_pipeline.py
+                       --dumper $<TARGET_FILE:av1gpu_dump>)
+      set_tests_properties(opencl_pipeline PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+    endif()
   endif()
 endif()

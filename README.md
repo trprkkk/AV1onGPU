@@ -105,6 +105,7 @@ src/core/post_filters.cpp     host deblock/CDEF/grain, shared with encoders
 src/backends/cpu/             reference backend (the correctness baseline)
 src/backends/opencl/          loader (dlopen) + backend
 src/backends/cuda/            loader (dlopen) + backend (NVRTC at run time)
+tools/                        info, bench, player, plan dumper (av1gpu_dump)
 tests/                        kernel unit tests, pipeline tests, OpenCL parity
 ```
 
@@ -141,10 +142,30 @@ cd build && ctest --output-on-failure
   compiler (pocl works) and checks a job of every kernel against values computed
   in Python. This is the test that catches kernel *source* errors, which the C++
   tests cannot see. It needs `pyopencl`; without it the test reports "skipped".
+* `opencl_pipeline.py` — the same, one level up: `av1gpu_dump` writes the real
+  decode plans of a clip, the test replays every job of every wave through the
+  actual OpenCL kernels in the order the backend submits them (waves, then
+  deblocking vertical/horizontal, CDEF, grain), and the whole frame has to match
+  the CPU reference decode bit for bit. It exercises job arrays, prefix tables,
+  launch counts, reference slots and loop filter scheduling together — the
+  things the per-kernel check cannot see. Also needs `pyopencl`.
 
 ```sh
 pip install pyopencl          # or pyopencl + pocl-binary-distribution
 python3 tests/opencl_selftest.py
+python3 tests/opencl_pipeline.py --frames 4 --qstep 6
+```
+
+`tests/` and this section assume Linux or macOS. On a machine without an ICD
+loader both OpenCL tests exit with 77 ("skipped") instead of failing, because
+that is a missing driver and not a wrong kernel; with pocl the two tests run on
+the CPU and still compile and execute the real kernel sources.
+
+```sh
+# PoCL in a scratch prefix, no ICD loader in the container
+export LD_LIBRARY_PATH=$POCL_LIBS:$PYOPENCL_LIBS
+export OPENCL_VENDOR_PATH=$PYOPENCL_LIBS
+ctest --test-dir build -R opencl --output-on-failure
 ```
 
 ## What is not here

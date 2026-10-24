@@ -20,7 +20,11 @@ not disagreements between backends.
   so that flat areas stay flat.
 * **Deblocking structure.** The job carries `level`, `sharpness`, tap length
   (4/6/8), plane and direction; the filter only ever moves samples towards each
-  other and is a no-op on flat areas (checked by the unit tests).
+  other and is a no-op on flat areas (checked by the unit tests). Vertical edges
+  are filtered before horizontal ones, as the specification orders them, because
+  a vertical and a horizontal edge cross: running both at once is a data race,
+  and it made `test_pipeline` fail roughly one run in five until the two passes
+  were separated.
 * **Film grain application.** Per 128×128 tile, per luma bucket LUT, added on
   top of the reconstructed picture with clipping.
 * **Colour conversion.** One integer matrix per (matrix, range, bit depth),
@@ -81,6 +85,28 @@ does this through `internal::apply_post_filters_host`, the same job builder the
 decoder uses. `test_pipeline` pins the property: the decoder output and the
 encoder's reconstruction agree to 99.00 dB — i.e. they are identical — for every
 frame of the clip, with deblock, CDEF and grain enabled.
+
+## How the GPU path is checked without a GPU
+
+Everything above is only worth as much as the evidence behind it, so there are
+three layers, all of them runnable on a machine with no GPU driver:
+
+1. `test_kernels` / `test_pipeline` — the shared scalar code on the host, and a
+   closed loop decode through the CPU backend.
+2. `tests/opencl_selftest.py` — compiles `kernels/av1_opencl.cl` with a real
+   OpenCL compiler (pocl) and checks one job of every kernel.
+3. `tests/opencl_pipeline.py` — `av1gpu_dump` writes the real decode plans of a
+   clip, the test replays *every* job of *every* wave through the real kernels in
+   backend order (waves, deblock vertical, deblock horizontal, CDEF, grain) and
+   compares whole frames against the CPU reference decode. Four frames, intra
+   and inter, all filters on: **bit identical**.
+
+The third layer is what found the deblocking group index bug: the kernel was
+handed a group number where the shared helper expects a sample offset, so edges
+longer than four samples were filtered in the wrong place. A flat test pattern
+cannot see that, and the per-kernel check had used one; the frame level test with
+a real edge and several groups does, and `opencl_selftest.py` now includes that
+case as well.
 
 ## Measured quality (synthetic clip, 640×360, CPU reference backend)
 
