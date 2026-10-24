@@ -194,7 +194,15 @@ stream. Instead:
   convention (`32768 - x`, counter after the probabilities, symbol counts per
   block level) before any syntax exists to get confused by.
 
-Until the syntax layer lands (see `docs/ROADMAP.md`), the
+* **The syntax layer is checked against the same trace.** The first block of
+  that frame is decoded end to end by `decode_intra_tile`: a 64x64 split, then a
+  32x32 block with skip 0, a quantiser delta of 2 (51 -> 53), y and chroma mode
+  SMOOTH_VERTICAL and a 32x32 transform - exactly the sequence dav1d's trace
+  shows for those bytes, in the same order. `tests/test_frontend.cpp` asserts
+  it, and asserts that parsing stops at the coefficient syntax rather than
+  inventing values for it.
+
+Until the coefficient and inter layers land (see `docs/ROADMAP.md`), the
 front-end can read the tile bytes but not yet interpret them; the trace replay
 above is what makes "the symbol reader is right" a demonstrated fact rather than
 a claim.

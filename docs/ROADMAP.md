@@ -36,6 +36,15 @@ The symbol reader is bit identical to dav1d's `msac`: replaying dav1d's own
 per-symbol trace of the fixture's key frame reproduces all **112,648 events**
 and the range coder state at every one of them (see `docs/ACCURACY.md`).
 
+**Started: the tile syntax.** `src/frontend/tile_decoder.hpp` walks a key
+frame's tile the way the bitstream describes it: superblocks, the partition
+tree (including the edge cases where only one direction can be split), skip,
+per-superblock quantiser deltas, intra modes with their angle deltas, chroma
+from luma, filter intra and the transform size, keeping the per-4x4 neighbour
+maps the contexts are built from. It produces a block tree, which is what the
+prediction and residual layers consume. It stops - with the block and the byte
+- where coefficient decoding starts, which is the next piece.
+
 **Started: the default probability tables.** `src/frontend/cdf.hpp` holds the
 specification's default tables for the partition symbol (all five block levels,
 all four contexts) and for skip, in the inverse-CDF layout the range decoder
@@ -48,11 +57,13 @@ syntax, and the syntax layer that turns symbols into `FrameSyntax`.
 
 **Next, in order:**
 
-1. *CDF tables and the tile syntax.* Finish the default tables (mode info,
-   transform and coefficient syntax), then the superblock/partition loop that
-   consumes them, plus `exit_symbol` and the end-of-frame CDF update. The trace
-   of the fixture is the oracle for each layer: every symbol must come out of
-   the tables and in the order dav1d decoded it.
+1. *Coefficients.* The last syntax layer: end of block position, base tokens,
+   the extended levels, signs, and the dequantisation that turns them into the
+   coefficients the engine's inverse transform takes. The trace of the fixture
+   is the oracle: every symbol must come out of the tables and in the order
+   dav1d decoded it. Then `exit_symbol` and the end-of-frame CDF update, which
+   close out the tile.
+2. *Inter frames.* Reference handling, motion vectors, the compound syntax.
 2. *Tile and partition tree.* Superblock loop, partition symbols, block sizes,
    transform selection, and the coefficient syntax with its scan tables. This is
    the bulk of the work and the point where the front-end first emits a

@@ -17,6 +17,7 @@
 #include "frontend/headers.hpp"
 #include "frontend/ivf.hpp"
 #include "frontend/obu.hpp"
+#include "frontend/tile_decoder.hpp"
 #include "frontend/tiles.hpp"
 #include "test_common.hpp"
 
@@ -904,6 +905,148 @@ void test_tile_group() {
         ParseStatus::Invalid);
 }
 
+
+/* Block sizes, partitions and transform sizes are all measured in 4x4 units,
+ * and every table in the syntax layer is indexed by those numbers. The helpers
+ * are small, so they are worth pinning directly: a wrong block level or a
+ * wrong quadrant size does not fail loudly, it decodes a plausible picture of
+ * the wrong shape. */
+void test_block_geometry() {
+  std::printf("block geometry\n");
+  /* the four legacy partitions of an 8x8 block, and the 4:1 sizes that only
+   * larger blocks can use */
+  CHECK(partition_subsize(kPartitionNone, kBlock8x8) == kBlock8x8);
+  CHECK(partition_subsize(kPartitionHorizontal, kBlock8x8) == kBlock8x4);
+  CHECK(partition_subsize(kPartitionVertical, kBlock8x8) == kBlock4x8);
+  CHECK(partition_subsize(kPartitionSplit, kBlock8x8) == kBlock4x4);
+  CHECK(partition_subsize(kPartitionHorizontal4, kBlock64x64) == kBlock64x16);
+  CHECK(partition_subsize(kPartitionVertical4, kBlock32x32) == kBlock8x32);
+  CHECK(partition_subsize(kPartitionHorizontalA, kBlock16x16) == kBlock8x8);
+
+  /* block levels are counted from the largest block down, because that is the
+   * order of the partition tables */
+  CHECK_EQ(block_level_of(kBlock128x128), 0);
+  CHECK_EQ(block_level_of(kBlock8x8), 4);
+  CHECK(square_block_size(4) == kBlock8x8);
+  CHECK(block_size_from_dims(8, 8) == kBlock32x32);
+  CHECK(block_size_from_dims(16, 4) == kBlock64x16);
+  CHECK(block_size_from_dims(3, 3) == kBlockSizeCount);
+
+  /* transforms: the block's transform is capped at 64x64, and a split halves
+   * the longer side, so 64x64 goes to 32x64 and then 32x32 */
+  CHECK(max_tx_size(8, 8) == (TxSize{3, 3}));
+  CHECK(max_tx_size(32, 32) == (TxSize{4, 4}));
+  CHECK(max_tx_size(4, 16) == (TxSize{2, 4}));
+  CHECK(split_tx_size(TxSize{4, 4}) == (TxSize{3, 4}));
+  CHECK(split_tx_size(TxSize{3, 4}) == (TxSize{3, 3}));
+  CHECK_EQ(max_tx_depth(TxSize{4, 4}), 4);
+  CHECK_EQ(tx_square_class(TxSize{2, 3}), 3);
+  CHECK_EQ(tx_min_class(TxSize{2, 3}), 2);
+  /* 4:2:0 chroma halves both sides, and never exceeds 32x32 */
+  CHECK(chroma_tx_size(TxSize{4, 4}, true, true) == (TxSize{3, 3}));
+  CHECK(chroma_tx_size(TxSize{0, 0}, true, true) == (TxSize{0, 0}));
+}
+
+/* The first block of a real key frame, symbol for symbol. dav1d's trace of this
+ * frame (see tests/data/tile_trace.hpp) starts with:
+ *
+ *   partition  64x64 -> split        (so a 32x32 block comes next)
+ *   partition  32x32 -> none
+ *   skip       0
+ *   delta_q    2                     (51 + 2 = 53, the frame's base_q_idx is 51)
+ *   y_mode     SMOOTH_VERTICAL (10)
+ *   uv_mode    SMOOTH_VERTICAL (10)
+ *   tx_depth   0                     (so the transform stays at 32x32)
+ *
+ * and then the block's coefficients. This checks that the block tree and mode
+ * info layer produces exactly that, and that it stops where the coefficient
+ * syntax starts instead of guessing at it. */
+void test_tile_decoder() {
+  std::printf("tile decoder (real key frame)\n");
+  const std::string path = std::string(AV1GPU_TEST_DATA_DIR) + "/svt_av1_320x240.ivf";
+  std::vector<uint8_t> data;
+  {
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    CHECK(file != nullptr);
+    if (!file) return;
+    uint8_t chunk[16384];
+    size_t got = 0;
+    while ((got = std::fread(chunk, 1, sizeof(chunk), file)) > 0)
+      data.insert(data.end(), chunk, chunk + got);
+    std::fclose(file);
+  }
+
+  IvfReader reader;
+  std::string error;
+  CHECK(reader.open(data, &error));
+  IvfFrame frame;
+  CHECK(reader.next(&frame, &error));
+
+  SequenceHeader seq;
+  FrameHeader header;
+  TileGroup group;
+  const uint8_t* tile = nullptr;
+  size_t tile_size = 0;
+  bool found = false;
+  std::vector<Obu> obus;
+  CHECK(split_obus(frame.payload.data(), frame.payload.size(), &obus, &error));
+  for (const Obu& obu : obus) {
+    if (obu.type == ObuType::SequenceHeader) {
+      CHECK(parse_sequence_header(obu.data, obu.size, &seq, &error) == ParseStatus::Ok);
+    } else if (obu.type == ObuType::Frame || obu.type == ObuType::FrameHeader) {
+      CHECK(parse_frame_header(seq, obu.data, obu.size, &header, &error) == ParseStatus::Ok);
+      CHECK(parse_tile_group(seq, header, obu.data, obu.size, &group, &error) ==
+            ParseStatus::Ok);
+      if (group.tiles.size() == 1) {
+        tile = obu.data + group.tiles[0].offset;
+        tile_size = group.tiles[0].size;
+        found = true;
+      }
+    }
+  }
+  CHECK(found);
+  if (!found) return;
+  CHECK_EQ(header.base_q_idx, 51);
+  CHECK(header.tx_mode_select);
+  CHECK(!header.allow_screen_content_tools);
+
+  TileDecodeResult result;
+  const ParseStatus status = decode_intra_tile(seq, header, tile, tile_size, &result, &error);
+  /* the block tree and the mode info are read; the residuals are not yet */
+  CHECK(status == ParseStatus::Unsupported);
+  CHECK(!result.complete);
+  CHECK_EQ(result.blocks_needing_residuals, 1);
+  CHECK(result.stop_reason.find("coefficient") != std::string::npos);
+  CHECK_EQ(result.blocks.size(), 1u);
+  if (result.blocks.size() == 1) {
+    const TileBlock& block = result.blocks[0];
+    CHECK_EQ(block.mi_row, 0);
+    CHECK_EQ(block.mi_col, 0);
+    CHECK(block.size == kBlock32x32);
+    CHECK(block.partition == kPartitionNone);
+    CHECK_EQ(block.block_level, 2);
+    CHECK(!block.skip);
+    CHECK_EQ(block.y_mode, kModeSmoothVertical);
+    CHECK_EQ(block.uv_mode, kModeSmoothVertical);
+    CHECK_EQ(block.y_angle, 0);
+    CHECK_EQ(block.qindex, 53);
+    CHECK(block.tx_size == (TxSize{3, 3}));
+    CHECK(block.has_chroma);
+  }
+  /* the split that produced that block was read before it, so the parser had
+   * to place the 32x32 block on the grid, not just read symbols in a row */
+  CHECK(result.bytes_used > 0);
+  CHECK(result.bytes_used < tile_size);
+
+  /* inter frames are refused rather than misparsed */
+  TileDecodeResult other;
+  FrameHeader inter = header;
+  inter.type = FrameType::Inter;
+  CHECK(decode_intra_tile(seq, inter, tile, tile_size, &other, &error) ==
+        ParseStatus::Unsupported);
+  CHECK(!error.empty());
+}
+
 } /* namespace */
 
 int main() {
@@ -914,7 +1057,9 @@ int main() {
   test_frame_header();
   test_inter_frame();
   test_segmentation();
+  test_block_geometry();
   test_tile_group();
+  test_tile_decoder();
   test_real_stream();
   return testing::finish("test_frontend");
 }
