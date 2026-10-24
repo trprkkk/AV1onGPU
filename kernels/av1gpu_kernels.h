@@ -133,11 +133,13 @@ typedef struct {
   int ref_x, ref_y;          /* patch position inside the reference plane */
   int ref_w, ref_h;          /* visible reference size, for clamping     */
   int border;                /* extra border samples available (0)       */
-  int mv0_x, mv0_y;   /* 1/8 pel, already scaled to the current plane     */
+  int mv0_x, mv0_y;   /* 1/8 pel, in *luma* samples, as the bitstream codes it */
   int mv1_x, mv1_y;
-  int filt;           /* AV1G_FILT_*                                      */
+  int sub_x, sub_y;   /* plane subsampling; the vector is halved per axis  */
+  int filt;           /* horizontal filter class, AV1G_FILT_*             */
+  int filt_v;         /* vertical filter class, AV1G_FILT_*               */
   int compound;       /* AV1G_COMPOUND_*                                  */
-  int w0, w1;         /* compound blend weights, sum == 64                */
+  int w0, w1;         /* compound blend weights, Q4, sum == 16            */
   int bitdepth;
 } Av1gInterJob;
 
@@ -256,7 +258,14 @@ typedef struct {
 #define AV1G_FILT_SMOOTH 1
 #define AV1G_FILT_SHARP 2
 #define AV1G_FILT_BILINEAR 3
-#define AV1G_FILT_COUNT 4
+/* the four tap versions of the regular and smooth filters, used per direction
+ * when the prediction block is only four samples wide (horizontal) or high
+ * (vertical). They are additional rows of the same table, not new classes. */
+#define AV1G_FILT_REGULAR_4TAP 4
+#define AV1G_FILT_SMOOTH_4TAP 5
+#define AV1G_FILT_ROWS 6
+#define AV1G_FILT_PHASES 16
+#define AV1G_FILT_TAPS 8
 
 #define AV1G_COMPOUND_NONE 0
 #define AV1G_COMPOUND_AVG 1
@@ -1192,13 +1201,25 @@ AV1G_FN void av1g_intra_block(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plan
 /* ------------------------------------------------------------------ */
 
 /*
- * Subpel filter tables are generated on the host and uploaded once:
- * layout filt -> 8 phases (1/8 pel) -> 8 taps, Q7, each row sums to 128.
- * Short filters (bilinear 2-tap, smooth 4-tap) are zero padded into the 8
- * tap slots so the device loop stays uniform.
+ * The subpel filter table is generated on the host and uploaded once:
+ * layout row -> 16 phases (1/16 pel) -> 8 taps, Q7, each row sums to 128.
+ * Rows 0..3 are AV1G_FILT_*; rows 4 and 5 are the four tap versions of the
+ * regular and smooth filters, used per direction for a block that is four
+ * samples wide (horizontal) or high (vertical). The four tap rows are zero
+ * padded into the eight tap slots, so one loop serves every class.
  */
-AV1G_FN int av1g_filt(AV1G_GLOBAL const int *tbl, int filt, int phase, int tap) {
-  return tbl[filt * 8 * 8 + phase * 8 + tap];
+AV1G_FN int av1g_filt(AV1G_GLOBAL const int *tbl, int row, int phase, int tap) {
+  return tbl[(row * AV1G_FILT_PHASES + phase) * AV1G_FILT_TAPS + tap];
+}
+
+/* The filter class per direction: a block only four samples wide uses the four
+ * tap regular/smooth filter horizontally, one only four samples high uses it
+ * vertically. Bilinear has no short version - it is two taps already. */
+AV1G_FN int av1g_filt_row(int cls, int extent) {
+  if (extent > 4) return cls;
+  if (cls == AV1G_FILT_REGULAR || cls == AV1G_FILT_SHARP) return AV1G_FILT_REGULAR_4TAP;
+  if (cls == AV1G_FILT_SMOOTH) return AV1G_FILT_SMOOTH_4TAP;
+  return cls;
 }
 
 /* fetch a reference sample with edge clamping */
@@ -1211,45 +1232,74 @@ AV1G_FN int av1g_fetch(AV1G_GLOBAL const av1g_px *p, int stride, int x, int y, i
   return (int)p[y * stride + x];
 }
 
+/* The two stage separable interpolation of one sample, in the specification's
+ * own arithmetic: the horizontal pass rounds by InterRound0 (3, or 5 at 12
+ * bit), which leaves the intermediate at 16 times the sample precision, and
+ * the vertical pass rounds by InterRound1 (11 for a single prediction, 7 for
+ * one half of a compound), which brings it back. Rounding the horizontal pass
+ * all the way down instead - the obvious thing to write - loses four bits of
+ * headroom and is off by one on roughly a third of all samples, so it has to be
+ * split exactly like this.
+ *
+ * A motion vector is in 1/8 luma samples: the phase into the 1/16 tables is
+ * (2 * mv) >> sub, and the integer part is the same value shifted four more
+ * bits, i.e. floor(mv / 8) in luma and floor(mv / 16) in chroma. Both are
+ * arithmetic shifts, which is what makes a negative vector land below the
+ * sample rather than above it. */
 AV1G_FN int av1g_inter_tap(const Av1gInterJob *job, AV1G_GLOBAL const av1g_px *ref,
                            int ref_off, int ref_stride, int x, int y, int mvx,
-                           int mvy, AV1G_GLOBAL const int *filters) {
-  const int xs = mvx >> 3, xf = mvx & 7;
-  const int ys = mvy >> 3, yf = mvy & 7;
+                           int mvy, AV1G_GLOBAL const int *filters,
+                           int compound) {
+  const int mx = mvx * 2, my = mvy * 2;
+  const int xs = mx >> (4 + job->sub_x), xf = (mx >> job->sub_x) & (AV1G_FILT_PHASES - 1);
+  const int ys = my >> (4 + job->sub_y), yf = (my >> job->sub_y) & (AV1G_FILT_PHASES - 1);
   const int bx0 = -job->border, bx1 = job->ref_w - 1 + job->border;
   const int by0 = -job->border, by1 = job->ref_h - 1 + job->border;
   /* absolute position of the patch origin inside the reference plane */
   const int ax = job->ref_x + x + xs;
   const int ay = job->ref_y + y + ys;
+  const int fh = av1g_filt_row(job->filt, job->w);
+  const int fv = av1g_filt_row(job->filt_v, job->h);
+  int round0 = job->bitdepth >= 12 ? 5 : 3;
+  int round1 = compound ? 7 : 11;
+  if (job->bitdepth >= 12 && !compound) round1 -= 2;
   int acc = 0, i, j;
-  for (j = 0; j < 8; ++j) {
+  for (j = 0; j < AV1G_FILT_TAPS; ++j) {
     int rowacc = 0;
-    for (i = 0; i < 8; ++i) {
+    for (i = 0; i < AV1G_FILT_TAPS; ++i) {
       const int s = av1g_fetch(ref + ref_off, ref_stride, ax - 3 + i, ay - 3 + j,
                                bx0, bx1, by0, by1);
-      rowacc += s * av1g_filt(filters, job->filt, xf, i);
+      rowacc += s * av1g_filt(filters, fh, xf, i);
     }
-    acc += ((rowacc + 64) >> 7) * av1g_filt(filters, job->filt, yf, j);
+    acc += ((rowacc + (1 << (round0 - 1))) >> round0) *
+           av1g_filt(filters, fv, yf, j);
   }
-  return (acc + 64) >> 7;
+  return (acc + (1 << (round1 - 1))) >> round1;
 }
 
 AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
                            AV1G_GLOBAL const av1g_px *ref0,
                            AV1G_GLOBAL const av1g_px *ref1,
                            AV1G_GLOBAL const int *filters, int x, int y, int maxv) {
+  const int compound = job->compound != AV1G_COMPOUND_NONE;
   const int v0 = av1g_inter_tap(job, ref0, job->ref0_off, job->ref0_stride, x, y,
-                                job->mv0_x, job->mv0_y, filters);
-  int acc = v0;
-  if (job->compound != AV1G_COMPOUND_NONE) {
+                                job->mv0_x, job->mv0_y, filters, compound);
+  int out = v0;
+  if (compound) {
     const int v1 = av1g_inter_tap(job, ref1, job->ref1_off, job->ref1_stride, x, y,
-                                  job->mv1_x, job->mv1_y, filters);
+                                  job->mv1_x, job->mv1_y, filters, 1);
+    /* Both halves are at 16 times the sample precision here, and
+     * InterPostRound (2 * FILTER_BITS - InterRound0 - InterRound1, so 4 at 8
+     * bit) is the shift that takes them back down. Neither half is clipped
+     * before the blend: the sum is what gets rounded and clipped. */
+    const int round0 = job->bitdepth >= 12 ? 5 : 3;
+    const int post = 2 * 7 - (round0 + 7);
     if (job->compound == AV1G_COMPOUND_AVG)
-      acc = (v0 + v1 + 1) >> 1;
+      out = (v0 + v1 + (1 << post)) >> (1 + post);
     else
-      acc = (job->w0 * v0 + job->w1 * v1 + 32) >> 6;
+      out = (job->w0 * v0 + job->w1 * v1 + (1 << (3 + post))) >> (4 + post);
   }
-  dst[job->dst_off + y * job->dst_stride + x] = (av1g_px)av1g_clip_px(acc, maxv);
+  dst[job->dst_off + y * job->dst_stride + x] = (av1g_px)av1g_clip_px(out, maxv);
 }
 
 #if !defined(AV1G_DEVICE)

@@ -143,13 +143,28 @@ void test_tables() {
       CHECK_EQ(sum, 16);
     }
 
-  /* subpel filters: every phase has unity DC gain and the halves are symmetric */
+  /* subpel filters: every phase of every row has unity DC gain, and the table
+   * is the specification's (phase 0 is a copy, the classes are symmetric about
+   * the half sample phase) */
   const int* filters = tables::filters().data();
-  for (int f = 0; f < AV1G_FILT_COUNT; ++f) {
-    for (int phase = 0; phase < 8; ++phase) {
+  for (int row = 0; row < AV1G_FILT_ROWS; ++row) {
+    for (int phase = 0; phase < AV1G_FILT_PHASES; ++phase) {
       int sum = 0;
-      for (int i = 0; i < 8; ++i) sum += filters[((f * 8) + phase) * 8 + i];
+      for (int i = 0; i < AV1G_FILT_TAPS; ++i)
+        sum += filters[(row * AV1G_FILT_PHASES + phase) * AV1G_FILT_TAPS + i];
       CHECK_EQ(sum, 128);
+    }
+  }
+  for (int row = 0; row < AV1G_FILT_ROWS; ++row) {
+    /* phase 0 is a straight copy: only the centre tap is non zero */
+    for (int i = 0; i < AV1G_FILT_TAPS; ++i)
+      CHECK_EQ(filters[(row * AV1G_FILT_PHASES + 0) * AV1G_FILT_TAPS + i],
+               i == 3 ? 128 : 0);
+    /* the half sample phase of every row is symmetric */
+    for (int i = 0; i < AV1G_FILT_TAPS / 2; ++i) {
+      const int a = filters[(row * AV1G_FILT_PHASES + 8) * AV1G_FILT_TAPS + i];
+      const int b = filters[(row * AV1G_FILT_PHASES + 8) * AV1G_FILT_TAPS + 7 - i];
+      CHECK_EQ(a, b);
     }
   }
   /* a constant input must stay constant through the filter */
@@ -168,6 +183,7 @@ void test_tables() {
     job.ref0_stride = w;
     job.ref1_stride = w;
     job.filt = AV1G_FILT_REGULAR;
+    job.filt_v = AV1G_FILT_REGULAR;
     job.mv0_x = 15; /* 1/8 pel, so the filter actually interpolates */
     job.mv0_y = 7;
     job.bitdepth = 8;
@@ -635,6 +651,7 @@ void test_inter() {
   job.ref0_stride = stride;
   job.ref1_stride = stride;
   job.filt = AV1G_FILT_REGULAR;
+  job.filt_v = AV1G_FILT_REGULAR;
   job.bitdepth = 8;
   std::vector<uint16_t> dst(static_cast<size_t>(stride) * 48, 0);
   av1g_inter_block(&job, dst.data(), ref.data(), ref.data(), tables::filters().data(), 255);
@@ -647,8 +664,8 @@ void test_inter() {
 
   /* compound average of two identical references equals the single prediction */
   job.compound = AV1G_COMPOUND_AVG;
-  job.w0 = 32;
-  job.w1 = 32;
+  job.w0 = 8;
+  job.w1 = 8;
   std::vector<uint16_t> dst2(dst);
   av1g_inter_block(&job, dst2.data(), ref.data(), ref.data(), tables::filters().data(), 255);
   int worst2 = 0;

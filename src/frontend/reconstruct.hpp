@@ -32,8 +32,17 @@
  *   - MaxLumaW/MaxLumaH for chroma from luma, which are the luma extent of the
  *     transform block being predicted.
  *
- * Only intra frames are planned. Inter frames need reference frames, motion
- * vectors and the compound syntax, which the front end does not read yet.
+ * Inter prediction does not need any of that bookkeeping: a block predicts from
+ * a reference picture at the position its motion vector names, and nothing it
+ * reads was written by this frame. What it does need is the *reference
+ * pictures*, so the caller hands them in as ReferenceInfo: the backend pool
+ * slot of each of the seven reference types, and the picture's own size.
+ *
+ * Not everything the syntax allows is reconstructed here yet. Warped motion,
+ * overlapped block motion compensation, inter/intra compound and the two masked
+ * compound modes are reported as unsupported rather than silently predicted as
+ * something else: a wrong prediction is a wrong frame, and the error message
+ * says which block would have needed the feature.
  */
 #ifndef AV1GPU_FRONTEND_RECONSTRUCT_HPP
 #define AV1GPU_FRONTEND_RECONSTRUCT_HPP
@@ -201,12 +210,84 @@ inline int intra_filter_type(const PlanState& st, int mi_row, int mi_col, int pl
   return above_smooth || left_smooth;
 }
 
+/* ------------------------------------------------------------------------- */
+/* inter prediction                                                          */
+/* ------------------------------------------------------------------------- */
+
+/* The reference pictures an inter frame names. Index 0..6 is the same index
+ * BlockSyntax::ref uses - LAST_FRAME through ALTREF_FRAME, minus one - and
+ * `slot` is the backend pool slot holding the picture, or -1 when the stream
+ * does not have that reference (which is a bug in the caller, not in the
+ * bitstream). `width`/`height` are the picture's own luma size, which a stream
+ * that changes resolution makes different from the current frame's; such a
+ * reference has to be resampled, which this stage does not do yet. */
+struct ReferenceInfo {
+  int slot[7] = {-1, -1, -1, -1, -1, -1, -1};
+  int width[7] = {0, 0, 0, 0, 0, 0, 0};
+  int height[7] = {0, 0, 0, 0, 0, 0, 0};
+};
+
+/* MAX_FRAME_DISTANCE: the clamp the distance weights apply to a frame
+ * distance. */
+constexpr int kMaxFrameDistance = 31;
+
+/* The distance weights process (specification 7.11.3.15): two weights, Q4 and
+ * summing to 16, that blend the two predictions of a COMPOUND_DISTANCE block
+ * according to how far each reference is from this frame in output order.
+ * `ref0`/`ref1` are reference type indices (0..6). */
+inline void distance_weights(const SequenceHeader& seq, const FrameHeader& frame, int ref0,
+                             int ref1, int out[2]) {
+  /* dist[0] is the first reference's distance, and the specification then reads
+   * them in the other order: d0 = dist[1], d1 = dist[0]. */
+  const int d0 = std::min(kMaxFrameDistance,
+                          std::abs(get_relative_dist(seq, frame.ref_order_hint[ref1],
+                                                     frame.order_hint)));
+  const int d1 = std::min(kMaxFrameDistance,
+                          std::abs(get_relative_dist(seq, frame.ref_order_hint[ref0],
+                                                     frame.order_hint)));
+  static const int kLookup[4][2] = {{9, 7}, {11, 5}, {12, 4}, {13, 3}};
+  static const int kWeight[4][2] = {{2, 3}, {2, 5}, {2, 7}, {1, kMaxFrameDistance}};
+  const int order = d0 <= d1 ? 1 : 0;
+  int i = 3;
+  if (d0 != 0 && d1 != 0) {
+    for (i = 0; i < 3; ++i) {
+      const int c0 = kWeight[i][order];
+      const int c1 = kWeight[i][1 - order];
+      if (order ? (d0 * c0 > d1 * c1) : (d0 * c0 < d1 * c1)) break;
+    }
+  }
+  out[0] = kLookup[i][order];
+  out[1] = kLookup[i][1 - order];
+}
+
+/* The bitstream numbers the subpel filters the way AV1G_FILT_* does, so this is
+ * a cast with a name and a default for the values a broken stream might carry.
+ * interp_filter[0] is the *vertical* filter and [1] the horizontal one, which is
+ * the opposite of the order the kernel takes them in. */
+inline FilterType to_filter_type(int filter) {
+  switch (filter) {
+    case 1: return FilterType::Smooth;
+    case 2: return FilterType::Sharp;
+    case 3: return FilterType::Bilinear;
+    default: return FilterType::Regular;
+  }
+}
+
+inline CompoundType to_compound_type(int compound) {
+  switch (compound) {
+    case kCompoundWeightedAverage: return CompoundType::Distance;
+    case kCompoundAverage: return CompoundType::Average;
+    default: return CompoundType::None;
+  }
+}
+
 /* Builds the FrameSyntax of one intra frame from what the tile decoder and the
  * dequantiser produced. Returns false with a message when the tile contains
  * syntax this stage cannot express. */
 inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
                            const TileDecodeResult& tile, const DequantisedTile& quant,
-                           FrameSyntax* out, std::string* error) {
+                           FrameSyntax* out, std::string* error,
+                           const ReferenceInfo* refs = nullptr) {
   std::string local;
   if (!error) error = &local;
   error->clear();
@@ -234,6 +315,15 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
   out->base_q_idx = frame.base_q_idx;
   out->sharpness = frame.loop_filter.sharpness;
   out->enable_intra_edge_filter = seq.enable_intra_edge_filter;
+
+  /* The seven reference types' backend slots, which every inter block's `ref`
+   * indexes. A frame that needs none of them (an intra frame, or an inter frame
+   * whose blocks are all intra) leaves the vector empty and nothing downstream
+   * has to care. */
+  if (refs) {
+    out->reference_slots.assign(7, -1);
+    for (int i = 0; i < 7; ++i) out->reference_slots[static_cast<size_t>(i)] = refs->slot[i];
+  }
 
   PlanState st;
   st.sb4 = seq.use_128x128_superblock ? 32 : 16;
@@ -295,6 +385,97 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
       if (ss_x && bw4 == 1) avail_l_chroma = avail_l && block.mi_col >= 2;
     }
 
+    /* ---- inter prediction ------------------------------------------------
+     * An inter prediction block is the whole *coding* block, not one transform
+     * block: the motion vector, the filters and the blend are block properties,
+     * and so is the rule that a block only four samples wide (or high) uses the
+     * four tap filters - a rule that would misfire if it were applied to a 4x4
+     * transform of a 32x32 block. So one BlockSyntax is built per plane here and
+     * the whole plane's transforms hang off it. */
+    bool inter = block.is_inter;
+    int ref_index[2] = {-1, -1};
+    int mv[2][2] = {{0, 0}, {0, 0}};
+    FilterType filter_h = FilterType::Regular, filter_v = FilterType::Regular;
+    CompoundType compound = CompoundType::None;
+    int blend[2] = {8, 8};
+    /* One prediction block per plane, filled in below and pushed once its
+     * transforms have been collected. */
+    BlockSyntax inter_block[3];
+    bool inter_used[3] = {false, false, false};
+    if (inter) {
+      if (block.interintra) {
+        *error = "reconstruct: inter/intra compound prediction is not implemented";
+        return false;
+      }
+      if (block.motion_mode == kMotionObmc) {
+        *error = "reconstruct: overlapped block motion compensation is not implemented";
+        return false;
+      }
+      if (block.motion_mode == kMotionWarped) {
+        *error = "reconstruct: warped motion is not implemented";
+        return false;
+      }
+      if (block.compound_type == kCompoundWedge || block.compound_type == kCompoundDiffwtd) {
+        *error = "reconstruct: masked compound prediction is not implemented";
+        return false;
+      }
+      const bool two_refs = block.compound_type != kCompoundNone;
+      for (int i = 0; i < (two_refs ? 2 : 1); ++i) {
+        const int type = block.ref_frame[i] - 1; /* kRefLast (1) -> index 0 */
+        if (type < 0 || type >= 7) {
+          *error = "reconstruct: inter block has no reference frame";
+          return false;
+        }
+        if (!refs || refs->slot[type] < 0) {
+          *error = "reconstruct: the frame the block predicts from is missing";
+          return false;
+        }
+        if (refs->width[type] != width || refs->height[type] != height) {
+          *error = "reconstruct: scaled reference frames are not implemented";
+          return false;
+        }
+        ref_index[i] = type;
+      }
+      for (int i = 0; i < 2; ++i) {
+        mv[i][0] = block.mv[i][0];
+        mv[i][1] = block.mv[i][1];
+      }
+      filter_h = to_filter_type(block.interp_filter[1]);
+      filter_v = to_filter_type(block.interp_filter[0]);
+      compound = to_compound_type(block.compound_type);
+      if (compound == CompoundType::Distance)
+        distance_weights(seq, frame, ref_index[0], ref_index[1], blend);
+      for (int plane = 0; plane < 3; ++plane) {
+        if (plane > 0 && seq.monochrome) break;
+        const int sub_x = plane > 0 && ss_x ? 1 : 0;
+        const int sub_y = plane > 0 && ss_y ? 1 : 0;
+        BlockSyntax& bs = inter_block[plane];
+        bs.plane = plane;
+        /* The chroma block of a 4x4 luma block in 4:2:0 covers 8x8 luma, which
+         * is two luma blocks in each direction, so its size is not simply the
+         * luma size halved: (bw4 + 1) >> 1 chroma 4x4 units. */
+        bs.x = (block.mi_col >> sub_x) * 4;
+        bs.y = (block.mi_row >> sub_y) * 4;
+        bs.w = ((bw4 + sub_x) >> sub_x) * 4;
+        bs.h = ((bh4 + sub_y) >> sub_y) * 4;
+        bs.bit_depth = seq.bit_depth;
+        bs.is_intra = false;
+        bs.lossless = lossless;
+        bs.ref[0] = ref_index[0];
+        bs.ref[1] = ref_index[1];
+        bs.mv[0][0] = mv[0][0];
+        bs.mv[0][1] = mv[0][1];
+        bs.mv[1][0] = mv[1][0];
+        bs.mv[1][1] = mv[1][1];
+        bs.filter = filter_h;
+        bs.filter_v = filter_v;
+        bs.compound = compound;
+        bs.blend[0] = blend[0];
+        bs.blend[1] = blend[1];
+        inter_used[plane] = false;
+      }
+    }
+
     for (const TileTransform& transform : block.transforms) {
       const int plane = transform.plane;
       if (plane > 0 && seq.monochrome) continue;
@@ -323,22 +504,27 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
       const int block_y = (block.mi_row >> sub_y) * 4;
 
       BlockSyntax bs;
-      bs.plane = plane;
-      bs.x = start_x;
-      bs.y = start_y;
-      bs.w = tx.width();
-      bs.h = tx.height();
-      bs.bit_depth = seq.bit_depth;
-      bs.is_intra = true;
-      bs.lossless = lossless;
+      if (inter) {
+        bs = inter_block[plane];
+        inter_used[plane] = true;
+      } else {
+        bs.plane = plane;
+        bs.x = start_x;
+        bs.y = start_y;
+        bs.w = tx.width();
+        bs.h = tx.height();
+        bs.bit_depth = seq.bit_depth;
+        bs.is_intra = true;
+        bs.lossless = lossless;
+      }
 
       /* Chroma from luma is a prediction mode of its own: the engine has to
        * know, both to run the CfL prediction and to make the block wait for
        * the co-located luma. It carries the alpha separately. */
-      const bool is_cfl = plane > 0 && block.uv_mode == kModeChromaFromLuma;
+      const bool is_cfl = !inter && plane > 0 && block.uv_mode == kModeChromaFromLuma;
       bs.mode = to_prediction_mode(plane == 0 ? block.y_mode : block.uv_mode);
       bs.angle_delta = plane == 0 ? block.y_angle : (is_cfl ? 0 : block.uv_angle);
-      if (plane == 0 && block.filter_intra) {
+      if (!inter && plane == 0 && block.filter_intra) {
         bs.use_filter_intra = true;
         bs.filter_intra_mode = to_filter_intra_mode(block.filter_intra_mode);
       }
@@ -353,8 +539,8 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
                                          plane == 0 ? avail_l : avail_l_chroma);
 
       TransformBlock tb;
-      tb.x = 0;
-      tb.y = 0;
+      tb.x = start_x - bs.x;
+      tb.y = start_y - bs.y;
       tb.w = tx.width();
       tb.h = tx.height();
       tb.eob = transform.eob;
@@ -363,12 +549,22 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
         tb.coef_offset = static_cast<int>(quant.offsets[next_offset]);
       }
       ++next_offset;
-      bs.transforms.push_back(tb);
-      out->blocks.push_back(bs);
+      if (inter) {
+        /* one prediction block per plane carries every transform of that plane */
+        inter_block[plane].transforms.push_back(tb);
+      } else {
+        bs.transforms.push_back(tb);
+        out->blocks.push_back(bs);
+      }
 
       /* The transform block counts as decoded once it is reconstructed, and
        * that is what the neighbours' above-right / below-left questions read. */
       st.decoded[plane].fill(grid_x, grid_y, grid_x + step_x, grid_y + step_y, 1);
+    }
+
+    if (inter) {
+      for (int plane = 0; plane < 3; ++plane)
+        if (inter_used[plane]) out->blocks.push_back(inter_block[plane]);
     }
   }
 

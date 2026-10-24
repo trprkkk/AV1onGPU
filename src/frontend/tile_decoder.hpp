@@ -141,8 +141,10 @@ constexpr CompoundModePair kCompoundModePairs[8] = {
 /* How the two predictions of a compound block are combined. The order is the
  * reference decoders' (it puts the two plain averages next to each other so a
  * comparison means "both are averages"), and the values are what the context
- * derivations test. */
-enum CompoundType {
+ * derivations test. The name says Mode because av1gpu::CompoundType is the
+ * engine's smaller version of the same idea: this one is what the bitstream
+ * codes, that one is what a prediction job can actually do. */
+enum CompoundMode {
   kCompoundNone = 0,
   kCompoundWeightedAverage = 1, /* distance weighted, the jnt_comp symbol */
   kCompoundAverage = 2,

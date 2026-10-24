@@ -272,8 +272,13 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
           }
           block.is_intra = false;
           block.ref[0] = 0;
-          block.mv[0][0] = best_mv_x << 3; /* 1/8 pel, integer MV  */
-          block.mv[0][1] = best_mv_y << 3;
+          /* The motion vector is in 1/8 *luma* samples, so a displacement
+           * measured on a subsampled plane has to be doubled per subsampled
+           * axis to mean the same thing. Integer vectors only, so the phase
+           * stays zero. */
+          const int mv_shift = 3 + (plane ? ss : 0);
+          block.mv[0][0] = best_mv_x << mv_shift;
+          block.mv[0][1] = best_mv_y << mv_shift;
           block.filter = FilterType::Regular;
           block.compound = CompoundType::None;
 
@@ -292,6 +297,9 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
           job.ref0_stride = reference->stride[plane];
           job.ref1_stride = reference->stride[plane];
           job.filt = AV1G_FILT_REGULAR;
+          job.filt_v = AV1G_FILT_REGULAR;
+          job.sub_x = plane ? ss : 0;
+          job.sub_y = plane ? ss : 0;
           job.compound = AV1G_COMPOUND_NONE;
           job.bitdepth = cfg.bit_depth;
           std::vector<uint16_t> tmp(static_cast<size_t>(w) * h, 0);

@@ -48,14 +48,6 @@ ParseStatus check_trailing_bits(BitReader* reader, std::string* error) {
 /* Width of each segmentation feature value, in specification order. */
 constexpr int kSegFeatureBits[kSegFeatureCount] = {8, 6, 6, 6, 6, 3, 1, 1};
 
-/* get_relative_dist(): sign extended distance between two order hints. */
-int get_relative_dist(const SequenceHeader& seq, int a, int b) {
-  if (!seq.enable_order_hint) return 0;
-  int diff = a - b;
-  const int m = 1 << (seq.order_hint_n_bits - 1);
-  return (diff & (m - 1)) - (diff & m);
-}
-
 /* decode_subexp(): AV1's subexponential code, used for the global motion
  * parameters. It is a bit reader construct (not arithmetic coded), so it lives
  * here rather than in the range decoder. */
@@ -232,6 +224,14 @@ void compute_skip_mode(const SequenceHeader& seq, FrameHeader& h, BitReader* r) 
 
 
 } /* namespace */
+
+/* get_relative_dist(): sign extended distance between two order hints. */
+int get_relative_dist(const SequenceHeader& seq, int a, int b) {
+  if (!seq.enable_order_hint) return 0;
+  int diff = a - b;
+  const int m = 1 << (seq.order_hint_n_bits - 1);
+  return (diff & (m - 1)) - (diff & m);
+}
 
 int project_mv_component(int mv, int num, int den) {
   /* 2^14 / den, rounded, for the denominators the projection can produce */

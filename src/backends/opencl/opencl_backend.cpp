@@ -209,7 +209,7 @@ class OpenCLBackend final : public Backend {
       api_.EnqueueWriteBuffer(queue_, coef_, opencl::CL_TRUE, 0,
                               plan.coefficients.size() * sizeof(int),
                               plan.coefficients.data(), 0, nullptr, nullptr);
-    ensure(&tmp_, &tmp_cap_, (plan.coefficients.size() + 1) * sizeof(int));
+    ensure(&tmp_, &tmp_cap_, (plan.tmp_size + 1) * sizeof(int));
     if (!plan.residual.empty()) {
       ensure(&residual_, &residual_cap_, (plan.residual.size() + 1) * sizeof(int));
       api_.EnqueueWriteBuffer(queue_, residual_, opencl::CL_TRUE, 0,
@@ -526,7 +526,8 @@ class OpenCLBackend final : public Backend {
   }
 
  private:
-  static constexpr int kReferenceSlots = 6;
+  /* one pool slot per AV1 reference slot; see the CPU backend */
+  static constexpr int kReferenceSlots = 8;
 
   void shutdown() {
     for (auto& entry : kernels_) {
@@ -742,7 +743,7 @@ class OpenCLBackend final : public Backend {
   size_t job_a_cap_ = 0, pref_a_cap_ = 0, pref_b_cap_ = 0;
   int max_local_ = 0;
   std::vector<uint16_t> staging_;
-  bool slots_[kReferenceSlots] = {false, false, false, false, false, false};
+  bool slots_[kReferenceSlots] = {};
   int last_slot_ = -1;
 };
 

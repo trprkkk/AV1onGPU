@@ -85,6 +85,11 @@ struct FramePlan {
   /* Coefficient pool, indexed by Av1gItxJob::coef_off. */
   std::vector<int32_t> coefficients;
   std::vector<int32_t> residual;
+  /* Size of the inverse transform scratch buffer, indexed by
+   * Av1gItxJob::tmp_off. A job needs w * h ints, which is not the same as its
+   * coefficient area (that one is clipped to 32 samples wide for a 64 point
+   * transform, because only the low 32x32 quarter is coded). */
+  size_t tmp_size = 0;
 
   std::vector<WaveJobs> waves;
 
@@ -165,7 +170,9 @@ namespace tables {
  * the row and column passes of the inverse transform. */
 int tx_row_shift(int w, int h);
 
-/* Q7 subpel filters: AV1G_FILT_COUNT filters x 8 phases x 8 taps. */
+/* The specification's Subpel_Filters: AV1G_FILT_ROWS rows (the four filter
+ * classes and their two four tap variants) x 16 phases (1/16 pel) x 8 taps,
+ * Q7, laid out row major. */
 const std::vector<int>& filters();
 
 /* Generates the film grain template for a seed, as the AV1 spec's

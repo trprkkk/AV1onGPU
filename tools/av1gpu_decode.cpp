@@ -2,10 +2,10 @@
  * AV1onGPU - decode a real AV1 file
  *
  * This is the tool that turns the front end into pictures: it reads an .ivf,
- * walks the OBUs, decodes the tile of each intra frame, plans the frame for the
- * engine and lets a backend reconstruct it. Until inter prediction lands, only
- * key frames and intra-only frames are decodable, which is why every other
- * frame is reported and skipped rather than guessed at.
+ * walks the OBUs, decodes each frame's tile, plans the frame for the engine and
+ * lets a backend reconstruct it. Frames are decoded in output order, so the
+ * picture of a frame stays in the backend's reference pool for the frames that
+ * name it; `show_existing_frame` outputs a picture that is already there.
  *
  *   av1gpu_decode clip.ivf -o out.yuv
  *   av1gpu_decode clip.ivf -o out.yuv --compare reference.yuv
@@ -235,6 +235,56 @@ int main(int argc, char** argv) {
   size_t reference_offset = 0;
   int comparisons = 0, exact = 0;
 
+  /* The decoder's own reference pool. AV1 has eight reference slots; each holds
+   * a backend pool slot, and - because a show_existing_frame has to output a
+   * picture that was decoded earlier - a copy of the picture. A stream may
+   * refresh several AV1 slots with one picture, so a backend slot is only
+   * released when no AV1 slot names it any more. */
+  int pool_slot[8];
+  Frame pool_picture[8];
+  bool pool_picture_valid[8] = {false, false, false, false, false, false, false, false};
+  for (int i = 0; i < 8; ++i) pool_slot[i] = -1;
+
+  auto release_if_unused = [&](int slot) {
+    if (slot < 0) return;
+    for (int i = 0; i < 8; ++i)
+      if (pool_slot[i] == slot) return;
+    decoder->release_reference(slot);
+  };
+
+  /* Writes one picture to the output and compares it with the reference, if
+   * there is one. A frame that is shown twice (show_existing_frame) goes
+   * through here twice, which is what the reference decoder's output has. */
+  auto emit_picture = [&](const Frame& picture, int ss_x, int ss_y) {
+    std::vector<uint8_t> yuv;
+    frame_to_yuv8(picture, &yuv);
+    if (out_file && !yuv.empty()) std::fwrite(yuv.data(), 1, yuv.size(), out_file);
+    if (reference.empty()) return;
+    Frame expected(picture.width, picture.height, picture.bit_depth, ss_x, ss_y);
+    const size_t frame_size = static_cast<size_t>(picture.width) * picture.height +
+                              ((ss_x ? (picture.width + 1) / 2 : picture.width) *
+                               (ss_y ? (picture.height + 1) / 2 : picture.height)) * 2;
+    if (reference_offset + frame_size > reference.size()) {
+      std::printf("  reference is too short for another frame\n");
+      return;
+    }
+    const uint8_t* src = reference.data() + reference_offset;
+    const int ss[3][2] = {{0, 0}, {ss_x, ss_y}, {ss_x, ss_y}};
+    size_t at = 0;
+    for (int p = 0; p < 3; ++p) {
+      const int w = picture.width >> ss[p][0], h = picture.height >> ss[p][1];
+      for (int y = 0; y < h; ++y) {
+        uint16_t* dst = expected.plane(p) + static_cast<size_t>(y) * expected.stride[p];
+        for (int x = 0; x < w; ++x) dst[x] = src[at++];
+      }
+    }
+    report_difference(picture, expected, "reference");
+    ++comparisons;
+    const Psnr psnr = frame_psnr(picture, expected);
+    if (psnr.y >= 99.0 && psnr.u >= 99.0 && psnr.v >= 99.0) ++exact;
+    reference_offset += frame_size;
+  };
+
   for (size_t index = 0; index < units.size(); ++index) {
     std::vector<Obu> obus;
     if (!split_obus(units[index].payload.data(), units[index].payload.size(), &obus, &error)) {
@@ -272,16 +322,28 @@ int main(int argc, char** argv) {
         refresh_ref_pool(frame, &refs);
         continue;
       }
+      if (std::getenv("AV1GPU_FRAMES"))
+        std::fprintf(stderr,
+                     "HDR unit=%zu type=%s show=%d showable=%d oh=%d refresh=0x%02x existing=%d "
+                     "primary=%d refs=%d,%d,%d,%d,%d,%d,%d\n",
+                     index, frame_type_name(frame.type), frame.show_frame ? 1 : 0,
+                     frame.showable_frame ? 1 : 0, frame.order_hint,
+                     frame.refresh_frame_flags, frame.existing_frame_idx,
+                     frame.primary_ref_frame, frame.ref_frame_idx[0], frame.ref_frame_idx[1],
+                     frame.ref_frame_idx[2], frame.ref_frame_idx[3], frame.ref_frame_idx[4],
+                     frame.ref_frame_idx[5], frame.ref_frame_idx[6]);
       if (frame.show_existing_frame) {
-        std::printf("frame %zu: show_existing_frame %d, skipped\n", index,
-                    frame.existing_frame_idx);
-        refresh_ref_pool(frame, &refs);
-        continue;
-      }
-      if (frame.type != FrameType::Key && frame.type != FrameType::IntraOnly) {
-        std::printf("frame %zu: %s, inter prediction is not implemented\n", index,
-                    frame_type_name(frame.type));
-        refresh_ref_pool(frame, &refs);
+        const int which = frame.existing_frame_idx;
+        if (which < 0 || which >= 8 || !pool_picture_valid[which]) {
+          std::printf("frame %zu: show_existing_frame %d names a slot that was never"
+                      " decoded\n", index, which);
+          status = 1;
+          break;
+        }
+        std::printf("frame %zu: show_existing_frame %d\n", index, which);
+        const Frame& shown = pool_picture[which];
+        emit_picture(shown, shown.ss_x, shown.ss_y);
+        ++decoded_frames;
         continue;
       }
 
@@ -302,8 +364,8 @@ int main(int argc, char** argv) {
 
       const TileExtent& tile = group.tiles[0];
       TileDecodeResult decoded;
-      const ParseStatus tile_status =
-          decode_intra_tile(seq, frame, obu.data + tile.offset, tile.size, &decoded, &tile_error);
+      const ParseStatus tile_status = decode_tile(seq, frame, &refs, obu.data + tile.offset,
+                                                  tile.size, &decoded, &tile_error);
       if (tile_status != ParseStatus::Ok) {
         std::printf("frame %zu: tile: %s\n", index,
                     decoded.stop_reason.empty() ? tile_error.c_str()
@@ -315,8 +377,20 @@ int main(int argc, char** argv) {
       DequantisedTile quant;
       dequantise_tile(frame, seq.bit_depth, decoded, &quant);
 
+      /* Which backend slot each of the seven reference types names. The frame
+       * header resolves the type to one of the eight AV1 slots (`ref_frame_idx`)
+       * and the pool says what that slot holds. */
+      ReferenceInfo reference_info;
+      for (int i = 0; i < 7; ++i) {
+        const int which = frame.ref_frame_idx[i];
+        if (which < 0 || which >= 8 || !refs.slots[which].valid) continue;
+        reference_info.slot[i] = pool_slot[which];
+        reference_info.width[i] = refs.slots[which].width;
+        reference_info.height[i] = refs.slots[which].height;
+      }
+
       FrameSyntax syntax;
-      if (!plan_from_tile(seq, frame, decoded, quant, &syntax, &error)) {
+      if (!plan_from_tile(seq, frame, decoded, quant, &syntax, &error, &reference_info)) {
         std::printf("frame %zu: %s\n", index, error.c_str());
         status = 1;
         break;
@@ -326,14 +400,21 @@ int main(int argc, char** argv) {
         const int limit = std::atoi(dump);
         for (int i = 0; i < limit && i < static_cast<int>(syntax.blocks.size()); ++i) {
           const BlockSyntax& b = syntax.blocks[i];
-          std::printf("  block %d: plane %d at (%d,%d) %dx%d mode %d angle %d cfl %d "
-                      "L%d A%d AR%d BL%d ft %d eob %d tx %d off %d\n",
-                      i, b.plane, b.x, b.y, b.w, b.h, static_cast<int>(b.mode), b.angle_delta,
+          std::printf("  block %d: plane %d at (%d,%d) %dx%d intra %d mode %d angle %d cfl %d "
+                      "L%d A%d AR%d BL%d ft %d eob %d tx %d off %d",
+                      i, b.plane, b.x, b.y, b.w, b.h, b.is_intra ? 1 : 0,
+                      static_cast<int>(b.mode), b.angle_delta,
                       b.cfl_alpha, b.have_left ? 1 : 0, b.have_above ? 1 : 0,
                       b.have_above_right, b.have_below_left, b.filter_type,
                       b.transforms.empty() ? -1 : b.transforms[0].eob,
                       b.transforms.empty() ? -1 : static_cast<int>(b.transforms[0].tx_type),
                       b.transforms.empty() ? -1 : b.transforms[0].coef_offset);
+          if (!b.is_intra)
+            std::printf(" refs %d,%d mv %d,%d %d,%d filt %d/%d comp %d blend %d,%d",
+                        b.ref[0], b.ref[1], b.mv[0][0], b.mv[0][1], b.mv[1][0], b.mv[1][1],
+                        static_cast<int>(b.filter), static_cast<int>(b.filter_v),
+                        static_cast<int>(b.compound), b.blend[0], b.blend[1]);
+          std::printf("\n");
         }
       }
       if (const char* which = std::getenv("AV1GPU_DUMP_COEF")) {
@@ -350,54 +431,48 @@ int main(int argc, char** argv) {
           }
         }
       }
-      if (std::getenv("AV1GPU_NO_RESIDUAL")) {
+      if (std::getenv("AV1GPU_NO_RESIDUAL") &&
+          (std::getenv("AV1GPU_NO_RESIDUAL")[0] != '2' ||
+           frame.type == FrameType::Inter)) {
         for (BlockSyntax& b : syntax.blocks)
           for (TransformBlock& tx : b.transforms) tx.eob = 0;
       }
 
       Frame picture;
-      if (!decoder->decode(syntax, &picture, &error)) {
+      const int slot = decoder->decode_reference(syntax, &picture, &error);
+      if (slot < 0) {
         std::printf("frame %zu: %s\n", index, error.c_str());
         status = 1;
         break;
       }
 
       std::printf("frame %zu: %dx%d, %zu block(s), %d transform block(s), "
-                  "%d wave(s), %.2f ms\n",
+                  "%d wave(s), %.2f ms%s\n",
                   index, frame.width, frame.height, syntax.blocks.size(),
                   decoded.transform_blocks, decoder->stats().waves,
-                  decoder->stats().total_ms);
+                  decoder->stats().total_ms, frame.show_frame ? "" : " (not shown)");
       ++decoded_frames;
 
-      std::vector<uint8_t> yuv;
-      frame_to_yuv8(picture, &yuv);
-      if (out_file && !yuv.empty()) std::fwrite(yuv.data(), 1, yuv.size(), out_file);
+      /* A frame that is not shown is still a reference for the frames that name
+       * it; it just never reaches the output. Its picture is displayed later
+       * through a show_existing_frame, which is what keeps the output in display
+       * order while the decoder runs in coding order. */
+      if (frame.show_frame) emit_picture(picture, syntax.ss_x, syntax.ss_y);
 
-      if (!reference.empty()) {
-        Frame expected(frame.width, frame.height, seq.bit_depth, syntax.ss_x, syntax.ss_y);
-        const size_t frame_size = static_cast<size_t>(frame.width) * frame.height +
-                                  ((syntax.ss_x ? (frame.width + 1) / 2 : frame.width) *
-                                   (syntax.ss_y ? (frame.height + 1) / 2 : frame.height)) * 2;
-        if (reference_offset + frame_size > reference.size()) {
-          std::printf("  reference is too short for another frame\n");
-        } else {
-          const uint8_t* src = reference.data() + reference_offset;
-          const int ss[3][2] = {{0, 0}, {syntax.ss_x, syntax.ss_y}, {syntax.ss_x, syntax.ss_y}};
-          size_t at = 0;
-          for (int p = 0; p < 3; ++p) {
-            const int w = frame.width >> ss[p][0], h = frame.height >> ss[p][1];
-            for (int y = 0; y < h; ++y) {
-              uint16_t* dst = expected.plane(p) + static_cast<size_t>(y) * expected.stride[p];
-              for (int x = 0; x < w; ++x) dst[x] = src[at++];
-            }
-          }
-          report_difference(picture, expected, "reference");
-          ++comparisons;
-          const Psnr psnr = frame_psnr(picture, expected);
-          if (psnr.y >= 99.0 && psnr.u >= 99.0 && psnr.v >= 99.0) ++exact;
-          reference_offset += frame_size;
-        }
+      /* Hand the picture to the AV1 slots this frame refreshes. */
+      bool kept = false;
+      for (int i = 0; i < 8; ++i) {
+        if (!(frame.refresh_frame_flags & (1 << i))) continue;
+        const int previous = pool_slot[i];
+        pool_slot[i] = -1;
+        release_if_unused(previous);
+        pool_slot[i] = slot;
+        pool_picture[i] = picture;
+        pool_picture_valid[i] = true;
+        kept = true;
       }
+      if (!kept) release_if_unused(slot);
+
       /* the tile adapted the probability tables; the slots this frame refreshes
        * hand them on to the frames that name it as their primary reference */
       refresh_ref_pool(frame, &refs, decoded.ref_mvs, decoded.cdf);

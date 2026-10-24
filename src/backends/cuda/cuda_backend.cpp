@@ -194,7 +194,7 @@ class CudaBackend final : public Backend {
     if (!plan.coefficients.empty())
       driver_.MemcpyHtoD(coef_, plan.coefficients.data(),
                          plan.coefficients.size() * sizeof(int));
-    ensure(&tmp_, &tmp_cap_, (plan.coefficients.size() + 1) * sizeof(int));
+    ensure(&tmp_, &tmp_cap_, (plan.tmp_size + 1) * sizeof(int));
     if (!plan.residual.empty()) {
       ensure(&residual_, &residual_cap_, (plan.residual.size() + 1) * sizeof(int));
       driver_.MemcpyHtoD(residual_, plan.residual.data(),
@@ -489,7 +489,8 @@ class CudaBackend final : public Backend {
   }
 
  private:
-  static constexpr int kReferenceSlots = 6;
+  /* one pool slot per AV1 reference slot; see the CPU backend */
+  static constexpr int kReferenceSlots = 8;
 
   void shutdown() {
     if (module_ && driver_.ModuleLoadDataEx) {
@@ -672,7 +673,7 @@ class CudaBackend final : public Backend {
   size_t grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0;
   size_t job_cap_ = 0, pref_cap_ = 0, pref_b_cap_ = 0;
   std::vector<uint16_t> staging_;
-  bool slots_[kReferenceSlots] = {false, false, false, false, false, false};
+  bool slots_[kReferenceSlots] = {};
   int last_slot_ = -1;
 };
 

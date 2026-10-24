@@ -9,7 +9,8 @@
  *   - on screen and not the frame border (nothing to filter against outside),
  *   - a transform block edge (the filter never crosses one),
  *   - either a prediction block edge, or a block that has no residual, or an
- *     intra block,
+ *     intra block (a skipped inter block is only filtered along prediction
+ *     block boundaries),
  *   - the level that the frame header gives for this plane, pass, segment,
  *     reference frame and mode, after the delta-LF syntax.
  *
@@ -70,6 +71,12 @@ struct DeblockGrid {
   std::vector<BlockSize> size;  /* MiSizes */
   std::vector<uint8_t> skip;    /* Skips */
   std::vector<uint8_t> segment; /* SegmentIds */
+  /* RefFrames[..][0] and YModes: the level of an inter edge depends on which
+   * reference the block predicts from and on whether its mode is one that codes
+   * a motion vector difference, which is what the specification's modeType
+   * distinguishes. */
+  std::vector<uint8_t> ref_frame;
+  std::vector<uint8_t> mode;
   std::vector<int8_t> delta_lf; /* DeltaLFs, four per cell */
   std::vector<TxSize> tx[3];    /* LoopfilterTxSizes per plane */
 
@@ -102,6 +109,8 @@ inline int deblock_level_selection(const FrameHeader& frame, const DeblockGrid& 
   const int index = plane == 0 ? pass : plane + 1;
   const int cell = grid.cell(row, col);
   const int segment = grid.segment[static_cast<size_t>(cell)];
+  const int ref = grid.ref_frame[static_cast<size_t>(cell)];
+  const int mode = grid.mode[static_cast<size_t>(cell)];
   const int delta_lf = grid.delta_lf[static_cast<size_t>(cell) * 4 +
                                     (frame.delta_lf_multi ? index : 0)];
   int level = clip3(0, delta_lf + loop_filter_level(frame, index), kMaxLoopFilter);
@@ -109,11 +118,19 @@ inline int deblock_level_selection(const FrameHeader& frame, const DeblockGrid& 
   if (seg_feature_active(frame, segment, feature))
     level = clip3(0, level + frame.segmentation.feature_data[segment][feature], kMaxLoopFilter);
   if (frame.loop_filter.mode_ref_delta_enabled) {
-    /* The front end decodes intra frames, so the reference frame is
-     * INTRA_FRAME (0) and modeType is 0: only the intra reference delta is
-     * applied, scaled by how strong the level already is. */
+    /* modeType is 1 for an inter mode that codes a motion vector difference -
+     * NEARESTMV and friends - and 0 for an intra block, GLOBALMV and
+     * GLOBAL_GLOBALMV. An intra block only ever pays the intra reference
+     * delta. */
+    const int mode_type =
+        (ref > kRefIntra && mode != kModeGlobalMv && mode != kModeGlobalGlobalMv) ? 1 : 0;
     const int n_shift = level >> 5;
-    level += frame.loop_filter.ref_deltas[0] << n_shift;
+    if (ref <= kRefIntra) {
+      level += frame.loop_filter.ref_deltas[0] << n_shift;
+    } else {
+      level += (frame.loop_filter.ref_deltas[ref] << n_shift) +
+               (frame.loop_filter.mode_deltas[mode_type] << n_shift);
+    }
     level = clip3(0, level, kMaxLoopFilter);
   }
   return level;
@@ -140,6 +157,8 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
   grid.size.assign(luma_cells, kBlock4x4);
   grid.skip.assign(luma_cells, 0);
   grid.segment.assign(luma_cells, 0);
+  grid.ref_frame.assign(luma_cells, kRefIntra);
+  grid.mode.assign(luma_cells, 0);
   grid.delta_lf.assign(luma_cells * 4, 0);
   for (int p = 0; p < 3; ++p) {
     const int sub_x = p > 0 ? ss_x : 0;
@@ -161,6 +180,8 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
         grid.size[cell] = block.size;
         grid.skip[cell] = block.skip ? 1 : 0;
         grid.segment[cell] = static_cast<uint8_t>(block.segment_id);
+        grid.ref_frame[cell] = static_cast<uint8_t>(block.is_inter ? block.ref_frame[0] : 0);
+        grid.mode[cell] = static_cast<uint8_t>(block.y_mode);
         for (int i = 0; i < 4; ++i)
           grid.delta_lf[cell * 4 + i] = static_cast<int8_t>(block.delta_lf[i]);
       }
@@ -237,10 +258,12 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
           const bool is_tx_edge = vertical ? (x_p % tx_w == 0) : (y_p % tx_h == 0);
           if (!is_tx_edge) continue;
           /* applyFilter: a transform edge, and either a prediction block edge,
-           * a block without residual, or an intra block. Every block here is
-           * intra, so the last condition always holds. */
-          (void)is_block_edge;
-          (void)cell;
+           * a block without residual, or an intra block. A skipped inter block
+           * is therefore only filtered where the prediction block changes, not
+           * at the transform boundaries inside it. */
+          const bool is_intra_block = grid.ref_frame[cell] <= kRefIntra;
+          const bool has_residual = grid.skip[cell] == 0;
+          if (!(is_block_edge || has_residual || is_intra_block)) continue;
 
           /* The filter size process: the smaller transform on the two sides of
            * the edge caps the filter, 16 in luma and 8 in chroma. */

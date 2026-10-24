@@ -281,6 +281,10 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     plan->waves.assign(static_cast<size_t>(max_wave) + 1, WaveJobs());
 
     /* ---- jobs ------------------------------------------------------------- */
+    /* The transform scratch is handed out in job order, one w * h block per
+     * job. Two jobs never share a region, so the passes of a wave stay
+     * independent even when the coefficient areas are smaller. */
+    size_t tmp_cursor = 0;
     for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
       const BlockSyntax& b = syntax.blocks[bi];
       WaveJobs& wj = plan->waves[block_wave[bi]];
@@ -344,6 +348,9 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.mv1_x = b.mv[1][0];
         job.mv1_y = b.mv[1][1];
         job.filt = static_cast<int>(b.filter);
+        job.filt_v = static_cast<int>(b.filter_v);
+        job.sub_x = geom.ss_x && plane > 0 ? 1 : 0;
+        job.sub_y = geom.ss_y && plane > 0 ? 1 : 0;
         job.compound = static_cast<int>(b.compound);
         job.w0 = b.blend[0];
         job.w1 = b.blend[1];
@@ -361,7 +368,9 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         Av1gItxJob itx;
         std::memset(&itx, 0, sizeof(itx));
         itx.coef_off = tx.coef_offset;
-        itx.tmp_off = static_cast<int>(tx.coef_offset);
+        itx.tmp_off = static_cast<int>(tmp_cursor);
+        tmp_cursor += static_cast<size_t>(tx.w) * static_cast<size_t>(tx.h);
+        plan->tmp_size = tmp_cursor;
         itx.dst_off = dst_off + tx.y * stride + tx.x;
         itx.dst_stride = stride;
         itx.w = tx.w;

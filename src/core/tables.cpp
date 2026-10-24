@@ -11,7 +11,6 @@
 #include "core/backend.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 
 namespace av1gpu {
@@ -21,64 +20,149 @@ namespace {
 
 /* ---- subpel filters ---------------------------------------------------- */
 
-double sinc(double x) {
-  if (std::fabs(x) < 1e-9) return 1.0;
-  const double px = M_PI * x;
-  return std::sin(px) / px;
-}
+/* Subpel_Filters[6][16][8] from the specification (section 7.11.3.5).
+ *
+ * Rows 0..3 are the four filter classes a block can name - regular, smooth,
+ * sharp, bilinear - and are indexed by AV1G_FILT_*. Rows 4 and 5 are the four
+ * tap versions of the regular and smooth filters that a prediction block only
+ * four samples wide or high uses. All six rows are stored with eight taps so
+ * the filter loops stay uniform: the four tap rows carry zeros at both ends,
+ * which puts their taps at the same sample offsets the specification uses.
+ *
+ * The weights are Q7 (each row sums to 128) and there are sixteen phases per
+ * row, one per 1/16 sample. The fractional part of a motion vector is
+ * therefore *not* the index: a vector stored in 1/8 samples has even phases in
+ * luma and every phase in chroma (the chroma vector is halved). Phase 0 is a
+ * straight sample copy.
+ *
+ * These are the specification's numbers, not an approximation of them: an
+ * interpolated prediction is only bit exact against a reference decoder if the
+ * weights, the rounding and the phase resolution all match. */
+constexpr int kFilterRows = 6;
+constexpr int kFilterPhases = 16;
+constexpr int kFilterTaps = 8;
 
-double lanczos(double x, double a) {
-  if (x <= -a || x >= a) return 0.0;
-  return sinc(x) * sinc(x / a);
-}
-
-struct FilterSpec {
-  int taps;      /* 2, 4 or 8                                              */
-  double window; /* Lanczos a; smaller is sharper                          */
-  int first_tap; /* index in the padded 8 tap row                          */
+const int kSubpelFilters[kFilterRows][kFilterPhases][kFilterTaps] = {
+    { /* regular (EIGHTTAP) */
+        {0, 0, 0, 128, 0, 0, 0, 0},
+        {0, 2, -6, 126, 8, -2, 0, 0},
+        {0, 2, -10, 122, 18, -4, 0, 0},
+        {0, 2, -12, 116, 28, -8, 2, 0},
+        {0, 2, -14, 110, 38, -10, 2, 0},
+        {0, 2, -14, 102, 48, -12, 2, 0},
+        {0, 2, -16, 94, 58, -12, 2, 0},
+        {0, 2, -14, 84, 66, -12, 2, 0},
+        {0, 2, -14, 76, 76, -14, 2, 0},
+        {0, 2, -12, 66, 84, -14, 2, 0},
+        {0, 2, -12, 58, 94, -16, 2, 0},
+        {0, 2, -12, 48, 102, -14, 2, 0},
+        {0, 2, -10, 38, 110, -14, 2, 0},
+        {0, 2, -8, 28, 116, -12, 2, 0},
+        {0, 0, -4, 18, 122, -10, 2, 0},
+        {0, 0, -2, 8, 126, -6, 2, 0},
+    },
+    { /* smooth (EIGHTTAP_SMOOTH) */
+        {0, 0, 0, 128, 0, 0, 0, 0},
+        {0, 2, 28, 62, 34, 2, 0, 0},
+        {0, 0, 26, 62, 36, 4, 0, 0},
+        {0, 0, 22, 62, 40, 4, 0, 0},
+        {0, 0, 20, 60, 42, 6, 0, 0},
+        {0, 0, 18, 58, 44, 8, 0, 0},
+        {0, 0, 16, 56, 46, 10, 0, 0},
+        {0, -2, 16, 54, 48, 12, 0, 0},
+        {0, -2, 14, 52, 52, 14, -2, 0},
+        {0, 0, 12, 48, 54, 16, -2, 0},
+        {0, 0, 10, 46, 56, 16, 0, 0},
+        {0, 0, 8, 44, 58, 18, 0, 0},
+        {0, 0, 6, 42, 60, 20, 0, 0},
+        {0, 0, 4, 40, 62, 22, 0, 0},
+        {0, 0, 4, 36, 62, 26, 0, 0},
+        {0, 0, 2, 34, 62, 28, 2, 0},
+    },
+    { /* sharp (EIGHTTAP_SHARP) */
+        {0, 0, 0, 128, 0, 0, 0, 0},
+        {-2, 2, -6, 126, 8, -2, 2, 0},
+        {-2, 6, -12, 124, 16, -6, 4, -2},
+        {-2, 8, -18, 120, 26, -10, 6, -2},
+        {-4, 10, -22, 116, 38, -14, 6, -2},
+        {-4, 10, -22, 108, 48, -18, 8, -2},
+        {-4, 10, -24, 100, 60, -20, 8, -2},
+        {-4, 10, -24, 90, 70, -22, 10, -2},
+        {-4, 12, -24, 80, 80, -24, 12, -4},
+        {-2, 10, -22, 70, 90, -24, 10, -4},
+        {-2, 8, -20, 60, 100, -24, 10, -4},
+        {-2, 8, -18, 48, 108, -22, 10, -4},
+        {-2, 6, -14, 38, 116, -22, 10, -4},
+        {-2, 6, -10, 26, 120, -18, 8, -2},
+        {-2, 4, -6, 16, 124, -12, 6, -2},
+        {0, 2, -2, 8, 126, -6, 2, -2},
+    },
+    { /* bilinear (BILINEAR) */
+        {0, 0, 0, 128, 0, 0, 0, 0},
+        {0, 0, 0, 120, 8, 0, 0, 0},
+        {0, 0, 0, 112, 16, 0, 0, 0},
+        {0, 0, 0, 104, 24, 0, 0, 0},
+        {0, 0, 0, 96, 32, 0, 0, 0},
+        {0, 0, 0, 88, 40, 0, 0, 0},
+        {0, 0, 0, 80, 48, 0, 0, 0},
+        {0, 0, 0, 72, 56, 0, 0, 0},
+        {0, 0, 0, 64, 64, 0, 0, 0},
+        {0, 0, 0, 56, 72, 0, 0, 0},
+        {0, 0, 0, 48, 80, 0, 0, 0},
+        {0, 0, 0, 40, 88, 0, 0, 0},
+        {0, 0, 0, 32, 96, 0, 0, 0},
+        {0, 0, 0, 24, 104, 0, 0, 0},
+        {0, 0, 0, 16, 112, 0, 0, 0},
+        {0, 0, 0, 8, 120, 0, 0, 0},
+    },
+    { /* four tap regular, for blocks 4 wide or high */
+        {0, 0, 0, 128, 0, 0, 0, 0},
+        {0, 0, -4, 126, 8, -2, 0, 0},
+        {0, 0, -8, 122, 18, -4, 0, 0},
+        {0, 0, -10, 116, 28, -6, 0, 0},
+        {0, 0, -12, 110, 38, -8, 0, 0},
+        {0, 0, -12, 102, 48, -10, 0, 0},
+        {0, 0, -14, 94, 58, -10, 0, 0},
+        {0, 0, -12, 84, 66, -10, 0, 0},
+        {0, 0, -12, 76, 76, -12, 0, 0},
+        {0, 0, -10, 66, 84, -12, 0, 0},
+        {0, 0, -10, 58, 94, -14, 0, 0},
+        {0, 0, -10, 48, 102, -12, 0, 0},
+        {0, 0, -8, 38, 110, -12, 0, 0},
+        {0, 0, -6, 28, 116, -10, 0, 0},
+        {0, 0, -4, 18, 122, -8, 0, 0},
+        {0, 0, -2, 8, 126, -4, 0, 0},
+    },
+    { /* four tap smooth, for blocks 4 wide or high */
+        {0, 0, 0, 128, 0, 0, 0, 0},
+        {0, 0, 30, 62, 34, 2, 0, 0},
+        {0, 0, 26, 62, 36, 4, 0, 0},
+        {0, 0, 22, 62, 40, 4, 0, 0},
+        {0, 0, 20, 60, 42, 6, 0, 0},
+        {0, 0, 18, 58, 44, 8, 0, 0},
+        {0, 0, 16, 56, 46, 10, 0, 0},
+        {0, 0, 14, 54, 48, 12, 0, 0},
+        {0, 0, 12, 52, 52, 12, 0, 0},
+        {0, 0, 12, 48, 54, 14, 0, 0},
+        {0, 0, 10, 46, 56, 16, 0, 0},
+        {0, 0, 8, 44, 58, 18, 0, 0},
+        {0, 0, 6, 42, 60, 20, 0, 0},
+        {0, 0, 4, 40, 62, 22, 0, 0},
+        {0, 0, 4, 36, 62, 26, 0, 0},
+        {0, 0, 2, 34, 62, 30, 0, 0},
+    },
 };
 
-FilterSpec filter_spec(int filt) {
-  switch (filt) {
-    case AV1G_FILT_SMOOTH:
-      return {4, 2.0, 2};
-    case AV1G_FILT_SHARP:
-      return {8, 2.0, 0};
-    case AV1G_FILT_BILINEAR:
-      return {2, 1.0, 3};
-    case AV1G_FILT_REGULAR:
-    default:
-      return {8, 4.0, 0};
-  }
-}
 
 struct FilterTable {
   std::vector<int> data;
   FilterTable() {
-    data.assign(AV1G_FILT_COUNT * 8 * 8, 0);
-    for (int filt = 0; filt < AV1G_FILT_COUNT; ++filt) {
-      const FilterSpec spec = filter_spec(filt);
-      for (int phase = 0; phase < 8; ++phase) {
-        const double t = phase / 8.0;
-        int w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        int sum = 0;
-        for (int i = 0; i < spec.taps; ++i) {
-          /* tap i sits at sample offset (first_tap + i) - 3 = -3..+4 */
-          const int centre = i + spec.first_tap - 3;
-          double v = lanczos(centre - t, spec.window);
-          if (spec.taps == 2) v = (i == 0) ? 1.0 - t : t; /* exactly bilinear */
-          w[spec.first_tap + i] = static_cast<int>(std::floor(v * 128.0 + 0.5));
-          sum += w[spec.first_tap + i];
-        }
-        /* force an exact unity DC gain */
-        int best = 0;
-        for (int i = 1; i < 8; ++i)
-          if (w[i] > w[best]) best = i;
-        w[best] += 128 - sum;
-        for (int i = 0; i < 8; ++i)
-          data[((filt * 8) + phase) * 8 + i] = w[i];
-      }
-    }
+    data.resize(static_cast<size_t>(kFilterRows) * kFilterPhases * kFilterTaps);
+    for (int row = 0; row < kFilterRows; ++row)
+      for (int phase = 0; phase < kFilterPhases; ++phase)
+        for (int tap = 0; tap < kFilterTaps; ++tap)
+          data[(static_cast<size_t>(row) * kFilterPhases + phase) * kFilterTaps + tap] =
+              kSubpelFilters[row][phase][tap];
   }
 };
 

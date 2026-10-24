@@ -172,6 +172,8 @@ enum class FilterType : int {
 enum class CompoundType : int {
   None = 0,
   Average = 1,
+  /* the two predictions are blended with the weights the frame distances give
+   * (BlockSyntax::blend) */
   Distance = 2,
 };
 
@@ -226,10 +228,21 @@ struct BlockSyntax {
 
   /* inter */
   int ref[2] = {-1, -1};  /* indices into FrameSyntax::reference_slots */
-  int mv[2][2] = {{0, 0}, {0, 0}}; /* 1/8 pel, relative to the block */
+  /* Motion vectors in 1/8 *luma* samples, exactly as the bitstream codes them
+   * (the specification's Mv). Chroma vectors are not stored scaled: the kernel
+   * halves them per subsampled axis, which is also where the 1/16 subpel phase
+   * comes from. */
+  int mv[2][2] = {{0, 0}, {0, 0}};
+  /* The subpel filter class per direction. `filter` is the horizontal one, the
+   * specification's interp_filter[1]; interp_filter[0] is the vertical one, so
+   * the two are stored the way the kernel uses them rather than in bitstream
+   * order. A frame with dual_filter off sets both to the same class. */
   FilterType filter = FilterType::Regular;
+  FilterType filter_v = FilterType::Regular;
   CompoundType compound = CompoundType::None;
-  int blend[2] = {32, 32}; /* Q6 weights for distance weighted compound */
+  /* Distance weighted compound weights, Q4 and summing to 16 (the
+   * specification's FwdWeight/BckWeight). */
+  int blend[2] = {8, 8};
 
   /* When set, the transform blocks carry raw residual samples
    * (FrameSyntax::residual) instead of an inverse transform. Used for block

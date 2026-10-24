@@ -30,7 +30,9 @@ double now_ms() {
   return std::chrono::duration<double, std::milli>(clock::now() - start).count();
 }
 
-constexpr int kReferenceSlots = 6;
+/* AV1 has eight reference slots, and a stream may keep a different picture
+ * in every one of them, so the pool has to be that large. */
+constexpr int kReferenceSlots = 8;
 
 struct RefFrame {
   bool used = false;
@@ -117,8 +119,23 @@ class CpuBackend final : public Backend {
     const int* filters = tables::filters().data();
     uint16_t* frame = frame_.data();
 
+    if (std::getenv("AV1GPU_PLAN_STATS")) {
+      size_t ni = 0, nt = 0, nr = 0, nx = 0;
+      for (const WaveJobs& w : plan.waves) {
+        ni += w.intra.size();
+        nt += w.itx.size();
+        nr += w.residual.size();
+        nx += w.inter.size();
+      }
+      std::fprintf(stderr,
+                   "PLAN waves=%zu intra=%zu itx=%zu residual=%zu inter=%zu deblock=%zu/%zu "
+                   "cdef=%zu grain=%zu\n",
+                   plan.waves.size(), ni, nt, nr, nx, plan.deblock_v.size(),
+                   plan.deblock_h.size(), plan.cdef.size(), plan.grain.size());
+    }
+
     /* ---- prediction, transform, residual --------------------------------- */
-    std::vector<int> tmp(plan.coefficients.size() + 64, 0);
+    std::vector<int> tmp(plan.tmp_size + 64, 0);
     for (const WaveJobs& wave : plan.waves) {
       /* Inside a wave no job reads another job's output, so every stage of a
        * wave is embarrassingly parallel - the same property the GPU backends
@@ -132,7 +149,31 @@ class CpuBackend final : public Backend {
         const Av1gInterJob& job = wave.inter[static_cast<size_t>(i)];
         const uint16_t* r0 = job.ref0_slot >= 0 ? refs_[job.ref0_slot].samples.data() : frame;
         const uint16_t* r1 = job.ref1_slot >= 0 ? refs_[job.ref1_slot].samples.data() : r0;
+        if (std::getenv("AV1GPU_MCDUMP") && job.dst_off == g.plane_off[0]) {
+          static int dumped = 0;
+          if (dumped < 3) {
+            ++dumped;
+            std::fprintf(stderr,
+                         "OURMC w=%d h=%d refxy=%d,%d mv=%d,%d sub=%d,%d filt=%d/%d comp=%d "
+                         "slots=%d,%d dst=%d:",
+                         job.w, job.h, job.ref_x, job.ref_y, job.mv0_x, job.mv0_y, job.sub_x,
+                         job.sub_y, job.filt, job.filt_v, job.compound, job.ref0_slot,
+                         job.ref1_slot, job.dst_off);
+            for (int i = 0; i < 4; ++i)
+              std::fprintf(stderr, " %d", static_cast<int>(r0[g.plane_off[0] + 9 * g.stride[0] + 68 + i]));
+            std::fprintf(stderr, "\n");
+          }
+        }
         av1g_inter_block(&job, frame, r0, r1, filters, maxv);
+        if (std::getenv("AV1GPU_MCDUMP") && job.dst_off == g.plane_off[0]) {
+          static int dumped2 = 0;
+          if (dumped2 < 3) {
+            ++dumped2;
+            std::fprintf(stderr, "OURDST dst=%d:", job.dst_off);
+            for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %d", static_cast<int>(frame[i]));
+            std::fprintf(stderr, "\n");
+          }
+        }
       }
       const int nintra = static_cast<int>(wave.intra.size());
 #if defined(AV1GPU_HAVE_OPENMP)
@@ -169,15 +210,24 @@ class CpuBackend final : public Backend {
     /* Vertical and horizontal edges cross each other, so the two groups are
      * sequential passes (the order the specification defines). Inside one group
      * the edges are disjoint, which makes the pass fully parallel. */
+    /* AV1GPU_NO_DEBLOCK is a debug bitmask of planes to leave unfiltered. */
+    const char* no_lf_env = std::getenv("AV1GPU_NO_DEBLOCK");
+    const int no_lf = no_lf_env ? std::atoi(no_lf_env) : 0;
     for (const std::vector<Av1gDeblockJob>* pass : {&plan.deblock_v, &plan.deblock_h}) {
       const int n = static_cast<int>(pass->size());
 #if defined(AV1GPU_HAVE_OPENMP)
 #pragma omp parallel for schedule(dynamic, 8)
 #endif
-      for (int i = 0; i < n; ++i)
-        av1g_deblock_job(&(*pass)[static_cast<size_t>(i)], frame, maxv);
+      for (int i = 0; i < n; ++i) {
+        const Av1gDeblockJob& job = (*pass)[static_cast<size_t>(i)];
+        if (no_lf & (job.is_chroma ? 2 : 1)) continue;
+        av1g_deblock_job(&job, frame, maxv);
+      }
     }
 
+    /* AV1GPU_NO_CDEF is a debug bitmask of planes to leave unfiltered. */
+    const char* no_cdef_env = std::getenv("AV1GPU_NO_CDEF");
+    const int no_cdef = no_cdef_env ? std::atoi(no_cdef_env) : 0;
     if (!plan.cdef.empty()) {
       /* CDEF reads a copy of the frame so that neighbouring blocks cannot
        * observe each other's filtering, exactly like the GPU scratch buffer. */
@@ -186,9 +236,12 @@ class CpuBackend final : public Backend {
 #if defined(AV1GPU_HAVE_OPENMP)
 #pragma omp parallel for schedule(dynamic, 8)
 #endif
-      for (int i = 0; i < n; ++i)
-        av1g_cdef_block(&plan.cdef[static_cast<size_t>(i)], scratch_.data(), frame,
-                        scratch_.data(), maxv);
+      for (int i = 0; i < n; ++i) {
+        const Av1gCdefJob& job = plan.cdef[static_cast<size_t>(i)];
+        /* chroma is one bit: the CDEF jobs carry both planes together */
+        if (no_cdef & (job.uv ? 2 : 1)) continue;
+        av1g_cdef_block(&job, scratch_.data(), frame, scratch_.data(), maxv);
+      }
     }
     {
       const int n = static_cast<int>(plan.grain.size());
@@ -198,6 +251,16 @@ class CpuBackend final : public Backend {
       for (int i = 0; i < n; ++i)
         av1g_grain_block(&plan.grain[static_cast<size_t>(i)], frame,
                          plan.grain_template.data(), plan.grain_lut, maxv);
+    }
+
+    if (std::getenv("AV1GPU_MCDUMP")) {
+      static int dumped3 = 0;
+      if (dumped3 < 3) {
+        ++dumped3;
+        std::fprintf(stderr, "OURFINAL:");
+        for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %d", static_cast<int>(frame[i]));
+        std::fprintf(stderr, "\n");
+      }
     }
 
     const double t_filter = now_ms();

@@ -260,6 +260,10 @@ struct RefMvs {
  * a different candidate and then a different dynamic reference list index. */
 int project_mv_component(int mv, int num, int den);
 
+/* get_relative_dist(): the sign extended distance between two order hints, the
+ * comparison every "is this reference in the past" question is built on. */
+int get_relative_dist(const SequenceHeader& seq, int a, int b);
+
 /* One entry of the reference frame store: enough for the bitstream front-end to
  * resolve inter frame sizes and skip-mode decisions. */
 struct RefSlot {
