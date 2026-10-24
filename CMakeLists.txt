@@ -82,6 +82,7 @@ set(AV1GPU_SOURCES
     src/frontend/obu.cpp
     src/frontend/headers.cpp
     src/frontend/range_decoder.cpp
+    src/frontend/tiles.cpp
     src/backends/cpu/cpu_backend.cpp
 )
 

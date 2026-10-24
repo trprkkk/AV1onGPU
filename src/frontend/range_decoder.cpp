@@ -111,27 +111,24 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
   const unsigned r = rng_ >> 8;
   unsigned u = 0;
   unsigned v = rng_;
-  int symbol = -1;
-  do {
-    ++symbol;
+  int symbol = 0;
+  while (true) {
     u = v;
+    /* Every interval keeps at least kMinProb per remaining symbol of range;
+     * without the term a very skewed table can produce a zero width interval
+     * and the range coder collapses. The term is zero for the last symbol. */
     v = r * (cdf[symbol] >> kProbShift);
     v >>= 7 - kProbShift;
-    /* Every interval keeps at least kMinProb per remaining symbol of range.
-     * Without the term a very skewed table can produce a zero width interval,
-     * and the range coder collapses. */
     v += kMinProb * static_cast<unsigned>(nsymbols - symbol);
-    /* The reference decoders rely on the counter entry (cdf[nsymbols] <= 32) to
-     * terminate the loop; the bound keeps a corrupt table from walking past the
-     * end of the array. */
-  } while (c < v && symbol < nsymbols);
-
-  if (symbol >= nsymbols) {
-    /* no interval matched: the stream (or the table) is corrupt. Report it as
-     * nsymbols, which no table lookup can confuse with a real symbol, and mark
-     * the decoder so the caller can abandon the tile. */
-    failed_ = true;
-    return static_cast<unsigned>(symbol);
+    if (c >= v) break;
+    if (symbol == nsymbols) {
+      /* The counter entry is not a probability: a valid one is at most 32, so
+       * it contributes no range and always terminates the loop above. Getting
+       * here means the table is not an AV1 CDF, and no symbol can be trusted. */
+      failed_ = true;
+      return 0;
+    }
+    ++symbol;
   }
 
   normalize(dif_ - (static_cast<uint64_t>(v) << (kWindowBits - 16)), u - v);

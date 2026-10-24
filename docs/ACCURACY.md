@@ -153,19 +153,43 @@ stream. Instead:
   (2, 3, 4, 8, 11 and 16 symbols, payloads picked so every symbol is exercised),
   the tables they adapt to, plus boolean, equiprobable, `L(n)` and `ns(n)`
   payloads. The expected values were produced by dav1d's `msac`, and
-  `tests/test_entropy.cpp` re-decodes them on every run: 683 checks.
+  `tests/test_entropy.cpp` re-decodes them on every run.
 * `disable_cdf_update`, the overflow of the adaptation counter at 32, and the
   end-of-tile contract (`overrun()` becomes true, decoding stays in the
   alphabet, `bytes_used()` never passes the tile size) are unit tested directly.
+* **A real tile decodes bit exactly.** That was the missing piece, and it is now
+  measured rather than argued: dav1d's `msac` was patched to log every decode it
+  performs (symbol or bit, the value, the exact CDF it used, and its window,
+  range and counter afterwards) while decoding the key frame of
+  `tests/data/svt_av1_320x240.ivf`. Replaying that log through AV1onGPU's
+  `RangeDecoder` reproduces dav1d for **all 112,648 events** of the tile:
+  78,090 symbols, 2,173 boolean reads and 32,385 equiprobable bits, with the
+  range coder state (`dif`, `rng`, `cnt`) identical at every event. The first
+  480 events are frozen into `tests/data/tile_trace.hpp` and replayed by
+  `tests/test_entropy.cpp`, including the final state, so a regression in the
+  window handling, the probability shift or the adaptation is caught without
+  dav1d being present.
 
-Two honest caveats. The adaptation *rate schedule* used here is the one the
-reference decoders implement (`4 + (cdf[N] >> 4) + (N > 2)`); it is what every
-encoder in the field writes, and matching it is what makes real streams decode,
-so it is the schedule we test against. And decoding a real tile has not been
-demonstrated yet: it needs the CDF tables and the tile syntax layer above the
-symbol reader. Until that lands, "matches dav1d symbol for symbol" is the
-strongest claim this file makes about the entropy path, and the fixture's tile
-data is the next thing to decode.
+  Two things this found, both invisible to round-trip testing:
+
+  * The last symbol of a table has no stored probability. Its interval is
+    whatever range is left, and the reference decoders select it by walking one
+    entry past the probabilities into the adaptation counter, which is at most
+    32 and therefore contributes no range at the 6 bit probability resolution.
+    **12,245 of the 78,090 symbols in that frame - one in seven - are the last
+    symbol**, so treating "walked past the table" as corruption, as this decoder
+    originally did, cannot decode a real tile at all.
+  * The specification's prose gives the adaptation rate as
+    `3 + (cdf[N] > 15) + (cdf[N] > 31) + Min(FloorLog2(N), 2)` while dav1d and
+    libaom both use `4 + (cdf[N] >> 4) + (N > 2)`. The two agree for alphabets of
+    2, 4, 8 and 16 symbols and differ for 3, 5, 6, 7, 9-15. AV1onGPU implements
+    the reference decoder formula, because the reference decoders are what real
+    encoders target and what a stream has to be decoded with.
+
+Until the CDF tables and the syntax layer land (see `docs/ROADMAP.md`), the
+front-end can read the tile bytes but not yet interpret them; the trace replay
+above is what makes "the symbol reader is right" a demonstrated fact rather than
+a claim.
 
 The third layer is what found the deblocking group index bug: the kernel was
 handed a group number where the shared helper expects a sample offset, so edges

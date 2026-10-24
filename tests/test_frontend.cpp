@@ -17,6 +17,7 @@
 #include "frontend/headers.hpp"
 #include "frontend/ivf.hpp"
 #include "frontend/obu.hpp"
+#include "frontend/tiles.hpp"
 #include "test_common.hpp"
 
 namespace {
@@ -830,6 +831,79 @@ void test_real_stream() {
   CHECK_EQ(order_hints[5], 5);
 }
 
+
+/* The tile group is where the payload stops being plain bits. A single tile
+ * that runs to the end of the payload is the common case; the group can also
+ * carry a subset of the tiles, and the last tile of the group is never given a
+ * size because it always takes the rest of the OBU. */
+void test_tile_group() {
+  std::printf("tile group\n");
+  FrameHeader h;
+  h.type = FrameType::Key;
+  h.frame_width = 640;
+  h.width = 640;
+  h.height = 240;
+  h.tiles.cols = 2;
+  h.tiles.rows = 1;
+  h.tiles.log2_cols = 1;
+  h.tiles.log2_rows = 0;
+  h.tiles.col_start_sb = {0, 5, 10};
+  h.tiles.row_start_sb = {0, 4};
+  h.tiles.tile_size_bytes = 2;
+  h.tile_data_offset = 0;
+
+  SequenceHeader seq; /* 64x64 superblocks */
+  TileGroup group;
+  std::string error;
+
+  /* one group covering both tiles: flag 0, byte align, then tile 0's size */
+  std::vector<uint8_t> payload = {0x00, 0x03, 0x00, 0xaa, 0xbb, 0xcc, 0xdd,
+                                  0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+  CHECK(parse_tile_group(seq, h, payload.data(), payload.size(), &group, &error) ==
+        ParseStatus::Ok);
+  CHECK_EQ(group.start, 0);
+  CHECK_EQ(group.end, 1);
+  CHECK_EQ(group.tiles.size(), 2u);
+  if (group.tiles.size() == 2) {
+    CHECK_EQ(group.tiles[0].offset, 3u);
+    CHECK_EQ(group.tiles[0].size, 4u);
+    CHECK_EQ(group.tiles[0].x, 0);
+    CHECK_EQ(group.tiles[0].w, 320);
+    CHECK_EQ(group.tiles[0].h, 240);
+    CHECK_EQ(group.tiles[1].offset, 7u);
+    CHECK_EQ(group.tiles[1].size, 6u);
+    CHECK_EQ(group.tiles[1].x, 320);
+    CHECK_EQ(group.tiles[1].w, 320);
+  }
+  CHECK(tile_group_is_complete(h, group));
+
+  /* a group covering only tile 1: 1 (present) 1 (start) 1 (end), then tile 1 */
+  std::vector<uint8_t> subset = {0xe0, 0x11, 0x22, 0x33, 0x44};
+  CHECK(parse_tile_group(seq, h, subset.data(), subset.size(), &group, &error) ==
+        ParseStatus::Ok);
+  CHECK_EQ(group.start, 1);
+  CHECK_EQ(group.end, 1);
+  CHECK_EQ(group.tiles.size(), 1u);
+  if (group.tiles.size() == 1) {
+    CHECK_EQ(group.tiles[0].index, 1);
+    CHECK_EQ(group.tiles[0].offset, 1u);
+    CHECK_EQ(group.tiles[0].size, 4u);
+  }
+  /* a subset is a valid group but not the whole frame */
+  CHECK(!tile_group_is_complete(h, group));
+
+  /* a size that runs past the payload is reported, not silently clipped */
+  std::vector<uint8_t> broken = {0x00, 0xff, 0x00, 0xaa};
+  CHECK(parse_tile_group(seq, h, broken.data(), broken.size(), &group, &error) ==
+        ParseStatus::Invalid);
+  CHECK(!error.empty());
+
+  /* an end tile outside the grid is invalid too */
+  std::vector<uint8_t> bad_end = {0xc0, 0x00}; /* start 1, end 0 */
+  CHECK(parse_tile_group(seq, h, bad_end.data(), bad_end.size(), &group, &error) ==
+        ParseStatus::Invalid);
+}
+
 } /* namespace */
 
 int main() {
@@ -840,6 +914,7 @@ int main() {
   test_frame_header();
   test_inter_frame();
   test_segmentation();
+  test_tile_group();
   test_real_stream();
   return testing::finish("test_frontend");
 }

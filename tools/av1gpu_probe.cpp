@@ -22,6 +22,7 @@
 #include "frontend/headers.hpp"
 #include "frontend/ivf.hpp"
 #include "frontend/obu.hpp"
+#include "frontend/tiles.hpp"
 
 namespace {
 
@@ -59,7 +60,8 @@ void print_sequence(const SequenceHeader& seq) {
               seq.film_grain_params_present ? "present" : "absent");
 }
 
-void print_frame(const FrameHeader& hdr, size_t payload_size, ParseStatus parsed) {
+void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const uint8_t* payload,
+                 size_t payload_size, ParseStatus parsed) {
   if (hdr.show_existing_frame) {
     std::printf("  show_existing_frame: slot %d (%s frame, %dx%d)\n",
                 hdr.existing_frame_idx, frame_type_name(hdr.type), hdr.width, hdr.height);
@@ -118,11 +120,28 @@ void print_frame(const FrameHeader& hdr, size_t payload_size, ParseStatus parsed
   if (hdr.frame_id_present) std::printf("  frame id %d\n", hdr.frame_id);
   if (hdr.reduced_tx_set) std::printf("  reduced transform set\n");
 
-  if (parsed == ParseStatus::Ok && payload_size > hdr.tile_data_offset) {
-    std::printf("  tile data: %zu bytes at offset %zu; tile syntax not implemented yet\n",
-                payload_size - hdr.tile_data_offset, hdr.tile_data_offset);
-  } else if (parsed == ParseStatus::Ok) {
-    std::printf("  no tile data in this OBU; tile syntax not implemented yet\n");
+  if (parsed != ParseStatus::Ok) return;
+  /* Parsing stops above the tile group: the bytes are located, not decoded. */
+  std::string tile_error;
+  TileGroup group;
+  const ParseStatus tiles = parse_tile_group(seq, hdr, payload, payload_size, &group,
+                                             &tile_error);
+  if (tiles != ParseStatus::Ok) {
+    std::printf("  tile group: %s\n", tile_error.c_str());
+    return;
+  }
+  if (group.tiles.size() == 1) {
+    const TileExtent& tile = group.tiles[0];
+    std::printf("  tile data: %zu bytes at offset %zu (%dx%d at %d,%d); tile syntax not "
+                "implemented yet\n",
+                tile.size, tile.offset, tile.w, tile.h, tile.x, tile.y);
+  } else {
+    std::printf("  tile group: %zu of %d tiles, %d..%d\n", group.tiles.size(),
+                hdr.tiles.cols * hdr.tiles.rows, group.start, group.end);
+    for (const TileExtent& tile : group.tiles) {
+      std::printf("    tile %d: %zu bytes at offset %zu (%dx%d at %d,%d)\n", tile.index,
+                  tile.size, tile.offset, tile.w, tile.h, tile.x, tile.y);
+    }
   }
 }
 
@@ -159,7 +178,7 @@ int probe_temporal_unit(const std::vector<uint8_t>& unit, size_t index,
         std::printf("  frame header invalid: %s\n", error.c_str());
         return 1;
       }
-      print_frame(hdr, obu.size, parsed);
+      print_frame(*seq, hdr, obu.data, obu.size, parsed);
       if (parsed == ParseStatus::Unsupported) {
         std::printf("  front-end: %s\n", error.c_str());
       }

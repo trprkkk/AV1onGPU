@@ -1,5 +1,10 @@
 # Test streams
 
+`tile_trace.hpp` is not a stream but the first 480 range coder events dav1d
+logged while decoding that stream's key frame, together with the CDFs it used
+and the range coder state it reached; `tests/test_entropy.cpp` replays them.
+See `docs/ACCURACY.md` for how it was captured.
+
 `svt_av1_320x240.ivf` is a real AV1 stream, not a hand written header: six frames
 of a 320x240 gradient at 8 bit 4:2:0, encoded with SVT-AV1 (crf 40, preset 10)
 and muxed into IVF. The front-end tests parse it end to end, so the parser is

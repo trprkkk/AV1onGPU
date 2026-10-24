@@ -54,10 +54,15 @@ class RangeDecoder {
 
   /* Decodes a symbol from `cdf`, which must hold `nsymbols` probabilities plus
    * the adaptation counter (nsymbols + 1 entries in total), and adapts the
-   * table in place when updating is enabled. A result equal to nsymbols
-   * means the stream or the table is corrupt: the range coder could satisfy no
-   * symbol at all; in that case failed() becomes true and no table lookup can
-   * be trusted afterwards. */
+   * table in place when updating is enabled.
+   *
+   * The table describes nsymbols + 1 symbols: symbol i for i < nsymbols is
+   * bounded below by cdf[i], and the last symbol needs no stored probability
+   * because its interval is whatever range is left. Reaching symbol nsymbols
+   * therefore reads the counter entry, which is at most 32 and so contributes
+   * no range. That works because the counter sits below the 6 bit probability
+   * resolution - it is why the reference decoders can walk one entry past the
+   * probabilities - and it lets a corrupt table be detected instead of read. */
   unsigned read_symbol(uint16_t* cdf, int nsymbols) { return decode_symbol(cdf, nsymbols); }
 
   /* L(n): n equiprobable bits, most significant first. */
@@ -83,6 +88,17 @@ class RangeDecoder {
 
   /* Bytes consumed so far, counting the lookahead window. */
   size_t bytes_used() const { return static_cast<size_t>(buf_pos_ - buf_); }
+
+  /* The raw window, range and counter. Reference decoders expose the same
+   * three values (dav1d calls them dif, rng and cnt), which makes them the
+   * cheapest way to find the exact symbol where two implementations of the
+   * same stream start to disagree. */
+  struct State {
+    uint64_t window;
+    unsigned range;
+    int count;
+  };
+  State state() const { return State{dif_, rng_, cnt_}; }
 
  private:
   unsigned decode_bool_equi();
