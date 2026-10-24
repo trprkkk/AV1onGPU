@@ -158,17 +158,28 @@ variants), 1/16 pel precision, the two stage rounding of the specification and
 the 1/8 pel motion vectors it is driven with. Inter prediction with a single
 reference and with compound averaging is bit exact against dav1d.
 
-## 3. Overlapped block motion compensation and masked compound
+## 3. Masked compound, warped motion, and OBMC's first fixture
 
-Wedge/difference masks and OBMC are the two inter tools missing from
+Wedge and difference weighted masks are the two inter tools still missing from
 `av1gpu_inter_px`. Both are per-sample blend weights, so they fit the existing
-"one work item per output sample" model without new synchronisation.
+"one work item per output sample" model without new synchronisation: the wedge
+tables are `Wedge_Master` (16 directions x 8 corner offsets per block shape) and
+the difference mask is two sums over the two predictors against a 1/64 threshold
+in `preds[][0]`, both spelled out in the specification's sections 7.11.3.11 and
+7.11.3.12.
 
-Measured on a plain libaom encode (mandelbrot 320x240, every inter tool left at
-its default), the order in which a decoder runs into them is: OBMC (first at
-around frame 31 of 60), then masked compound, then warped motion, plus
-inter/intra compound. Intrabc and palette are the remaining intra tools, and
-they only appear on screen content streams.
+The order in which a decoder meets the remaining inter tools, measured on plain
+libaom encodes with every tool at its default, is masked compound, then warped
+motion, then inter/intra compound. OBMC and warped motion share the neighbour
+search, and the OBMC blend is already implemented (mask table, per strip
+prediction, the two passes, in the shared kernel) - but none of the fixtures
+built so far code `motion_mode` as anything but `SIMPLE`, so the only thing
+proven about it today is that it costs nothing when unused. A fixture that
+actually uses OBMC needs libaom's speed settings raised until the encoder picks
+it, and is worth building before the code is trusted.
+
+Intrabc and palette are the remaining intra tools, and they only appear on
+screen content streams.
 
 ## 4. Spec-conformant film grain
 
