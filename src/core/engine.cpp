@@ -355,6 +355,39 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.w0 = b.blend[0];
         job.w1 = b.blend[1];
         job.bitdepth = b.bit_depth;
+        /* Masked compound. The mask lives on the luma grid, so the wedge's
+         * codebook entry is looked up for the luma size of this block (a chroma
+         * block's own size would select the wrong entry) and a chroma job also
+         * carries the luma plane: the difference weighted mask is a function of
+         * the two *luma* predictions, which a chroma job has no other way to
+         * reach. */
+        job.mask_kind = AV1G_MASK_NONE;
+        if (b.compound == CompoundType::Wedge || b.compound == CompoundType::DiffWtd) {
+          const int luma_w = b.w << (plane > 0 ? geom.ss_x : 0);
+          const int luma_h = b.h << (plane > 0 ? geom.ss_y : 0);
+          job.mask_kind = b.compound == CompoundType::Wedge ? AV1G_MASK_WEDGE : AV1G_MASK_DIFFWTD;
+          job.mask_sign = b.mask_sign;
+          if (job.mask_kind == AV1G_MASK_WEDGE) {
+            int dir = AV1G_WEDGE_HORIZONTAL, xoff = 0, yoff = 0, flip = 0;
+            if (!tables::wedge_entry(luma_w, luma_h, b.wedge_index, &dir, &xoff, &yoff, &flip)) {
+              *error = "engine: a wedge on a block size that has none";
+              return false;
+            }
+            job.wedge_dir = dir;
+            job.wedge_xoff = xoff;
+            job.wedge_yoff = yoff;
+            job.wedge_flip = flip;
+          }
+          if (job.mask_kind == AV1G_MASK_DIFFWTD && (job.sub_x || job.sub_y)) {
+            job.luma_ref0_off = g.plane_off[0];
+            job.luma_ref1_off = g.plane_off[0];
+            job.luma_stride = g.stride[0];
+            job.luma_x = b.x << geom.ss_x;
+            job.luma_y = b.y << geom.ss_y;
+            job.luma_ref_w = g.plane_w[0];
+            job.luma_ref_h = g.plane_h[0];
+          }
+        }
         job.ref0_slot = resolve_slot(syntax, b.ref[0]);
         job.ref1_slot = resolve_slot(syntax, b.ref[1]);
         job.ref0_off = g.plane_off[plane];

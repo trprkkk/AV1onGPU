@@ -160,6 +160,20 @@ typedef struct {
   int compound;       /* AV1G_COMPOUND_*                                  */
   int w0, w1;         /* compound blend weights, Q4, sum == 16            */
   int bitdepth;
+  /* Masked compound: the weight the two predictions are mixed with, per
+   * sample, instead of one weight for the whole block. The mask is defined on
+   * the luma samples and subsampled for chroma, which is why a chroma job
+   * carries the luma plane's reference offsets too: the difference weighted
+   * mask is a function of the two luma predictions. */
+  int mask_kind;      /* AV1G_MASK_*                                      */
+  int mask_sign;      /* complement the mask (wedge_sign / diffwtd type)  */
+  int wedge_dir;      /* AV1G_WEDGE_* master mask direction               */
+  int wedge_xoff, wedge_yoff; /* master mask origin for this block        */
+  int wedge_flip;     /* the block's mask reads as 64 - master            */
+  int luma_ref0_off, luma_ref1_off; /* luma planes inside the pool         */
+  int luma_stride;
+  int luma_x, luma_y; /* patch origin in the luma plane                   */
+  int luma_ref_w, luma_ref_h; /* visible luma reference size              */
   /* OBMC: at most two strips from above and two from the left (the
    * specification caps the scan at four each, but a block is at most 16 mi
    * wide, so a strip is at least 2 mi wide and two of each fit). */
@@ -294,6 +308,21 @@ typedef struct {
 #define AV1G_COMPOUND_NONE 0
 #define AV1G_COMPOUND_AVG 1
 #define AV1G_COMPOUND_DIST 2
+
+/* A masked compound block blends its two predictions with a per sample weight
+ * instead of one weight for the whole block. */
+#define AV1G_MASK_NONE 0
+#define AV1G_MASK_WEDGE 1    /* a shape from the master mask table           */
+#define AV1G_MASK_DIFFWTD 2  /* the weight follows the two predictions apart  */
+
+/* The six wedge directions of the specification's master mask, in the order its
+ * constants are numbered. */
+#define AV1G_WEDGE_HORIZONTAL 0
+#define AV1G_WEDGE_VERTICAL 1
+#define AV1G_WEDGE_OBLIQUE27 2
+#define AV1G_WEDGE_OBLIQUE63 3
+#define AV1G_WEDGE_OBLIQUE117 4
+#define AV1G_WEDGE_OBLIQUE153 5
 
 /* ------------------------------------------------------------------ */
 /* inverse transform                                                  */
@@ -1326,6 +1355,102 @@ AV1G_FN int av1g_inter_tap(const Av1gInterCtx *ctx, AV1G_GLOBAL const av1g_px *r
   return (acc + (1 << (round1 - 1))) >> round1;
 }
 
+/* ------------------------------------------------------------------ */
+/* masked compound: the wedge master mask                              */
+/* ------------------------------------------------------------------ */
+
+/* The three one dimensional tables the master mask is built from: the two
+ * oblique rasters and the vertical one. `which` picks the table, `j` is the
+ * column (0..63). They are mostly 0 at one end and 64 at the other, with the
+ * smooth ramp of the wedge in between. */
+AV1G_FN int av1g_wedge_1d(int which, int j) {
+  const int even[8] = {1, 4, 11, 27, 46, 58, 62, 63};
+  const int odd[8] = {1, 2, 6, 18, 37, 53, 60, 63};
+  const int vertical[6] = {2, 7, 21, 43, 57, 62};
+  if (which == 2) {
+    if (j < 29) return 0;
+    if (j >= 35) return 64;
+    return vertical[j - 29];
+  }
+  if (j < 28) return 0;
+  if (j >= 36) return 64;
+  return which == 0 ? even[j - 28] : odd[j - 28];
+}
+
+/* Wedge_Master_Oblique63: the raster every other oblique direction is
+ * transposed and flipped out of. The table steps along by one every *two* rows,
+ * and an odd row is one step further than the even row above it, which is what
+ * gives the 63 degree edge its 1:2 slope. */
+AV1G_FN int av1g_wedge_ob63(int i, int j) {
+  const int k = i >> 1;
+  const int shift = (i & 1) ? (15 - k) : (16 - k);
+  return av1g_wedge_1d((i & 1) ? 1 : 0, av1g_clip(j - shift, 0, 63));
+}
+
+/* MasterMask[dir][i][j] of the specification's initialise_wedge_mask_table. The
+ * four oblique directions are that raster transposed and/or flipped with the
+ * mask complemented, and the horizontal one is the vertical one transposed, so
+ * everything comes out of av1g_wedge_ob63 and the vertical table. */
+AV1G_FN int av1g_wedge_master(int dir, int i, int j) {
+  if (dir == AV1G_WEDGE_HORIZONTAL) return av1g_wedge_1d(2, i);
+  if (dir == AV1G_WEDGE_VERTICAL) return av1g_wedge_1d(2, j);
+  if (dir == AV1G_WEDGE_OBLIQUE27) return av1g_wedge_ob63(j, i);
+  if (dir == AV1G_WEDGE_OBLIQUE117) return 64 - av1g_wedge_ob63(i, 63 - j);
+  if (dir == AV1G_WEDGE_OBLIQUE153) return 64 - av1g_wedge_ob63(j, 63 - i);
+  return av1g_wedge_ob63(i, j);
+}
+
+/* One sample of a block's wedge mask, at luma resolution: the master mask
+ * shifted so the wedge sits where the size's codebook entry puts it. `flip` is
+ * the block's position in the master table - the specification stores both
+ * signs of every wedge and picks one from the mask's average, which is a
+ * property of the block and not of the sample. */
+AV1G_FN int av1g_wedge_px(const Av1gInterJob *job, int i, int j) {
+  const int m = av1g_wedge_master(job->wedge_dir, av1g_clip(job->wedge_yoff + i, 0, 63),
+                                  av1g_clip(job->wedge_xoff + j, 0, 63));
+  return job->wedge_flip ? 64 - m : m;
+}
+
+/* One sample of a difference weighted mask, from the two predictions at luma
+ * resolution. `sh` is where the round to sample units happens: InterPostRound
+ * plus the (BitDepth - 8) of a high bit depth stream.
+ *
+ * The two shifts are not one: the specification rounds on the way to sample
+ * units and then *divides* by 16, so folding them into a single rounded shift
+ * biases the weight up by one whenever the difference lands in the upper half
+ * of a 16 sample unit. That is worth one level on a small fraction of samples,
+ * which is exactly the kind of error a bit exactness test catches. */
+AV1G_FN int av1g_diffwtd_m(int d, int sh, int sign) {
+  d = (d + (1 << (sh - 1))) >> sh;
+  d = av1g_clip(38 + (d >> 4), 0, 64);
+  return sign ? 64 - d : d;
+}
+
+/* The two luma predictions at one luma sample under a chroma sample. The
+ * difference weighted mask is a function of them, and a chroma job does not
+ * otherwise have luma resolution predictions, so the job carries the luma
+ * planes, the patch origin and the visible size for exactly this. */
+AV1G_FN int av1g_mask_luma_diff(const Av1gInterJob *job, AV1G_GLOBAL const av1g_px *cur,
+                                AV1G_GLOBAL const av1g_px *pool,
+                                AV1G_GLOBAL const int *filters, int lx, int ly, int extent_w,
+                                int extent_h) {
+  Av1gInterCtx lctx;
+  int v0, v1;
+  lctx.sub_x = 0;
+  lctx.sub_y = 0;
+  lctx.ref_w = job->luma_ref_w;
+  lctx.ref_h = job->luma_ref_h;
+  lctx.border = 0;
+  lctx.bitdepth = job->bitdepth;
+  v0 = av1g_inter_tap(&lctx, job->ref0_slot >= 0 ? pool : cur, job->luma_ref0_off,
+                      job->luma_stride, job->luma_x, job->luma_y, extent_w, extent_h,
+                      job->mv0_x, job->mv0_y, job->filt, job->filt_v, lx, ly, 1, filters);
+  v1 = av1g_inter_tap(&lctx, job->ref1_slot >= 0 ? pool : cur, job->luma_ref1_off,
+                      job->luma_stride, job->luma_x, job->luma_y, extent_w, extent_h,
+                      job->mv1_x, job->mv1_y, job->filt, job->filt_v, lx, ly, 1, filters);
+  return v0 - v1;
+}
+
 /*
  * get_obmc_mask: the taper an overlap prediction is blended with, 64 at the
  * edge it shares with the block's own prediction and smaller towards the block
@@ -1383,10 +1508,45 @@ AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
        * before the blend: the sum is what gets rounded and clipped. */
       const int round0 = job->bitdepth >= 12 ? 5 : 3;
       const int post = 2 * 7 - (round0 + 7);
-      if (job->compound == AV1G_COMPOUND_AVG)
+      if (job->mask_kind != AV1G_MASK_NONE) {
+        /* Masked compound (7.11.3.14): one weight per sample, still applied to
+         * the unrounded pair, and the round and clip happen once at the end.
+         * The mask lives on the luma grid, so a subsampled plane averages the
+         * two or four luma weights under it - the spec rounds that average,
+         * which is the only reason the chroma mask is not just a decimation. */
+        const int sh = post + (job->bitdepth - 8);
+        int m, sum = 0, n = 0;
+        int i, j;
+        const int ny = ctx.sub_y + 1, nx = ctx.sub_x + 1;
+        for (j = 0; j < ny; ++j) {
+          for (i = 0; i < nx; ++i) {
+            const int lx = (x << ctx.sub_x) + i;
+            const int ly = (y << ctx.sub_y) + j;
+            if (job->mask_kind == AV1G_MASK_WEDGE) {
+              m = av1g_wedge_px(job, ly, lx);
+              if (job->mask_sign) m = 64 - m;
+            } else if (ctx.sub_x == 0 && ctx.sub_y == 0) {
+              /* the luma plane already has both predictions, so its mask needs
+               * no second pass over the references */
+              m = av1g_diffwtd_m(av1g_abs(v0 - v1), sh, job->mask_sign);
+            } else {
+              m = av1g_diffwtd_m(
+                  av1g_abs(av1g_mask_luma_diff(job, cur, pool, filters, lx, ly,
+                                               job->w << ctx.sub_x, job->h << ctx.sub_y)),
+                  sh, job->mask_sign);
+            }
+            sum += m;
+            ++n;
+          }
+        }
+        /* Round2(sum, log2(n)) with n a power of two: 1, 2 or 4 samples. */
+        m = n == 1 ? sum : (n == 2 ? (sum + 1) >> 1 : (sum + 2) >> 2);
+        out = (m * v0 + (64 - m) * v1 + (1 << (5 + post))) >> (6 + post);
+      } else if (job->compound == AV1G_COMPOUND_AVG) {
         out = (v0 + v1 + (1 << post)) >> (1 + post);
-      else
+      } else {
         out = (job->w0 * v0 + job->w1 * v1 + (1 << (3 + post))) >> (4 + post);
+      }
     }
   }
   out = av1g_clip_px(out, maxv);

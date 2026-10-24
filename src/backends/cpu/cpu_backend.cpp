@@ -162,6 +162,14 @@ class CpuBackend final : public Backend {
           job.ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
         if (job.ref1_slot >= 0)
           job.ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
+        /* a difference weighted chroma block builds its mask on the luma plane, so
+         * those offsets need the same slot rebase the two named planes get */
+        if (job.mask_kind == AV1G_MASK_DIFFWTD) {
+          if (job.ref0_slot >= 0)
+            job.luma_ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
+          if (job.ref1_slot >= 0)
+            job.luma_ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
+        }
         for (int k = 0; k < job.obmc_count; ++k)
           if (job.obmc[k].ref_slot >= 0)
             job.obmc[k].ref_off += job.obmc[k].ref_slot * static_cast<int>(g.buffer_size);

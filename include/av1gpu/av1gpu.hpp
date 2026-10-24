@@ -175,6 +175,10 @@ enum class CompoundType : int {
   /* the two predictions are blended with the weights the frame distances give
    * (BlockSyntax::blend) */
   Distance = 2,
+  /* a masked blend: a wedge shape, or weights that follow how far the two
+   * predictions are apart (BlockSyntax::wedge_index and ::mask_sign) */
+  Wedge = 3,
+  DiffWtd = 4,
 };
 
 /* One transform block inside a BlockSyntax.  Coefficients live in the frame's
@@ -263,6 +267,11 @@ struct BlockSyntax {
   /* Distance weighted compound weights, Q4 and summing to 16 (the
    * specification's FwdWeight/BckWeight). */
   int blend[2] = {8, 8};
+  /* Masked compound: the wedge shape (0..15, an index into the wedge codebook)
+   * and the mask sign - which half of the wedge, or which way the difference
+   * weighted mask leans. */
+  int wedge_index = 0;
+  int mask_sign = 0;
   /* Overlapped block motion compensation strips, in the order the
    * specification blends them: the ones from above first, then from the left. */
   std::vector<ObmcCandidate> obmc;

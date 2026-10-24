@@ -324,6 +324,80 @@ void frame_to_rgb(const Frame& frame, ColorMatrix matrix, ColorRange range,
   }
 }
 
+/* ---- masked compound: the wedge codebook ------------------------------- */
+
+namespace {
+
+/* Wedge_Codebook[3][16][3] from the specification (section 7.11.3.11): the
+ * master mask direction and the offset, in eighths of the block size, that
+ * places the wedge for one block shape. The three rows are the tall shapes, the
+ * wide ones and the square ones - the wedge table is indexed by shape rather
+ * than by size, so an 8x16 and a 16x32 block share a row. */
+struct WedgeCode {
+  int dir;
+  int xoff;
+  int yoff;
+};
+
+const WedgeCode kWedgeCodebook[3][16] = {
+    {{AV1G_WEDGE_OBLIQUE27, 4, 4}, {AV1G_WEDGE_OBLIQUE63, 4, 4},
+     {AV1G_WEDGE_OBLIQUE117, 4, 4}, {AV1G_WEDGE_OBLIQUE153, 4, 4},
+     {AV1G_WEDGE_HORIZONTAL, 4, 2}, {AV1G_WEDGE_HORIZONTAL, 4, 4},
+     {AV1G_WEDGE_HORIZONTAL, 4, 6}, {AV1G_WEDGE_VERTICAL, 4, 4},
+     {AV1G_WEDGE_OBLIQUE27, 4, 2}, {AV1G_WEDGE_OBLIQUE27, 4, 6},
+     {AV1G_WEDGE_OBLIQUE153, 4, 2}, {AV1G_WEDGE_OBLIQUE153, 4, 6},
+     {AV1G_WEDGE_OBLIQUE63, 2, 4}, {AV1G_WEDGE_OBLIQUE63, 6, 4},
+     {AV1G_WEDGE_OBLIQUE117, 2, 4}, {AV1G_WEDGE_OBLIQUE117, 6, 4}},
+    {{AV1G_WEDGE_OBLIQUE27, 4, 4}, {AV1G_WEDGE_OBLIQUE63, 4, 4},
+     {AV1G_WEDGE_OBLIQUE117, 4, 4}, {AV1G_WEDGE_OBLIQUE153, 4, 4},
+     {AV1G_WEDGE_VERTICAL, 2, 4}, {AV1G_WEDGE_VERTICAL, 4, 4},
+     {AV1G_WEDGE_VERTICAL, 6, 4}, {AV1G_WEDGE_HORIZONTAL, 4, 4},
+     {AV1G_WEDGE_OBLIQUE27, 4, 2}, {AV1G_WEDGE_OBLIQUE27, 4, 6},
+     {AV1G_WEDGE_OBLIQUE153, 4, 2}, {AV1G_WEDGE_OBLIQUE153, 4, 6},
+     {AV1G_WEDGE_OBLIQUE63, 2, 4}, {AV1G_WEDGE_OBLIQUE63, 6, 4},
+     {AV1G_WEDGE_OBLIQUE117, 2, 4}, {AV1G_WEDGE_OBLIQUE117, 6, 4}},
+    {{AV1G_WEDGE_OBLIQUE27, 4, 4}, {AV1G_WEDGE_OBLIQUE63, 4, 4},
+     {AV1G_WEDGE_OBLIQUE117, 4, 4}, {AV1G_WEDGE_OBLIQUE153, 4, 4},
+     {AV1G_WEDGE_HORIZONTAL, 4, 2}, {AV1G_WEDGE_HORIZONTAL, 4, 6},
+     {AV1G_WEDGE_VERTICAL, 2, 4}, {AV1G_WEDGE_VERTICAL, 6, 4},
+     {AV1G_WEDGE_OBLIQUE27, 4, 2}, {AV1G_WEDGE_OBLIQUE27, 4, 6},
+     {AV1G_WEDGE_OBLIQUE153, 4, 2}, {AV1G_WEDGE_OBLIQUE153, 4, 6},
+     {AV1G_WEDGE_OBLIQUE63, 2, 4}, {AV1G_WEDGE_OBLIQUE63, 6, 4},
+     {AV1G_WEDGE_OBLIQUE117, 2, 4}, {AV1G_WEDGE_OBLIQUE117, 6, 4}},
+};
+
+/* Wedge_Bits[bsize] > 0: the shapes that carry a wedge at all. Everything
+ * larger than 32x32 uses the difference weighted mask instead, which is why the
+ * master mask only ever has to cover 32 samples. */
+bool wedge_shape(int w, int h, int* shape) {
+  if (w < 8 || h < 8 || w > 32 || h > 32) return false;
+  *shape = h > w ? 0 : (h < w ? 1 : 2);
+  return true;
+}
+
+} /* namespace */
+
+bool wedge_entry(int block_w, int block_h, int wedge_index, int* dir, int* xoff, int* yoff,
+                 int* flip) {
+  int shape = 0;
+  if (wedge_index < 0 || wedge_index >= 16 || !wedge_shape(block_w, block_h, &shape))
+    return false;
+  const WedgeCode& c = kWedgeCodebook[shape][wedge_index];
+  *dir = c.dir;
+  *xoff = 32 - ((c.xoff * block_w) >> 3);
+  *yoff = 32 - ((c.yoff * block_h) >> 3);
+  /* flipSign: the specification stores both signs of every wedge and picks one
+   * by the sign of the mask's mean. Only the first row and the first column are
+   * summed, which is enough: the wedge is monotone along both. */
+  int sum = 0;
+  for (int i = 0; i < block_w; ++i) sum += av1g_wedge_master(c.dir, *yoff, *xoff + i);
+  for (int i = 1; i < block_h; ++i) sum += av1g_wedge_master(c.dir, *yoff + i, *xoff);
+  const int n = block_w + block_h - 1;
+  const int avg = (sum + n / 2) / n;
+  *flip = avg < 32 ? 1 : 0;
+  return true;
+}
+
 } /* namespace tables */
 } /* namespace internal */
 } /* namespace av1gpu */

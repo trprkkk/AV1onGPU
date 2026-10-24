@@ -277,6 +277,8 @@ inline CompoundType to_compound_type(int compound) {
   switch (compound) {
     case kCompoundWeightedAverage: return CompoundType::Distance;
     case kCompoundAverage: return CompoundType::Average;
+    case kCompoundWedge: return CompoundType::Wedge;
+    case kCompoundDiffwtd: return CompoundType::DiffWtd;
     default: return CompoundType::None;
   }
 }
@@ -440,10 +442,6 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
         *error = "reconstruct: warped motion is not implemented";
         return false;
       }
-      if (block.compound_type == kCompoundWedge || block.compound_type == kCompoundDiffwtd) {
-        *error = "reconstruct: masked compound prediction is not implemented";
-        return false;
-      }
       const bool two_refs = block.compound_type != kCompoundNone;
       for (int i = 0; i < (two_refs ? 2 : 1); ++i) {
         const int type = block.ref_frame[i] - 1; /* kRefLast (1) -> index 0 */
@@ -498,6 +496,8 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
         bs.compound = compound;
         bs.blend[0] = blend[0];
         bs.blend[1] = blend[1];
+        bs.wedge_index = block.wedge_index;
+        bs.mask_sign = block.mask_sign;
         bs.obmc.clear();
         inter_used[plane] = false;
         if (block.motion_mode == kMotionObmc) {

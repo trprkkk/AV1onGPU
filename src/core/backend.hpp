@@ -175,6 +175,13 @@ int tx_row_shift(int w, int h);
  * Q7, laid out row major. */
 const std::vector<int>& filters();
 
+/* The wedge codebook entry for a block of `block_w` x `block_h` *luma* samples
+ * and a wedge index: the master mask direction, the mask origin and the sign
+ * the block's mask is flipped with (the specification's flipSign). Returns
+ * false for the shapes that carry no wedge. */
+bool wedge_entry(int block_w, int block_h, int wedge_index, int* dir, int* xoff, int* yoff,
+                 int* flip);
+
 /* Generates the film grain template for a seed, as the AV1 spec's
  * pseudo random noise generator does. */
 void grain_template(int seed, int stride, int rows, std::vector<signed char>* out);
