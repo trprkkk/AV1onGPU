@@ -927,7 +927,16 @@ void test_block_geometry() {
   CHECK(partition_subsize(kPartitionSplit, kBlock8x8) == kBlock4x4);
   CHECK(partition_subsize(kPartitionHorizontal4, kBlock64x64) == kBlock64x16);
   CHECK(partition_subsize(kPartitionVertical4, kBlock32x32) == kBlock8x32);
-  CHECK(partition_subsize(kPartitionHorizontalA, kBlock16x16) == kBlock8x8);
+  /* the T shapes: Partition_Subsize gives the largest of the two sub-blocks,
+   * which is the long one - the parent's width for HORZ_A/B, its height for
+   * VERT_A/B - and only the square halves come from the split size */
+  CHECK(partition_subsize(kPartitionHorizontalA, kBlock16x16) == kBlock16x8);
+  CHECK(partition_subsize(kPartitionHorizontalB, kBlock16x16) == kBlock16x8);
+  CHECK(partition_subsize(kPartitionVerticalA, kBlock16x16) == kBlock8x16);
+  CHECK(partition_subsize(kPartitionVerticalB, kBlock16x16) == kBlock8x16);
+  CHECK(partition_subsize(kPartitionHorizontalA, kBlock32x32) == kBlock32x16);
+  CHECK(partition_subsize(kPartitionVerticalA, kBlock32x32) == kBlock16x32);
+  CHECK(partition_subsize(kPartitionHorizontal4, kBlock16x16) == kBlock16x4);
 
   /* block levels are counted from the largest block down, because that is the
    * order of the partition tables */

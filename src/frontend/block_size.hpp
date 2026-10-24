@@ -131,7 +131,20 @@ inline BlockSize partition_subsize(PartitionType partition, BlockSize parent) {
     case kPartitionVertical4:
       w4 /= 4;
       break;
-    default: /* SPLIT, and the four T shapes, use the quadrant size */
+    /* The T shapes code one half as two squares and the other half as a single
+     * long block, and Partition_Subsize gives the largest of the two - the long
+     * block, which keeps the parent's width (HORZ_A/B) or height (VERT_A/B).
+     * Only the squares come from Partition_Subsize[PARTITION_SPLIT], which the
+     * caller takes separately. */
+    case kPartitionHorizontalA:
+    case kPartitionHorizontalB:
+      h4 /= 2;
+      break;
+    case kPartitionVerticalA:
+    case kPartitionVerticalB:
+      w4 /= 2;
+      break;
+    default: /* SPLIT */
       w4 /= 2;
       h4 /= 2;
       break;

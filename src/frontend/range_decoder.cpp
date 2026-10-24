@@ -131,11 +131,13 @@ unsigned RangeDecoder::decode_bool_equi() {
   if (above) {
     v += r - 2 * v;
     normalize(dif - threshold, v);
+    hash_symbol(0);
     trace_bool("E", 0, 0);
     trace_state(dif_, rng_, cnt_);
     return 0;
   }
   normalize(dif, v);
+  hash_symbol(1);
   trace_bool("E", 1, 0);
   trace_state(dif_, rng_, cnt_);
   return 1;
@@ -151,11 +153,13 @@ unsigned RangeDecoder::decode_bool(unsigned probability) {
   if (above) {
     v += r - 2 * v;
     normalize(dif - threshold, v);
+    hash_symbol(0);
     trace_bool("B", 0, probability);
     trace_state(dif_, rng_, cnt_);
     return 0;
   }
   normalize(dif, v);
+  hash_symbol(1);
   trace_bool("B", 1, probability);
   trace_state(dif_, rng_, cnt_);
   return 1;
@@ -197,6 +201,7 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
   }
 
   normalize(dif_ - (static_cast<uint64_t>(v) << (kWindowBits - 16)), u - v);
+  hash_symbol(static_cast<unsigned>(symbol));
 
   if (tracing) {
     trace_symbol(static_cast<unsigned>(symbol), before, nsymbols);

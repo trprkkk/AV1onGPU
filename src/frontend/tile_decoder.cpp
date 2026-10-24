@@ -28,6 +28,14 @@ bool trace_enabled() {
   return enabled;
 }
 
+/* AV1GPU_TRACE_CDF=1 adds the partition context derivation and the whole CDF
+ * row to that trace. Finding the first block where two decoders disagree needs
+ * it, but it is far too much output for every other use of the trace. */
+bool cdf_trace_enabled() {
+  static const bool enabled = std::getenv("AV1GPU_TRACE_CDF") != nullptr;
+  return enabled;
+}
+
 void trace_block(const TileBlock& block) {
   if (block.is_inter) {
     std::fprintf(stderr,
@@ -360,8 +368,18 @@ class TileParser {
   int partition_context(int row, int col, int level) {
     const int bsl = 5 - level; /* log2 of the parent's side in 4x4 units */
     int above = 0, left = 0;
-    if (have_top(row)) above = kBlockWidthLog2[mi_size_[index(row - 1, col)]] < bsl;
-    if (have_left(col)) left = kBlockHeightLog2[mi_size_[index(row, col - 1)]] < bsl;
+    int above_sz = -1, left_sz = -1;
+    if (have_top(row)) {
+      above_sz = mi_size_[index(row - 1, col)];
+      above = kBlockWidthLog2[above_sz] < bsl;
+    }
+    if (have_left(col)) {
+      left_sz = mi_size_[index(row, col - 1)];
+      left = kBlockHeightLog2[left_sz] < bsl;
+    }
+    if (cdf_trace_enabled())
+      std::fprintf(stderr, "PC %d %d bsl=%d above_sz=%d left_sz=%d above=%d left=%d\n", col, row,
+                   bsl, above_sz, left_sz, above, left);
     return left * 2 + (above ? 1 : 0);
   }
 
@@ -2277,13 +2295,23 @@ class TileParser {
       /* the alphabet shrinks with the level: 128x128 blocks cannot use the
        * 4:1 splits and 8x8 blocks only have the four legacy types */
       const int nsymbols = kPartitionSymbols[level];
-      partition = static_cast<PartitionType>(
-          decoder_.read_symbol(cdf_.partition.row(level, ctx), nsymbols));
+      uint16_t* const row_cdf = cdf_.partition.row(level, ctx);
+      const uint16_t cdf_before[4] = {row_cdf[0], row_cdf[1], row_cdf[2], row_cdf[3]};
+      const uint16_t cdf_counter_before = row_cdf[nsymbols];
+      partition = static_cast<PartitionType>(decoder_.read_symbol(row_cdf, nsymbols));
       if (trace_enabled()) {
         const RangeDecoder::State state = decoder_.state();
-        std::fprintf(stderr, "P %d %d bl=%d ctx=%d bp=%d %llu %u %d\n", col, row, level, ctx,
-                     static_cast<int>(partition),
-                     static_cast<unsigned long long>(state.window), state.range, state.count);
+        std::fprintf(stderr,
+                     "P %d %d bl=%d ctx=%d bp=%d %llu %u %d cdf=%u,%u,%u,%u n=%u\n", col, row,
+                     level, ctx, static_cast<int>(partition),
+                     static_cast<unsigned long long>(state.window), state.range, state.count,
+                     cdf_before[0], cdf_before[1], cdf_before[2], cdf_before[3],
+                     cdf_counter_before);
+        if (cdf_trace_enabled()) {
+          std::fprintf(stderr, "PA");
+          for (int z = 0; z <= nsymbols; ++z) std::fprintf(stderr, ",%d", row_cdf[z]);
+          std::fprintf(stderr, "\n");
+        }
       }
       if (static_cast<int>(partition) > nsymbols) return corrupt("partition");
     } else if (have_cols) {
@@ -2367,6 +2395,7 @@ class TileParser {
 
   ParseStatus decode_block(int row, int col, BlockSize size, PartitionType partition) {
     TileBlock block;
+    decoder_.reset_symbol_hash();
     block.mi_row = row;
     block.mi_col = col;
     block.size = size;
@@ -2582,7 +2611,11 @@ class TileParser {
         return status;
       }
     }
-    if (trace_enabled()) trace_block(block);
+    if (trace_enabled()) {
+      trace_block(block);
+      std::fprintf(stderr, "H %d %d %d %d %u\n", col, row, block_width4(size),
+                   block_height4(size), decoder_.symbol_hash());
+    }
     trace_state(block);
     out_->blocks.push_back(block);
     return ParseStatus::Ok;

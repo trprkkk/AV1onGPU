@@ -89,6 +89,12 @@ class RangeDecoder {
   /* Bytes consumed so far, counting the lookahead window. */
   size_t bytes_used() const { return static_cast<size_t>(buf_pos_ - buf_); }
 
+  /* A rolling hash of every symbol decoded since the last reset. Two decoders
+   * that parse the same stream produce the same value, so a per-block dump of
+   * it pinpoints the first block whose bitstream reading disagrees. */
+  unsigned symbol_hash() const { return symbol_hash_; }
+  void reset_symbol_hash() { symbol_hash_ = 0; }
+
   /* The raw window, range and counter. Reference decoders expose the same
    * three values (dav1d calls them dif, rng and cnt), which makes them the
    * cheapest way to find the exact symbol where two implementations of the
@@ -101,6 +107,10 @@ class RangeDecoder {
   State state() const { return State{dif_, rng_, cnt_}; }
 
  private:
+  /* Every decoded value feeds a rolling hash, in the same order the reference
+   * decoder mixes its own, so the per-block dumps of the two can be compared
+   * directly. The offsets keep the four kinds of call apart. */
+  void hash_symbol(unsigned value) { symbol_hash_ = symbol_hash_ * 0x9E3779B1u + value; }
   unsigned decode_bool_equi();
   unsigned decode_bool(unsigned probability);
   unsigned decode_symbol(uint16_t* cdf, int nsymbols);
@@ -114,6 +124,7 @@ class RangeDecoder {
   unsigned rng_ = 0;
   int cnt_ = 0;
   bool update_cdf_ = true;
+  unsigned symbol_hash_ = 0;
   bool overrun_ = false;
   bool failed_ = false;
 };
