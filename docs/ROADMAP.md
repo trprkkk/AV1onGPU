@@ -36,46 +36,42 @@ The symbol reader is bit identical to dav1d's `msac`: replaying dav1d's own
 per-symbol trace of the fixture's key frame reproduces all **112,648 events**
 and the range coder state at every one of them (see `docs/ACCURACY.md`).
 
-**Started: the tile syntax.** `src/frontend/tile_decoder.hpp` walks a key
+**Done: a whole intra frame, bit exact.** `tests/data/svt_av1_320x240.ivf`'s key
+frame now decodes to the same picture dav1d produces, sample for sample, with
+the deblocking filter and CDEF enabled. `tests/test_frontend.cpp` pins two
+hashes of that picture (and of two patched variants that push every loop filter
+level to its maximum, so the wide filter, the flat masks and the per pass, per
+plane level selection are all covered), which means the parser, the coefficient
+decoder, prediction, chroma from luma, the inverse transforms, the deblocking
+filter and CDEF are all exercised by one reference picture.
+
+**Done: the tile syntax.** `src/frontend/tile_decoder.hpp` walks a key
 frame's tile the way the bitstream describes it: superblocks, the partition
 tree (including the edge cases where only one direction can be split), skip,
 per-superblock quantiser deltas, intra modes with their angle deltas, chroma
 from luma, filter intra and the transform size, keeping the per-4x4 neighbour
 maps the contexts are built from. It produces a block tree, which is what the
-prediction and residual layers consume. It stops - with the block and the byte
-- where coefficient decoding starts, which is the next piece.
-
-**Started: the default probability tables.** `src/frontend/cdf.hpp` holds the
-specification's default tables for the partition symbol (all five block levels,
-all four contexts) and for skip, in the inverse-CDF layout the range decoder
-consumes. `tests/test_entropy.cpp` decodes the first symbol of the fixture's
-key frame out of those tables and requires dav1d's value, so the table
-convention (32768 - x, counter after the probabilities) is pinned against a real
-stream rather than only against the specification text. What is still missing is
-everything *above* the symbol reader: the default tables for the rest of the
-syntax, and the syntax layer that turns symbols into `FrameSyntax`.
+prediction and residual layers consume: the whole tile, including the
+coefficient syntax (end of block, base tokens, the extended levels, signs), the
+dequantisation, the `cdef_idx` grid and the loop filter parameters. The default
+CDF tables in `src/frontend/cdf.hpp` cover every symbol it reads, in the
+inverse-CDF layout the range decoder consumes, and `tests/test_entropy.cpp`
+still pins the convention (32768 - x, counter after the probabilities) against
+the first symbol of the fixture's key frame.
 
 **Next, in order:**
 
-1. *Coefficients.* The last syntax layer: end of block position, base tokens,
-   the extended levels, signs, and the dequantisation that turns them into the
-   coefficients the engine's inverse transform takes. The trace of the fixture
-   is the oracle: every symbol must come out of the tables and in the order
-   dav1d decoded it. Then `exit_symbol` and the end-of-frame CDF update, which
-   close out the tile.
-2. *Inter frames.* Reference handling, motion vectors, the compound syntax.
-2. *Tile and partition tree.* Superblock loop, partition symbols, block sizes,
-   transform selection, and the coefficient syntax with its scan tables. This is
-   the bulk of the work and the point where the front-end first emits a
-   `FrameSyntax` the engine can decode.
-3. *Reference frame management in the engine.* The front-end already tracks the
-   eight slots for header parsing; the decoder needs the actual sample buffers,
-   reference scaling and `show_existing_frame` output.
-4. *Optional:* a libaom / dav1d hook that emits syntax from an already
-   conformance-tested parser. Useful for testing the engine against real
-   streams long before our own parser is complete.
-
-Schedule: one `SyntaxBuilder` class, no changes to the backends.
+1. *Inter frames.* Reference handling (the eight slots, the actual sample
+   buffers, `show_existing_frame` output), motion vectors, the compound syntax,
+   and then the engine's inter path: the subpel filters, OBMC and mask compound
+   from the sections below. Frames 1-5 of the fixture are inter frames, so this
+   is what turns a still picture into a video.
+2. *A second intra frame to check against.* One reference picture proves a lot
+   but it cannot cover filter intra, every transform shape or a 128x128
+   superblock; a stream per feature class is cheap insurance and needs an
+   encoder (or a hand-patched fixture) to produce.
+3. *Restoration.* `loop_restoration` is currently rejected at the frame header;
+   the fixture signals it off, so nothing below it has been exercised.
 
 ## 2. Subpel filters from the specification
 
@@ -108,11 +104,34 @@ effort:
 * a persistent kernel that walks the wavefront on the device (needs an atomics
   based scheduler; well worth it for 1080p+).
 
-## 6. Zero-copy output
+## 6. Zero-copy output, and being usable by a browser
 
 `Decoder::to_rgb` converts on the device, but the result is copied back to host
-memory. Binding the OpenCL/CUDA buffer to a texture / `cl_khr_gl_sharing`
-surface would let a player present it directly.
+memory. For a browser to pick the decoder up transparently there is a layer
+missing on top of the library, and it is the layer `compute-vp9` (a VP9 port of
+the same idea, Vulkan compute shaders for cards without a fixed function VP9
+decoder) already built for VA-API:
+
+* **A VA-API driver plugin.** ~950 lines in `compute-vp9/src/vaapi/`: the
+  entrypoints Chrome and Firefox call (`vaQueryConfigProfiles`,
+  `vaCreateSurfaces2`, `vaBeginPicture`/`vaRenderPicture`/`vaEndPicture`,
+  `vaExportSurfaceHandle`), with `VAProfileAV1Profile0` in place of the VP9
+  profiles. Chrome listed that driver as "hardware accelerated" even though the
+  decode is compute shaders, which is exactly the effect we want.
+* **NV12 pack straight into the surface.** A VA surface is NV12 with a pitch of
+  its own, so the last step is planar YUV in, interleaved UV out, on the device.
+  That is a small kernel (their `vp9_nv12_pack.comp.glsl` is 59 lines) and it
+  removes the CPU copy that would otherwise give back the CPU time we saved.
+* **DMA-BUF export** (`VK_EXT_external_memory_dma_buf`; for us the OpenCL
+  equivalents) so the compositor imports the frame with no copy at all.
+* **A pipelined decode API.** `compute-vp9` keeps three frames in flight and
+  offers a non-blocking `cvp9_get_frame` next to the blocking one. Our engine is
+  synchronous per frame; a submission queue of that shape is what lets the host
+  parse frame N+1 while the device reconstructs frame N, which is the only way
+  the CPU share stays where the benchmarks say it should be.
+
+Order matters: inter frames first (a browser cannot use an intra-only decoder),
+then this. None of it touches the kernels.
 
 ## 7. Bit depth and chroma coverage
 
