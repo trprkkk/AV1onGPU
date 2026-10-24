@@ -201,7 +201,7 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
   const unsigned r = rng_ >> 8;
   /* the trace shows the table as it was before this symbol adapted it */
   uint16_t before[kMaxCdfSymbols + 1] = {0};
-  const bool tracing = trace_file() != nullptr;
+  const bool tracing = trace_file() != nullptr || symtrace;
   if (tracing) {
     for (int i = 0; i <= nsymbols; ++i) before[i] = cdf[i];
   }
@@ -231,6 +231,11 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
   }
 
   normalize(dif_ - (static_cast<uint64_t>(v) << (kWindowBits - 16)), u - v);
+  if (symtrace) {
+    std::fprintf(stderr, "SD %d", nsymbols);
+    for (int i = 0; i <= nsymbols; ++i) std::fprintf(stderr, " %u", before[i]);
+    std::fprintf(stderr, " %d\n", symbol);
+  }
   if (symtrace) std::fprintf(stderr, "Y 2 %llu %u %d %d\n",
                              static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt,
                              symbol);

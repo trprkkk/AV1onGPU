@@ -31,6 +31,10 @@ bool trace_enabled() {
 /* AV1GPU_TRACE_CDF=1 adds the partition context derivation and the whole CDF
  * row to that trace. Finding the first block where two decoders disagree needs
  * it, but it is far too much output for every other use of the trace. */
+/* The frame this decoder is currently parsing, counted from zero. Only the
+ * debug probes read it, and only so a dump can be attributed to a frame. */
+int g_frame_ordinal = -1;
+
 bool cdf_trace_enabled() {
   static const bool enabled = std::getenv("AV1GPU_TRACE_CDF") != nullptr;
   return enabled;
@@ -748,7 +752,8 @@ class TileParser {
    * reference frame to *its* reference, so the two projections land on this
    * frame along two different directions. */
   void add_temporal_candidate(MvCand* stack, int* count, const TemporalMv& cell, int ref0,
-                              int ref1, int* globalmv_ctx, int gmv_x, int gmv_y, int weight) {
+                              int ref1, int* globalmv_ctx, int gmv_x, int gmv_y, int weight,
+                              int origin_row, int origin_col) {
     if (!cell.valid()) return;
     MvCand entry;
     entry.weight = weight;
@@ -756,8 +761,15 @@ class TileParser {
     entry.mv[0][1] = project_mv_component(cell.y, pocdiff_[ref0 - 1], cell.ref);
     lower_mv_precision(&entry.mv[0][0], &entry.mv[0][1]);
     if (ref1 == kRefIntra) {
-      if (globalmv_ctx)
+      if (globalmv_ctx) {
         *globalmv_ctx = (std::abs(entry.mv[0][0] - gmv_x) | std::abs(entry.mv[0][1] - gmv_y)) >= 16;
+        if (trace_enabled())
+          std::fprintf(stderr,
+                       "GMV fo=%d %d %d mv=%d,%d gmv=%d,%d res=%d raw=%d,%d rr=%d pd=%d,%d\n",
+                       g_frame_ordinal, origin_col, origin_row, entry.mv[0][1], entry.mv[0][0],
+                       gmv_y, gmv_x, *globalmv_ctx, cell.y, cell.x, cell.ref,
+                       pocdiff_[ref0 - 1], pocdiff_[cell.ref - 1]);
+      }
     } else {
       entry.mv[1][0] = project_mv_component(cell.x, pocdiff_[ref1 - 1], cell.ref);
       entry.mv[1][1] = project_mv_component(cell.y, pocdiff_[ref1 - 1], cell.ref);
@@ -803,13 +815,13 @@ class TileParser {
           continue;
         }
         add_temporal_candidate(stack, count, run, ref0, ref1, run_gmv_ctx, gmv_x, gmv_y,
-                               2 * run_len);
+                               2 * run_len, mi_row, mi_col);
         run_gmv_ctx = nullptr;
         run = cell;
         run_len = 1;
       }
     }
-    add_temporal_candidate(stack, count, run, ref0, ref1, run_gmv_ctx, gmv_x, gmv_y, 2 * run_len);
+    add_temporal_candidate(stack, count, run, ref0, ref1, run_gmv_ctx, gmv_x, gmv_y, 2 * run_len, mi_row, mi_col);
 
     /* Small blocks also look at the cells just past their bottom right corner,
      * which are the ones a neighbouring block's own scan would not reach. */
@@ -818,16 +830,16 @@ class TileParser {
       const bool has_bottom = by8 + bh8 < std::min(tile_row_end_ >> 1, (by8 & ~7) + 8);
       if (has_bottom && bx8 - 1 >= std::max(tile_col_start_ >> 1, bx8 & ~7)) {
         add_temporal_candidate(stack, count, projected_at(bx8 - 1, by8 + bh8), ref0, ref1,
-                               nullptr, 0, 0, 2);
+                               nullptr, 0, 0, 2, mi_row, mi_col);
       }
       if (bx8 + bw8 < std::min(tile_col_end_ >> 1, (bx8 & ~7) + 8)) {
         if (has_bottom) {
           add_temporal_candidate(stack, count, projected_at(bx8 + bw8, by8 + bh8), ref0, ref1,
-                                 nullptr, 0, 0, 2);
+                                 nullptr, 0, 0, 2, mi_row, mi_col);
         }
         if (by8 + bh8 - 1 < std::min(tile_row_end_ >> 1, (by8 & ~7) + 8)) {
           add_temporal_candidate(stack, count, projected_at(bx8 + bw8, by8 + bh8 - 1), ref0,
-                                 ref1, nullptr, 0, 0, 2);
+                                 ref1, nullptr, 0, 0, 2, mi_row, mi_col);
         }
       }
     }
@@ -896,6 +908,8 @@ class TileParser {
    * reference block: the specification writes -1 there, and that value is what
    * selects the single reference form of every test below. */
   struct MvScan {
+    int origin_row = 0;   /* the block the scan belongs to, for the traces */
+    int origin_col = 0;
     MvCand* stack = nullptr;
     int* count = nullptr;
     int ref[2] = {kRefIntra, kRefIntra};
@@ -914,6 +928,13 @@ class TileParser {
     if (row < 0 || row >= mi_rows() || col < 0 || col >= mi_cols()) return;
     const MiRef& cand = mi_at(row, col);
     if (cand.intra) return;
+    if (trace_enabled())
+      std::fprintf(stderr, "SC fo=%d %d %d nb=%d,%d bs=%d refs=%d,%d mv=%d,%d,%d,%d mf=%d w=%d\n",
+                   g_frame_ordinal, scan.origin_col, scan.origin_row, col, row,
+                   static_cast<int>(block_size_at(row, col)), cand.ref[0],
+                   cand.ref[1] ? cand.ref[1] : -1, cand.mv[0][1], cand.mv[0][0],
+                   cand.mv[1][1], cand.mv[1][0], cand.global_subpel + 2 * cand.coded_newmv,
+                   weight);
     const bool compound = scan.ref[1] != kRefIntra;
     if (!compound) {
       if (cand.ref[0] != scan.ref[0] && cand.ref[1] != scan.ref[0]) return;
@@ -1101,6 +1122,8 @@ class TileParser {
     const bool compound = ref1 != kRefIntra;
 
     MvScan scan;
+    scan.origin_row = mi_row;
+    scan.origin_col = mi_col;
     scan.stack = stack;
     scan.count = count;
     scan.ref[0] = ref0;
@@ -1171,7 +1194,7 @@ class TileParser {
        * neighbours decide that half of the mode context */
       const bool newmv_before = scan.have_newmv;
       if (static_cast<unsigned>(n) > n_rows && static_cast<unsigned>(n) <= max_rows) {
-        n_rows += scan_row(scan, mi_row - 2 * n + 1, mi_col | 1, bw4, w4,
+        n_rows += scan_row(scan, (mi_row - 2 * n + 1) | 1, mi_col | 1, bw4, w4,
                            1 + static_cast<int>(max_rows) - n, bw4 >= 16 ? 4 : 2, have_row_mvs);
       }
       if (static_cast<unsigned>(n) > n_cols && static_cast<unsigned>(n) <= max_cols) {
@@ -2542,6 +2565,7 @@ class TileParser {
     /* the frame's deltas are coded once per superblock, by its first block */
     read_deltas_ = false;
     trace_point(row, col, "delta");
+    if (trace_enabled()) std::fprintf(stderr, "BF %d %d\n", col, row);
 
     /* intra_frame_mode_info or inter_frame_mode_info: a key frame always codes
      * an intra block, an inter frame codes whether this block is intra and then
@@ -2850,8 +2874,13 @@ class TileParser {
    * or identity, and a 16 point one cannot carry the one dimensional ADST and
    * flip variants. `luma_type` is the type of the luma transform that covers
    * the same samples - the map `set_tx_type` fills. */
-  int inter_chroma_tx_type(TxSize tx, int x4, int y4) const {
-    const int lx = x4 << sub_x(), ly = y4 << sub_y();
+  int inter_chroma_tx_type(const TileBlock& block, TxSize tx, int x4, int y4) const {
+    /* The luma position is the chroma one scaled back up, but a chroma sample
+     * can sit half a luma sample outside its block (the block origin is not
+     * always even), and then the cell belongs to the neighbour. The
+     * specification clamps to the block origin for exactly that reason. */
+    const int lx = std::max(block.mi_col, x4 << sub_x());
+    const int ly = std::max(block.mi_row, y4 << sub_y());
     const int luma_type = tx_type_map_[index(ly, lx)];
     if (tx_square_class(tx) == 3) {
       return luma_type == coef_tables::kIdtx ? coef_tables::kIdtx : coef_tables::kDctDct;
@@ -3063,7 +3092,7 @@ class TileParser {
                           : read_tx_type(block, x4, y4, tx,
                                          tx_set(tx, false, frame_.reduced_tx_set));
     } else {
-      plane_tx_type = block->is_inter ? inter_chroma_tx_type(tx, x4, y4)
+      plane_tx_type = block->is_inter ? inter_chroma_tx_type(*block, tx, x4, y4)
                                       : chroma_tx_type(*block, tx);
     }
     transform.tx_type = plane_tx_type;
@@ -3346,6 +3375,11 @@ ParseStatus decode_tile(const SequenceHeader& seq, const FrameHeader& frame,
     return ParseStatus::Unsupported;
   }
 
+  ++g_frame_ordinal;
+  if (trace_enabled()) {
+    std::fprintf(stderr, "FR %d oh=%d type=%d show=%d\n", g_frame_ordinal, frame.order_hint,
+                 static_cast<int>(frame.type), frame.show_frame ? 1 : 0);
+  }
   TileParser parser(seq, frame, refs, data, size, out, error);
   parser.init_state();
   const ParseStatus status = parser.run();

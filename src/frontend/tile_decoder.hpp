@@ -130,8 +130,8 @@ struct CompoundModePair {
 constexpr CompoundModePair kCompoundModePairs[8] = {
     {{kModeNearestMv, kModeNearestMv}},
     {{kModeNearMv, kModeNearMv}},
-    {{kModeNewMv, kModeNearestMv}},
     {{kModeNearestMv, kModeNewMv}},
+    {{kModeNewMv, kModeNearestMv}},
     {{kModeNearMv, kModeNewMv}},
     {{kModeNewMv, kModeNearMv}},
     {{kModeGlobalMv, kModeGlobalMv}},
