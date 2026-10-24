@@ -175,6 +175,18 @@ int tx_row_shift(int w, int h);
  * Q7, laid out row major. */
 const std::vector<int>& filters();
 
+/* The specification's block warp process filters with Warped_Filters, appended
+ * to the same table: AV1G_WARP_FILTER_OFFSET is where the 193 rows of 8 taps
+ * start, so one uploaded table serves both. */
+constexpr int kWarpFilterRows = 193;
+
+/* setup shear (7.11.3.6, with the resolve divisor of 7.11.3.7): the two
+ * shearing operations an affine model is applied as. `params` is the
+ * specification's warp matrix at WARPEDMODEL_PREC_BITS precision. Returns the
+ * specification's warpValid: a model whose shear is too steep to be applied as
+ * two passes is not warped at all, the block falls back to its motion vector. */
+bool gm_setup_shear(const int32_t* params, int* alpha, int* beta, int* gamma, int* delta);
+
 /* The wedge codebook entry for a block of `block_w` x `block_h` *luma* samples
  * and a wedge index: the master mask direction, the mask origin and the sign
  * the block's mask is flipped with (the specification's flipSign). Returns

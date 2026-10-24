@@ -127,10 +127,19 @@ void read_global_motion_params(const SequenceHeader& seq, FrameHeader& h, BitRea
 
   for (int ref = 1; ref < 8; ++ref) {
     GlobalMotion& gm = h.global_motion[ref];
-    /* PrevGmParams: the model the reference frame itself used, which is what
-     * the coded difference is relative to. */
+    /* PrevGmParams: the model the *primary reference frame* used, which is
+     * what the coded difference is relative to. It is the frame named by
+     * primary_ref_frame, not the reference this model describes: every model
+     * of the frame is coded against the same previous frame's models. Without
+     * a primary reference the defaults stand, which is what an identity model
+     * holds. */
     GlobalMotion prev;
-    if (refs) prev = refs->slots[h.ref_frame_idx[ref - 1]].global_motion[ref];
+    if (refs && h.primary_ref_frame != kPrimaryRefNone) {
+      const int slot = h.ref_frame_idx[h.primary_ref_frame];
+      if (slot >= 0 && slot < 8) {
+        prev = refs->slots[slot].global_motion[ref];
+      }
+    }
 
     h.is_global[ref] = r->read_bit();
     if (!h.is_global[ref]) {

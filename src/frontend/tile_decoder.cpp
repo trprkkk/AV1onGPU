@@ -1480,6 +1480,7 @@ class TileParser {
     kRefKindForward2,     /* fwd_ref_2, uni_p2: LAST3 against GOLDEN */
     kRefKindBackward,     /* bwd_ref, bwd_ref_2: the three backward references */
     kRefKindBackward1,    /* bwd_ref_1: BWDREF against ALTREF2 */
+    kRefKindUniP1,        /* uni_p1: LAST2 against LAST3 + GOLDEN */
   };
 
   /* The reference context helpers all count, over the two neighbours, how many
@@ -1935,8 +1936,10 @@ class TileParser {
           ref1 = kRefAltref;
         } else {
           ref0 = kRefLast;
+          /* uni_comp_ref_p1 asks a different question than comp_ref_p1: LAST2
+           * against LAST3 and GOLDEN together, not LAST against LAST2. */
           int index = decoder_.read_symbol(
-              cdf_.inter.uni_comp_ref[ref_context(row, col, kRefKindForward1)][1], 1);
+              cdf_.inter.uni_comp_ref[ref_context(row, col, kRefKindUniP1)][1], 1);
           if (index) {
             index += decoder_.read_symbol(
                 cdf_.inter.uni_comp_ref[ref_context(row, col, kRefKindForward2)][2], 1);

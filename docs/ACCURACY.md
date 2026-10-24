@@ -15,9 +15,12 @@ not disagreements between backends.
   the same intermediate rounding structure as the spec's staged butterflies.
 * **Residual add and clipping.** `clip(pred + residual, 0, maxv)`, in the
   pipeline order: prediction, then transform, then loop filters.
-* **Subpel interpolation arithmetic.** Q7 taps, two separable passes, each
-  rounded `(acc + 64) >> 7`, the second pass normalised by the filter's DC gain
-  so that flat areas stay flat.
+* **Subpel interpolation arithmetic.** `Subpel_Filters` and `Warped_Filters`
+  are the specification's tables (Q7, 16 phases for the subpel filters and 193
+  offset rows for the warp), not approximations of them. Two separable passes,
+  each rounded `(acc + 64) >> 7`, the second pass normalised by the filter's DC
+  gain so that flat areas stay flat, with the specification's InterRound0 /
+  InterRound1 / InterPostRound shifts.
 * **Deblocking structure.** The job carries `level`, `sharpness`, tap length
   (4/6/8), plane and direction; the filter only ever moves samples towards each
   other and is a no-op on flat areas (checked by the unit tests). Vertical edges
@@ -60,15 +63,6 @@ not disagreements between backends.
   range (asserted in `test_kernels`). Because the bases are derived instead of
   copied, every size the spec defines exists (4..64 for DCT, 4..16 for DST-IV)
   and no basis table in the source is magic data.
-* **Subpel filters use a windowed sinc, not the AV1 tap tables.** The spec
-  ships four fixed 8-tap filters (regular, smooth, sharp, bilinear) sampled at
-  16 phases; this implementation generates Lanczos-windowed sinc filters at
-  **1/8 pel precision** (8 phases) and normalises each phase to a DC gain of
-  128. Consequences: chroma/luma interpolation is smoother than the spec's
-  sharpest filters, motion vectors are quantised to 1/8 pel, and a reference
-  decoder fed a real AV1 stream would produce slightly different pixels. The
-  filter generator is a stand-in, not a conformance implementation — replacing
-  it with the spec tables is a self-contained change in one function.
 * **CDEF weights match the spec, its strength selection does not.** The tap
   weights (primary 4/2, secondary 2/1, 8 directions, secondary directions at
   ±2 and ±6 from the primary, thresholds halved for the far tap, `(sum + 8) >> 4`
@@ -90,9 +84,16 @@ not disagreements between backends.
   luma is simplified: the DC part of the luma AC contribution is subtracted
   (`aux->ac_dc`) and the alpha is applied as `(alpha * ac) >> 3`, without the
   spec's per-block scaling and sign handling of the full CfL search.
-* **Compound prediction.** Average and distance-weighted blending are
-  implemented with Q6 weights; the spec's mask-based (wedge/difference) modes
-  are not.
+* **Compound prediction.** Average, distance weighted, wedge and difference
+  weighted blending are implemented. The mask-based modes follow 7.11.3.11-14:
+  the wedge mask selects an entry of the master table per block shape and
+  applies the specification's flipSign rule, the difference mask is
+  `Clip3(0, 64, 38 + Round2(abs(pred0 - pred1), (BitDepth - 8) + InterPostRound)
+  / 16)`, and both are evaluated on the luma grid and averaged down for chroma
+  samples. Global warped motion (`useWarp` per reference list, 7.11.3.5-7) rides
+  the same blend: each reference is predicted through its own affine model
+  when the frame's model is steeper than a translation and the region is at
+  least 8x8.
 
 ## Closed loop invariant
 
@@ -213,10 +214,33 @@ stream. Instead:
   it, and asserts that parsing stops at the coefficient syntax rather than
   inventing values for it.
 
-Until the coefficient and inter layers land (see `docs/ROADMAP.md`), the
-front-end can read the tile bytes but not yet interpret them; the trace replay
-above is what makes "the symbol reader is right" a demonstrated fact rather than
-a claim.
+### Whole frames against a reference decoder
+
+The end-to-end check is a set of libaom encodes decoded by both this decoder and
+dav1d and compared frame by frame, in coding order, on all three planes. Every
+one of them is **bit exact, every frame**, as of the inter prediction work in
+`docs/ROADMAP.md` section 3. (`tests/data/svt_av1_320x240.ivf` is used for the
+*parser* cross-checks above, not for pixel comparison: it is an older encode
+whose frame count and reference handling are not what the fixture set below
+was built for.)
+
+| fixture | frames | what it exercises |
+| --- | --- | --- |
+| `q5`, `xc5`, `xc6`, `xc7`, `s`, `xt` | 6 each | general intra and inter streams |
+| `t_4_32`, `t_8_32` | 15 each | transform shapes, masked compound |
+| `ab` | 12 | masked compound (wedge and difference) |
+| `wg` | 15 | the chroma of sub-8x8 blocks |
+| `w_cu4` | 30 | global motion, sub-8x8 chroma |
+| `w_cu2` | 30 | ROTZOOM global motion, a difference mask on chroma |
+
+A single sample of drift is worth chasing rather than tolerating: the last three
+differences on `w_cu2` were one level on four chroma samples spread over three
+frames, and the cause was the difference weighted mask being rebuilt from
+*translational* luma predictions in a region the luma plane warped (see
+`mask_warp` in `Av1gInterJob`). Display-order comparison cannot even see that:
+the stream reorders with `show_existing_frame`, so the dumps are taken in coding
+order (`AV1GPU_DUMPCODED`, dav1d's `--outputinvisible`) and matched on their
+frame signatures.
 
 The third layer is what found the deblocking group index bug: the kernel was
 handed a group number where the shared helper expects a sample offset, so edges
@@ -255,6 +279,9 @@ PSNR of the decoded picture against the *clean source*, frames 1–11:
   thread pool, on a GPU with no shuffles and on a GPU with a 64×64 workgroup
   limit alike.
 * OpenCL C does not allow a private pointer to global memory, so every helper
-  that reads a buffer through a pointer takes an explicitly qualified
-  `AV1G_GLOBAL` parameter (see `kernels/av1gpu_kernels.h`). CDEF deliberately
-  does not stage through `__local` memory.
+  that reads a *buffer* through a pointer takes an explicitly qualified
+  `AV1G_GLOBAL` parameter (see `kernels/av1gpu_kernels.h`). The exception is a
+  pointer into a job struct - `av1g_warp_tap` takes the warp matrix that way -
+  because the device wrappers copy a job into private memory before calling in,
+  so those pointers live in the generic address space (OpenCL 2.0). CDEF
+  deliberately does not stage through `__local` memory.

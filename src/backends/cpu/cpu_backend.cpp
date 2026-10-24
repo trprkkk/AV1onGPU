@@ -137,6 +137,12 @@ class CpuBackend final : public Backend {
      * astray, which is why the dump is on the job rather than on the block. */
     static int g_decode_count = 0;
     ++g_decode_count;
+    /* AV1GPU_DUMPCODED=<file> appends every decoded picture, shown or not, in
+     * coding order. Comparing against a reference decoder's invisible frame
+     * output (dav1d's output_invisible_frames) is the only way to tell which
+     * frame a drift starts on: a display-order dump cannot, because a stream
+     * with show_existing_frame reorders them. */
+    const char* dump_coded = std::getenv("AV1GPU_DUMPCODED");
 
     if (std::getenv("AV1GPU_PLAN_STATS")) {
       size_t ni = 0, nt = 0, nr = 0, nx = 0;
@@ -188,9 +194,10 @@ class CpuBackend final : public Backend {
           if (obmc_dumped < 4) {
             ++obmc_dumped;
             std::fprintf(stderr, "OUROBMC w=%d h=%d refxy=%d,%d mv=%d,%d filt=%d/%d comp=%d "
-                                 "slots=%d,%d strips=%d\n",
+                                 "slots=%d,%d strips=%d warp=%d,%d\n",
                          job.w, job.h, job.ref_x, job.ref_y, job.mv0_x, job.mv0_y, job.filt,
-                         job.filt_v, job.compound, job.ref0_slot, job.ref1_slot, job.obmc_count);
+                         job.filt_v, job.compound, job.ref0_slot, job.ref1_slot,
+                         job.obmc_count, job.warp[0], job.warp[1]);
             for (int k = 0; k < job.obmc_count; ++k)
               std::fprintf(stderr, "  strip %d pass=%d rect=%d,%d %dx%d mv=%d,%d filt=%d/%d "
                                    "slot=%d off=%d\n",
@@ -214,18 +221,19 @@ class CpuBackend final : public Backend {
         if (const char* rect = std::getenv("AV1GPU_INTERRECT")) {
           int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
           if (std::sscanf(rect, "%d,%d,%d,%d", &x0, &y0, &x1, &y1) == 4) {
-            for (int p = 1; p < 3; ++p) {
+            for (int p = 0; p < 3; ++p) {
               if (job.dst_off < g.plane_off[p]) continue;
-              if (p == 1 && job.dst_off >= g.plane_off[2]) continue;
+              if (p < 2 && job.dst_off >= g.plane_off[p + 1]) continue;
               const int rel = job.dst_off - g.plane_off[p];
               const int jx = rel % g.stride[p], jy = rel / g.stride[p];
               if (jx < x0 || jx > x1 || jy < y0 || jy > y1) continue;
               std::fprintf(stderr,
                            "IJOB frame=%d plane=%d x=%d y=%d w=%d h=%d mv=%d,%d/%d,%d "
-                           "filter=%d/%d compound=%d slots=%d,%d obmc=%d\n",
+                           "filter=%d/%d compound=%d slots=%d,%d obmc=%d warp=%d,%d\n",
                            g_decode_count - 1, p, jx, jy, job.w, job.h, job.mv0_x,
                            job.mv0_y, job.mv1_x, job.mv1_y, job.filt, job.filt_v,
-                           job.compound, job.ref0_slot, job.ref1_slot, job.obmc_count);
+                           job.compound, job.ref0_slot, job.ref1_slot, job.obmc_count,
+                           job.warp[0], job.warp[1]);
             }
           }
         }
@@ -341,6 +349,26 @@ class CpuBackend final : public Backend {
         std::fprintf(stderr, "OURFINAL:");
         for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %d", static_cast<int>(frame[i]));
         std::fprintf(stderr, "\n");
+      }
+    }
+
+    if (dump_coded) {
+      if (FILE* df = std::fopen(dump_coded, "ab")) {
+        for (int p = 0; p < 3; ++p) {
+          const int w = g.plane_w[p];
+          const int h = g.plane_h[p];
+          for (int y = 0; y < h; ++y) {
+            const uint16_t* row = frame + g.plane_off[p] + static_cast<size_t>(y) * g.stride[p];
+            if (g.frame.bit_depth > 8) {
+              std::fwrite(row, sizeof(uint16_t), static_cast<size_t>(w), df);
+            } else {
+              std::vector<unsigned char> bytes(static_cast<size_t>(w));
+              for (int i = 0; i < w; ++i) bytes[static_cast<size_t>(i)] = static_cast<unsigned char>(row[i]);
+              std::fwrite(bytes.data(), 1, static_cast<size_t>(w), df);
+            }
+          }
+        }
+        std::fclose(df);
       }
     }
 

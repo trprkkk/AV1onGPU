@@ -158,33 +158,49 @@ variants), 1/16 pel precision, the two stage rounding of the specification and
 the 1/8 pel motion vectors it is driven with. Inter prediction with a single
 reference and with compound averaging is bit exact against dav1d.
 
-## 3. Masked compound, warped motion, and OBMC's first fixture
+## 3. Masked compound, warped motion, and OBMC — done
 
-Wedge and difference weighted masks are the two inter tools still missing from
-`av1gpu_inter_px`. Both are per-sample blend weights, so they fit the existing
-"one work item per output sample" model without new synchronisation: the wedge
-tables are `Wedge_Master` (16 directions x 8 corner offsets per block shape) and
-the difference mask is two sums over the two predictors against a 1/64 threshold
-in `preds[][0]`, both spelled out in the specification's sections 7.11.3.11 and
-7.11.3.12.
+Wedge and difference weighted masks are per-sample blend weights, so they fit
+the existing "one work item per output sample" model without new
+synchronisation. Both are in `av1g_inter_px`: the wedge mask comes from the
+`Wedge_Master` table (16 directions x corner offsets, selected per block shape
+with the specification's flipSign rule), and the difference weighted mask is
+`Clip3(0, 64, 38 + Round2(abs(pred0 - pred1), (BitDepth - 8) + InterPostRound) /
+16)`. Two details cost a hunt each and are worth writing down:
 
-The order in which a decoder meets the remaining inter tools, measured on plain
-libaom encodes with every tool at its default, is masked compound, then warped
-motion, then inter/intra compound.
+* The difference mask is built on the **luma** grid even when the plane being
+  predicted is chroma: 7.11.3.12 only runs for plane 0, and 7.11.3.14 then
+  averages that array over the two or four luma samples under each chroma
+  sample (with the specification's rounding, `(m0+m1+m2+m3+2)>>2`). A chroma
+  job therefore has to *recompute* the two luma predictions - which is why the
+  job carries the luma plane, the patch origin and the visible size.
+* Those recomputed predictions have to go through the same warped-motion path
+  the luma plane took. `useWarp` is decided per prediction region, so an 8x8
+  luma region can be warped while the 4x4 chroma region under it is not: the
+  job carries both decisions (`warp` for this plane, `mask_warp` for the luma
+  region) and the difference mask follows the luma one. Mixing the two up is a
+  one-level error on a handful of chroma samples, which is what `w_cu2.ivf`
+  kept showing.
 
-Warped motion is now the one that shows: `w_cu2.ivf` codes global motion of type
-ROTZOOM from its first inter frame on, and a translator that ignores the affine
-part diverges in every following frame (luma included), while every fixture
-whose global motion is TRANSLATION or absent decodes bit exactly. OBMC and warped motion share the neighbour
-search, and the OBMC blend is already implemented (mask table, per strip
-prediction, the two passes, in the shared kernel) - but none of the fixtures
-built so far code `motion_mode` as anything but `SIMPLE`, so the only thing
-proven about it today is that it costs nothing when unused. A fixture that
-actually uses OBMC needs libaom's speed settings raised until the encoder picks
-it, and is worth building before the code is trusted.
+Global warped motion (7.11.3.5, the block warp process with the setup shear of
+7.11.3.6 and the resolve divisor of 7.11.3.7) is implemented as two shears in
+`av1g_warp_tap`: the horizontal pass builds the intermediate rows at 16 times
+the sample precision with a phase that drifts by alpha/beta across the section,
+and the vertical pass brings them back with gamma/delta. `Warped_Filters` is
+appended to the same table the subpel path uploads, so a backend still transfers
+one table. Every fixture whose global motion is TRANSLATION or absent decodes
+bit exactly, and so do the ROTZOOM ones (`w_cu2`, `w_cu4`) now.
 
-Intrabc and palette are the remaining intra tools, and they only appear on
-screen content streams.
+OBMC is implemented (mask table, per-strip prediction, the above-then-left pass
+order) but none of the fixtures code `motion_mode` as anything but `SIMPLE`, so
+the only thing proven about it today is that it costs nothing when unused. A
+fixture that actually uses OBMC needs libaom's speed settings raised until the
+encoder picks it.
+
+Still missing from the inter path: **local warped motion** (`motion_mode =
+LOCALWARP`, the least squares warp estimation of 7.11.3.8) and inter/intra
+compound. Intrabc and palette are the remaining intra tools, and they only
+appear on screen content streams.
 
 ## 4. Spec-conformant film grain
 

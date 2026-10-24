@@ -272,6 +272,20 @@ struct BlockSyntax {
    * weighted mask leans. */
   int wedge_index = 0;
   int mask_sign = 0;
+  /* Global warped motion: this reference is predicted by projecting the
+   * sample's position through the frame's affine model instead of displacing
+   * it by the block's vector (`warp` per reference list). The parameters are
+   * the frame header's global motion model at WARPEDMODEL_PREC_BITS precision;
+   * a compound block can warp both halves, each with its own model. */
+  bool warp[2] = {false, false};
+  int32_t warp_params[2][6] = {{0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}};
+  /* The same decision taken for the block's *luma* region. A chroma region is
+   * half the size, so it can fall under the specification's 8x8 floor and be
+   * predicted from its vector while the luma region above it is warped. The
+   * difference weighted mask is built on the luma grid (7.11.3.12 only runs for
+   * plane 0 and 7.11.3.14 averages that array for the chroma samples), so a
+   * chroma job still needs the luma decision to reproduce the mask. */
+  bool mask_warp[2] = {false, false};
   /* Overlapped block motion compensation strips, in the order the
    * specification blends them: the ones from above first, then from the left. */
   std::vector<ObmcCandidate> obmc;

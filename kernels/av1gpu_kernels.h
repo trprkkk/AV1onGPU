@@ -179,6 +179,20 @@ typedef struct {
    * wide, so a strip is at least 2 mi wide and two of each fit). */
   int obmc_count;
   Av1gObmcCandidate obmc[4];
+  /* Global warped motion (7.11.3.5): a reference predicted through an affine
+   * model instead of its motion vector. `warp[refList]` says whether this
+   * reference is warped; `warp_params` is the specification's warp matrix at
+   * WARPEDMODEL_PREC_BITS precision and `warp_abcd` the setup shear output
+   * (alpha, beta, gamma, delta) that makes the two passes separable. A
+   * compound block can warp both halves, each with its own model. */
+  int warp[2];
+  int warp_params[2][6];
+  int warp_abcd[2][4];
+  /* `warp` above is this plane's decision; `mask_warp` is the luma region's,
+   * which is what a difference weighted mask is built from even in a chroma
+   * job (7.11.3.12 prepares the mask for plane 0 only and 7.11.3.14 averages
+   * that array down for the chroma samples). */
+  int mask_warp[2];
 } Av1gInterJob;
 
 /*
@@ -1356,6 +1370,93 @@ AV1G_FN int av1g_inter_tap(const Av1gInterCtx *ctx, AV1G_GLOBAL const av1g_px *r
 }
 
 /* ------------------------------------------------------------------ */
+/* global warped motion                                               */
+/* ------------------------------------------------------------------ */
+
+/* Warped_Filters, appended to the subpel table by the host (see
+ * tables::filters()). WARPEDPIXEL_PREC_SHIFTS is the 1.0 offset, and the table
+ * carries the two phases either side of it. */
+#define AV1G_WARP_FILTER_OFFSET (AV1G_FILT_ROWS * AV1G_FILT_PHASES * AV1G_FILT_TAPS)
+#define AV1G_WARP_FILTER_ROWS 193
+#define AV1G_WARP_PREC_SHIFTS 64
+#define AV1G_WARP_DIFF_BITS 10
+
+AV1G_FN int av1g_warp_filt(AV1G_GLOBAL const int *tbl, int offs, int tap) {
+  return tbl[AV1G_WARP_FILTER_OFFSET + offs * 8 + tap];
+}
+
+/* one phase of the warp kernel, clamped into the table */
+AV1G_FN int av1g_warp_offs(int v) {
+  const int offs = (v + (1 << (AV1G_WARP_DIFF_BITS - 1))) >> AV1G_WARP_DIFF_BITS;
+  return av1g_clip(offs + AV1G_WARP_PREC_SHIFTS, 0, AV1G_WARP_FILTER_ROWS - 1);
+}
+
+/*
+ * One sample of a globally warped prediction (7.11.3.5). The warp is applied
+ * as two shears: the horizontal pass builds the intermediate rows at 16 times
+ * the sample precision and the vertical pass brings them back, exactly the
+ * structure the subpel path has, but the phases are not constant - they drift
+ * across the block by alpha/beta horizontally and gamma/delta vertically, which
+ * is the whole point of a warp.
+ *
+ * The specification builds one 8x8 intermediate array per 8x8 section of the
+ * block, with three extra rows above and four below (a 15x8 array) because the
+ * vertical pass of the bottom rows reaches into the ones below. This computes
+ * one sample on its own instead: the eight intermediate rows that sample needs
+ * are filtered here, which is the same number of multiplies the subpel path
+ * already spends per sample and keeps one thread per output sample.
+ *
+ * (x, y) is the sample's position inside the block, in this plane's samples;
+ * base_x/base_y is the block's origin in the same plane.
+ *
+ * warp_params and warp_abcd are the *address of a job field*, so they are
+ * deliberately unqualified: the device wrappers copy a job into private memory
+ * before calling in, and a plain `const int *` is the generic address space
+ * those pointers live in under OpenCL 2.0 (the plane and table pointers really
+ * are global, so they keep the qualifier).
+ */
+AV1G_FN int av1g_warp_tap(int sub_x, int sub_y, int ref_w, int ref_h,
+                          const int *warp_params, const int *warp_abcd,
+                          AV1G_GLOBAL const av1g_px *ref, int ref_off, int ref_stride,
+                          int base_x, int base_y, int x, int y, int bitdepth, int compound,
+                          AV1G_GLOBAL const int *filters) {
+  const int i8 = y >> 3, j8 = x >> 3;
+  const int i1 = (y & 7) - 4, i2 = (x & 7) - 4;
+  /* the section's centre in *luma* coordinates is what the model is applied to */
+  const long long src_x = (long long)((base_x + j8 * 8 + 4) << sub_x);
+  const long long src_y = (long long)((base_y + i8 * 8 + 4) << sub_y);
+  const long long dst_x = (long long)warp_params[2] * src_x + (long long)warp_params[3] * src_y +
+                          warp_params[0];
+  const long long dst_y = (long long)warp_params[4] * src_x + (long long)warp_params[5] * src_y +
+                          warp_params[1];
+  /* back to this plane's samples, split into the integer part and the phase */
+  const long long x4 = dst_x >> sub_x;
+  const long long y4 = dst_y >> sub_y;
+  const int ix4 = (int)(x4 >> 16), sx4 = (int)(x4 & 0xffff);
+  const int iy4 = (int)(y4 >> 16), sy4 = (int)(y4 & 0xffff);
+  const int alpha = warp_abcd[0], beta = warp_abcd[1];
+  const int gamma = warp_abcd[2], delta = warp_abcd[3];
+  int round0 = bitdepth >= 12 ? 5 : 3;
+  int round1 = compound ? 7 : 11;
+  int offs_y, k, t, acc = 0;
+  if (bitdepth >= 12 && !compound) round1 -= 2;
+  offs_y = av1g_warp_offs(sy4 + gamma * i2 + delta * i1);
+  for (k = 0; k < 8; ++k) {
+    /* the intermediate row this tap reads: rows i1-3 .. i1+4 of the section */
+    const int row = i1 - 3 + k;
+    const int offs_x = av1g_warp_offs(sx4 + alpha * i2 + beta * row);
+    const int ry = iy4 + row;
+    int s = 0;
+    for (t = 0; t < 8; ++t)
+      s += av1g_warp_filt(filters, offs_x, t) *
+           av1g_fetch(ref + ref_off, ref_stride, ix4 + i2 - 3 + t, ry, 0, ref_w - 1, 0,
+                      ref_h - 1);
+    acc += ((s + (1 << (round0 - 1))) >> round0) * av1g_warp_filt(filters, offs_y, k);
+  }
+  return (acc + (1 << (round1 - 1))) >> round1;
+}
+
+/* ------------------------------------------------------------------ */
 /* masked compound: the wedge master mask                              */
 /* ------------------------------------------------------------------ */
 
@@ -1442,12 +1543,24 @@ AV1G_FN int av1g_mask_luma_diff(const Av1gInterJob *job, AV1G_GLOBAL const av1g_
   lctx.ref_h = job->luma_ref_h;
   lctx.border = 0;
   lctx.bitdepth = job->bitdepth;
-  v0 = av1g_inter_tap(&lctx, job->ref0_slot >= 0 ? pool : cur, job->luma_ref0_off,
-                      job->luma_stride, job->luma_x, job->luma_y, extent_w, extent_h,
-                      job->mv0_x, job->mv0_y, job->filt, job->filt_v, lx, ly, 1, filters);
-  v1 = av1g_inter_tap(&lctx, job->ref1_slot >= 0 ? pool : cur, job->luma_ref1_off,
-                      job->luma_stride, job->luma_x, job->luma_y, extent_w, extent_h,
-                      job->mv1_x, job->mv1_y, job->filt, job->filt_v, lx, ly, 1, filters);
+  v0 = job->mask_warp[0]
+           ? av1g_warp_tap(0, 0, job->luma_ref_w, job->luma_ref_h, job->warp_params[0],
+                           job->warp_abcd[0], job->ref0_slot >= 0 ? pool : cur,
+                           job->luma_ref0_off, job->luma_stride, job->luma_x, job->luma_y,
+                           lx, ly, job->bitdepth, 1, filters)
+           : av1g_inter_tap(&lctx, job->ref0_slot >= 0 ? pool : cur, job->luma_ref0_off,
+                            job->luma_stride, job->luma_x, job->luma_y, extent_w, extent_h,
+                            job->mv0_x, job->mv0_y, job->filt, job->filt_v, lx, ly, 1,
+                            filters);
+  v1 = job->mask_warp[1]
+           ? av1g_warp_tap(0, 0, job->luma_ref_w, job->luma_ref_h, job->warp_params[1],
+                           job->warp_abcd[1], job->ref1_slot >= 0 ? pool : cur,
+                           job->luma_ref1_off, job->luma_stride, job->luma_x, job->luma_y,
+                           lx, ly, job->bitdepth, 1, filters)
+           : av1g_inter_tap(&lctx, job->ref1_slot >= 0 ? pool : cur, job->luma_ref1_off,
+                            job->luma_stride, job->luma_x, job->luma_y, extent_w, extent_h,
+                            job->mv1_x, job->mv1_y, job->filt, job->filt_v, lx, ly, 1,
+                            filters);
   return v0 - v1;
 }
 
@@ -1492,16 +1605,30 @@ AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
   int out, k;
   av1g_inter_ctx(job, &ctx);
   {
-    const int v0 = av1g_inter_tap(&ctx, job->ref0_slot >= 0 ? pool : cur, job->ref0_off,
-                                  job->ref0_stride, job->ref_x, job->ref_y, job->w,
-                                  job->h, job->mv0_x, job->mv0_y, job->filt, job->filt_v,
-                                  x, y, compound, filters);
+    AV1G_GLOBAL const av1g_px *ref0 = job->ref0_slot >= 0 ? pool : cur;
+    AV1G_GLOBAL const av1g_px *ref1 = job->ref1_slot >= 0 ? pool : cur;
+    /* A globally warped reference ignores the block's vector: the model
+     * projects the sample's position, not a displacement (7.11.3.5). */
+    const int v0 = job->warp[0]
+                       ? av1g_warp_tap(ctx.sub_x, ctx.sub_y, ctx.ref_w, ctx.ref_h,
+                                       job->warp_params[0], job->warp_abcd[0], ref0,
+                                       job->ref0_off, job->ref0_stride, job->ref_x,
+                                       job->ref_y, x, y, job->bitdepth, compound, filters)
+                       : av1g_inter_tap(&ctx, ref0, job->ref0_off, job->ref0_stride,
+                                        job->ref_x, job->ref_y, job->w, job->h, job->mv0_x,
+                                        job->mv0_y, job->filt, job->filt_v, x, y, compound,
+                                        filters);
     out = v0;
     if (compound) {
-      const int v1 = av1g_inter_tap(&ctx, job->ref1_slot >= 0 ? pool : cur, job->ref1_off,
-                                    job->ref1_stride, job->ref_x, job->ref_y, job->w,
-                                    job->h, job->mv1_x, job->mv1_y, job->filt, job->filt_v,
-                                    x, y, 1, filters);
+      const int v1 = job->warp[1]
+                         ? av1g_warp_tap(ctx.sub_x, ctx.sub_y, ctx.ref_w, ctx.ref_h,
+                                         job->warp_params[1], job->warp_abcd[1], ref1,
+                                         job->ref1_off, job->ref1_stride, job->ref_x,
+                                         job->ref_y, x, y, job->bitdepth, 1, filters)
+                         : av1g_inter_tap(&ctx, ref1, job->ref1_off, job->ref1_stride,
+                                          job->ref_x, job->ref_y, job->w, job->h, job->mv1_x,
+                                          job->mv1_y, job->filt, job->filt_v, x, y, 1,
+                                          filters);
       /* Both halves are at 16 times the sample precision here, and
        * InterPostRound (2 * FILTER_BITS - InterRound0 - InterRound1, so 4 at 8
        * bit) is the shift that takes them back down. Neither half is clipped
@@ -1530,10 +1657,12 @@ AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
                * no second pass over the references */
               m = av1g_diffwtd_m(av1g_abs(v0 - v1), sh, job->mask_sign);
             } else {
-              m = av1g_diffwtd_m(
-                  av1g_abs(av1g_mask_luma_diff(job, cur, pool, filters, lx, ly,
-                                               job->w << ctx.sub_x, job->h << ctx.sub_y)),
-                  sh, job->mask_sign);
+              /* the mask lives on the luma grid and this plane has no luma
+               * predictions of its own, so they are rebuilt here */
+              m = av1g_diffwtd_m(av1g_abs(av1g_mask_luma_diff(job, cur, pool, filters, lx, ly,
+                                                              job->w << ctx.sub_x,
+                                                              job->h << ctx.sub_y)),
+                                 sh, job->mask_sign);
             }
             sum += m;
             ++n;
@@ -1888,9 +2017,12 @@ AV1G_FN void av1g_cdef_block(const Av1gCdefJob *job, AV1G_GLOBAL const av1g_px *
     if (job->uv) {
       dir = pri_str == 0 ? 0 : uv_dir[job->ss_x][job->ss_y][y_dir];
     } else {
+      /* the direction is picked from the strength the header coded, before the
+       * variance scales it; a block whose variance is zero keeps its direction
+       * even though its primary strength then drops to nothing */
       const int var_str = (var >> 6) ? av1g_min(av1g_floor_log2(var >> 6), 12) : 0;
-      pri_str = var ? ((pri_str * (4 + var_str) + 8) >> 4) : 0;
       dir = pri_str == 0 ? 0 : y_dir;
+      pri_str = var ? ((pri_str * (4 + var_str) + 8) >> 4) : 0;
     }
   }
   if (pri_str == 0 && sec_str == 0) {

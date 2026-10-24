@@ -474,6 +474,13 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
       compound = to_compound_type(block.compound_type);
       if (compound == CompoundType::Distance)
         distance_weights(seq, frame, ref_index[0], ref_index[1], blend);
+      /* Global warped motion (predict_inter steps 6-7): a GLOBALMV block whose
+       * reference frame carries a model steeper than a pure translation is
+       * predicted by that model instead of by the block's vector. Which of the
+       * two references that applies to, and whether the block is big enough,
+       * is decided per prediction block below. */
+      const bool global_mode = block.inter_mode == kModeGlobalMv ||
+                               block.inter_mode == kModeGlobalGlobalMv;
       for (int plane = 0; plane < 3; ++plane) {
         if (plane > 0 && seq.monochrome) break;
         const int sub_x = plane > 0 && ss_x ? 1 : 0;
@@ -601,8 +608,30 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
             }
           }
         }
+        /* Global warped motion is decided per prediction block: the spec's
+         * useWarp asks for w >= 8 and h >= 8, where w and h are the region the
+         * block is predicted over, and for a frame whose vectors are not
+         * forced to integers. A compound block can warp either, both or
+         * neither half. */
+        auto apply_global_warp = [&](BlockSyntax* region) {
+          if (!global_mode || frame.force_integer_mv) return;
+          const int luma_w = region->w << sub_x, luma_h = region->h << sub_y;
+          if (luma_w < 8 || luma_h < 8) return;
+          for (int i = 0; i < 2; ++i) {
+            if (region->ref[i] < 0) continue;
+            const GlobalMotion& gm = frame.global_motion[region->ref[i] + 1];
+            if (gm.type <= kGmTranslation) continue;
+            for (int j = 0; j < 6; ++j) region->warp_params[i][j] = gm.params[j];
+            /* The mask decision is the one plane 0 takes, so it is evaluated on
+             * the region's luma size even when this region is a chroma one. */
+            region->mask_warp[i] = true;
+            if (region->w >= 8 && region->h >= 8) region->warp[i] = true;
+          }
+        };
         if (!split) {
-          inter_regions[plane].push_back(bs);
+          BlockSyntax region = bs;
+          apply_global_warp(&region);
+          inter_regions[plane].push_back(region);
         } else {
           for (int y = 0; y < bs.h; y += pred_h) {
             for (int x = 0; x < bs.w; x += pred_w) {
@@ -633,6 +662,7 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
                 region.filter = to_filter_type(cell->interp_filter[1]);
                 region.filter_v = to_filter_type(cell->interp_filter[0]);
               }
+              apply_global_warp(&region);
               inter_regions[plane].push_back(region);
             }
           }

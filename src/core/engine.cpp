@@ -22,6 +22,8 @@
  * carry a plain sample offset and the backends need a single allocation.
  */
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "core/backend.hpp"
@@ -415,6 +417,34 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
           o.ref_slot = resolve_slot(syntax, c.ref);
           o.ref_off = g.plane_off[plane];
           ++job.obmc_count;
+        }
+        /* Global warped motion: the shear is computed here, once per job,
+         * because the model is a frame property and the two passes of the
+         * warp need it. A model whose shear is too steep to apply is not
+         * warped at all - the block falls back to its vector, which is the
+         * specification's warpValid. */
+        const bool warp_disabled = std::getenv("AV1GPU_NO_WARP") != nullptr;
+        for (int i = 0; i < 2; ++i) {
+          job.warp[i] = 0;
+          job.mask_warp[i] = 0;
+          if ((!b.warp[i] && !b.mask_warp[i]) || warp_disabled) continue;
+          /* a chroma region that is too small to warp may still need the luma
+           * region's model to build a difference weighted mask */
+          if (b.warp[i]) job.warp[i] = 1;
+          if (b.mask_warp[i]) job.mask_warp[i] = 1;
+          int alpha = 0, beta = 0, gamma = 0, delta = 0;
+          if (!tables::gm_setup_shear(b.warp_params[i], &alpha, &beta, &gamma, &delta))
+            continue;
+          for (int j = 0; j < 6; ++j) job.warp_params[i][j] = b.warp_params[i][j];
+          job.warp_abcd[i][0] = alpha;
+          job.warp_abcd[i][1] = beta;
+          job.warp_abcd[i][2] = gamma;
+          job.warp_abcd[i][3] = delta;
+          if (std::getenv("AV1GPU_WARPDEBUG"))
+            std::fprintf(stderr, "WARP ref=%d plane=%d x=%d y=%d w=%d h=%d params=%d,%d,%d,%d,%d,%d abcd=%d,%d,%d,%d\n",
+                         i, plane, b.x, b.y, b.w, b.h, b.warp_params[i][0], b.warp_params[i][1],
+                         b.warp_params[i][2], b.warp_params[i][3], b.warp_params[i][4],
+                         b.warp_params[i][5], alpha, beta, gamma, delta);
         }
         wj.inter.push_back(job);
       }
