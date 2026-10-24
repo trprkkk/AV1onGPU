@@ -241,7 +241,8 @@ int project_mv_component(int mv, int num, int den) {
 }
 
 void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
-                      const std::shared_ptr<const RefMvs>& ref_mvs) {
+                      const std::shared_ptr<const RefMvs>& ref_mvs,
+                      const std::shared_ptr<const CdfContext>& cdf) {
   if (!pool || frame.show_existing_frame) return;
   /* An intra frame codes no motion vectors, so it clears the grid of every slot
    * it refreshes: a later frame must not project the motion vectors of a frame
@@ -258,6 +259,7 @@ void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
       for (int ref = 0; ref < 8; ++ref) slot.global_motion[ref] = frame.global_motion[ref];
       for (int ref = 0; ref < 7; ++ref) slot.ref_poc[ref] = frame.ref_order_hint[ref];
       slot.ref_mvs = stores_mvs ? ref_mvs : nullptr;
+      slot.cdf = cdf;
     }
   }
 }

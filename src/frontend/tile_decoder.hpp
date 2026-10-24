@@ -282,6 +282,11 @@ struct TileDecodeResult {
    * an intra frame, which has no motion vectors to store. */
   std::shared_ptr<const RefMvs> ref_mvs;
 
+  /* The probability tables as this frame leaves them, after adapting to every
+   * symbol it coded. A later frame whose primary_ref_frame points here starts
+   * from this context instead of the defaults. */
+  std::shared_ptr<const CdfContext> cdf;
+
   /* Range decoder position at the end, for error reporting. */
   size_t bytes_used = 0;
   bool overrun = false;

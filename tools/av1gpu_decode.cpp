@@ -398,7 +398,9 @@ int main(int argc, char** argv) {
           reference_offset += frame_size;
         }
       }
-      refresh_ref_pool(frame, &refs);
+      /* the tile adapted the probability tables; the slots this frame refreshes
+       * hand them on to the frames that name it as their primary reference */
+      refresh_ref_pool(frame, &refs, decoded.ref_mvs, decoded.cdf);
     }
     if (status != 0) break;
   }

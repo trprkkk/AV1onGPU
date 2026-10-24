@@ -253,6 +253,17 @@ struct CdfContext {
  * default set. */
 void init_default_cdf(CdfContext* cdf, int base_q_idx);
 
+/* Zeroes every table's adaptation counter, leaving the probabilities in place.
+ *
+ * This is the other half of handing a context to a later frame: the
+ * specification's load_cdfs() says that once the tables are loaded "the last
+ * entry in each array, representing the symbol count for that context, is set
+ * to 0". The counter is what makes the adaptation slow down; a decoder that
+ * kept the previous frame's counters would adapt more slowly than the encoder
+ * expected, its probabilities would drift, and the two would disagree on a
+ * symbol some frames later - with no symbol individually decoded wrong. */
+void reset_cdf_counts(CdfContext* cdf);
+
 } /* namespace frontend */
 } /* namespace av1gpu */
 

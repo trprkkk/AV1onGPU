@@ -1028,6 +1028,76 @@ void test_projected_motion_vectors() {
   refresh_ref_pool(key, &pool, store);
   CHECK(pool.slots[1].valid);
   CHECK(pool.slots[1].ref_mvs == nullptr);
+
+  /* The probability context rides along with the slot: a frame that refreshes a
+   * slot also stores the tables it ended with, and a later frame whose
+   * primary_ref_frame names that slot starts from them. */
+  auto cdf = std::make_shared<CdfContext>();
+  init_default_cdf(cdf.get(), 100);
+  FrameHeader coder = inter;
+  refresh_ref_pool(coder, &pool, nullptr, cdf);
+  CHECK(pool.slots[1].cdf == cdf);
+  CHECK(pool.slots[5].cdf == cdf);
+  CHECK(pool.slots[0].cdf == nullptr);
+}
+
+/* The two halves of handing a probability context to a later frame: the tables
+ * travel with the reference slot, and what a later frame starts from is those
+ * tables with every adaptation counter back at zero - the probabilities the
+ * encoder and decoder agreed on, adapted at the rate of a fresh context.
+ *
+ * Keeping the counters would look harmless (the probabilities still match) and
+ * only show up frames later, as a symbol decoded against a probability that has
+ * drifted: the counters decide how far each observation moves a probability, so
+ * a decoder that keeps them adapts more slowly than the encoder did. */
+void test_cdf_inheritance() {
+  std::printf("probability context inheritance\n");
+  CdfContext cdf;
+  init_default_cdf(&cdf, 100);
+  /* the counter of a row sits just past its probabilities: skip has one
+   * probability, the chroma mode table thirteen when chroma from luma is
+   * allowed and twelve when it is not */
+  CHECK_EQ(cdf.skip.table[1][1], 0);
+  CHECK_EQ(cdf.inter.skip_mode[2][1], 0);
+  CHECK_EQ(cdf.mode.uv_mode[0][5][12], 0);
+  CHECK_EQ(cdf.mode.uv_mode[1][5][13], 0);
+
+  /* pretend a frame adapted these two tables a few thousand symbols' worth */
+  cdf.skip.table[1][0] -= 1000;
+  cdf.skip.table[1][1] = 32;
+  cdf.inter.skip_mode[2][0] += 500;
+  cdf.inter.skip_mode[2][1] = 17;
+  const uint16_t skip_probability = cdf.skip.table[1][0];
+  const uint16_t mode_probability = cdf.inter.skip_mode[2][0];
+
+  reset_cdf_counts(&cdf);
+  /* the probabilities survive, the counters do not */
+  CHECK_EQ(cdf.skip.table[1][0], skip_probability);
+  CHECK_EQ(cdf.inter.skip_mode[2][0], mode_probability);
+  CHECK_EQ(cdf.skip.table[1][1], 0);
+  CHECK_EQ(cdf.inter.skip_mode[2][1], 0);
+
+  /* every table, not just the ones above: an unadapted table with a counter
+   * that survived would silently keep adapting slowly */
+  cdf.coef.base_tok[0][0][0][3] = 9;
+  cdf.coef.eob_bin_64[1][0][6] = 9;
+  cdf.mode.uv_mode[0][3][12] = 9;
+  cdf.mode.uv_mode[1][3][13] = 9;
+  cdf.mode.txsz[0][0][1] = 9;
+  cdf.mode.txsz[3][0][2] = 9;
+  cdf.partition.table[4][0][3] = 9;
+  cdf.inter.mv_class0_fr[1][1][3] = 9;
+  cdf.inter.mv_joint[3] = 9;
+  reset_cdf_counts(&cdf);
+  CHECK_EQ(cdf.coef.base_tok[0][0][0][3], 0);
+  CHECK_EQ(cdf.coef.eob_bin_64[1][0][6], 0);
+  CHECK_EQ(cdf.mode.uv_mode[0][3][12], 0);
+  CHECK_EQ(cdf.mode.uv_mode[1][3][13], 0);
+  CHECK_EQ(cdf.mode.txsz[0][0][1], 0);
+  CHECK_EQ(cdf.mode.txsz[3][0][2], 0);
+  CHECK_EQ(cdf.partition.table[4][0][3], 0);
+  CHECK_EQ(cdf.inter.mv_class0_fr[1][1][3], 0);
+  CHECK_EQ(cdf.inter.mv_joint[3], 0);
 }
 
 /* The first block of a real key frame, symbol for symbol. dav1d's trace of this
@@ -1436,6 +1506,7 @@ int main() {
   test_segmentation();
   test_block_geometry();
   test_projected_motion_vectors();
+  test_cdf_inheritance();
   test_tile_group();
   test_tile_decoder();
   test_real_stream();

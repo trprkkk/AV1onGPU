@@ -2,6 +2,7 @@
 
 #include "frontend/cdf_tables_inter.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <type_traits>
 
@@ -123,6 +124,118 @@ void init_default_cdf(CdfContext* cdf, int base_q_idx) {
   copy_table(cdf->coef.eob_hi_bit, t::eob_hi_bit[qcat]);
   copy_table(cdf->coef.skip, t::coef_skip[qcat]);
   copy_table(cdf->coef.dc_sign, t::dc_sign[qcat]);
+}
+
+namespace {
+
+/* The counter of a row sits just past its probabilities, at the index the
+ * decoder passes as `nsymbols` to read_symbol. */
+template <size_t N>
+void reset_row(uint16_t (&row)[N], int nsyms) {
+  if (nsyms >= 0 && static_cast<size_t>(nsyms) < N) row[nsyms] = 0;
+}
+
+template <typename T, size_t A, size_t B>
+void reset_2d(T (&table)[A][B], int nsyms) {
+  for (size_t i = 0; i < A; ++i) reset_row(table[i], nsyms);
+}
+
+template <typename T, size_t A, size_t B, size_t C>
+void reset_3d(T (&table)[A][B][C], int nsyms) {
+  for (size_t i = 0; i < A; ++i) reset_2d(table[i], nsyms);
+}
+
+template <typename T, size_t A, size_t B, size_t C, size_t D>
+void reset_4d(T (&table)[A][B][C][D], int nsyms) {
+  for (size_t i = 0; i < A; ++i) reset_3d(table[i], nsyms);
+}
+
+} /* namespace */
+
+void reset_cdf_counts(CdfContext* cdf) {
+  if (!cdf) return;
+  ModeCdf& m = cdf->mode;
+  InterCdf& in = cdf->inter;
+  CoefCdf& co = cdf->coef;
+
+  /* coefficient tables: the end of block tables carry their own symbol counts,
+   * which grow with the transform size */
+  reset_3d(co.eob_bin_16, 4);
+  reset_3d(co.eob_bin_32, 5);
+  reset_3d(co.eob_bin_64, 6);
+  reset_3d(co.eob_bin_128, 7);
+  reset_3d(co.eob_bin_256, 8);
+  reset_2d(co.eob_bin_512, 9);
+  reset_2d(co.eob_bin_1024, 10);
+  reset_4d(co.eob_base_tok, 2);
+  reset_4d(co.base_tok, 3);
+  reset_4d(co.br_tok, 3);
+  reset_4d(co.eob_hi_bit, 1);
+  reset_3d(co.skip, 1);
+  reset_3d(co.dc_sign, 1);
+
+  /* mode tables: the chroma mode table has one symbol more when chroma from
+   * luma is available, and the transform size table narrows near the top of
+   * the tree, so both are reset row by row */
+  for (int cfl = 0; cfl < 2; ++cfl)
+    for (int mode = 0; mode < 13; ++mode)
+      reset_row(m.uv_mode[cfl][mode], kUvIntraModes - 1 - (cfl ? 0 : 1));
+  /* the partition and skip tables live outside ModeCdf: they are the two an
+   * intra frame reads as often as an inter frame */
+  for (int level = 0; level < kBlockLevelCount; ++level)
+    reset_2d(cdf->partition.table[level], kPartitionSymbols[level]);
+  reset_2d(m.cfl_alpha, 15);
+  reset_3d(m.txtp_intra1, 6);
+  reset_3d(m.txtp_intra2, 4);
+  for (int cls = 0; cls < 4; ++cls)
+    reset_2d(m.txsz[cls], std::min(cls + 1, 2));
+  reset_row(m.cfl_sign, 7);
+  reset_2d(m.angle_delta, 6);
+  reset_row(m.filter_intra, 4);
+  reset_2d(m.seg_id, 7);
+  reset_2d(m.use_filter_intra, 1);
+  reset_3d(m.txpart, 1);
+  reset_2d(cdf->skip.table, 1);
+  reset_row(m.delta_q, 3);
+  reset_2d(m.delta_lf, 3);
+
+  /* inter tables */
+  reset_2d(in.y_mode, 12);
+  reset_2d(in.is_inter, 1);
+  reset_2d(in.skip_mode, 1);
+  reset_2d(in.comp_mode, 1);
+  reset_2d(in.comp_ref_type, 1);
+  reset_3d(in.uni_comp_ref, 1);
+  reset_3d(in.comp_ref, 1);
+  reset_3d(in.comp_bwd_ref, 1);
+  reset_3d(in.single_ref, 1);
+  reset_2d(in.compound_mode, 7);
+  reset_2d(in.compound_idx, 1);
+  reset_2d(in.comp_group_idx, 1);
+  reset_2d(in.compound_type, 1);
+  reset_2d(in.wedge_index, 15);
+  reset_2d(in.inter_intra, 1);
+  reset_2d(in.inter_intra_mode, 3);
+  reset_2d(in.wedge_inter_intra, 1);
+  reset_2d(in.use_obmc, 1);
+  reset_2d(in.motion_mode, 2);
+  reset_2d(in.interp_filter, 2);
+  reset_row(in.mv_joint, 3);
+  reset_2d(in.mv_sign, 1);
+  reset_2d(in.mv_class, 10);
+  reset_2d(in.mv_class0_bit, 1);
+  reset_3d(in.mv_class0_fr, 3);
+  reset_2d(in.mv_class0_hp, 1);
+  reset_2d(in.mv_hp, 1);
+  reset_3d(in.mv_bit, 1);
+  reset_2d(in.mv_fr, 3);
+  reset_2d(in.new_mv, 1);
+  reset_2d(in.zero_mv, 1);
+  reset_2d(in.ref_mv, 1);
+  reset_2d(in.drl_mode, 1);
+  reset_2d(in.txtp_inter1, 15);
+  reset_row(in.txtp_inter2, 11);
+  reset_2d(in.txtp_inter3, 1);
 }
 
 } /* namespace frontend */

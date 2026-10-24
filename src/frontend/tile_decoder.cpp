@@ -273,6 +273,25 @@ class TileParser {
       save_temporal_mvs(store.get());
       out_->ref_mvs = std::move(store);
     }
+    /* The tables this frame passes on: the ones it adapted when it may update
+     * the context at its end, otherwise the ones it started from. A frame that
+     * updates nothing leaves its references with exactly the tables they
+     * already had, rather than the ones it used and abandoned.
+     *
+     * The adapted tables lose their adaptation counters on the way out, and the
+     * two tables a key frame alone reads (the key frame mode table and the
+     * intra block copy one) keep the values the frame inherited: a later frame
+     * starts from the probabilities this one reached but adapts them at the
+     * rate a fresh context adapts. */
+    auto published = std::make_shared<CdfContext>(
+        frame_.refresh_frame_context ? cdf_ : start_cdf_);
+    if (frame_.refresh_frame_context) {
+      std::memcpy(published->mode.kfym, start_cdf_.mode.kfym, sizeof(published->mode.kfym));
+      std::memcpy(published->mode.intrabc, start_cdf_.mode.intrabc,
+                  sizeof(published->mode.intrabc));
+      reset_cdf_counts(published.get());
+    }
+    out_->cdf = std::move(published);
     return ParseStatus::Ok;
   }
 
@@ -1856,29 +1875,22 @@ class TileParser {
          * the context and the second the step of the tree, which is not the
          * order the steps are coded in: the three second-level tests live in
          * different rows. */
-        if (decoder_.read_symbol(
-                cdf_.inter.single_ref[ref_context(row, col, kRefKindAll)][0], 1)) {
-          if (decoder_.read_symbol(
-                  cdf_.inter.single_ref[ref_context(row, col, kRefKindBackward)][1], 1)) {
+        const auto ref_bit = [&](int kind, int step) {
+          return decoder_.read_symbol(cdf_.inter.single_ref[ref_context(row, col, kind)][step], 1);
+        };
+        if (ref_bit(kRefKindAll, 0)) {
+          /* the backward half: ALTREF, or BWDREF against ALTREF2 */
+          if (ref_bit(kRefKindBackward, 1)) {
             ref0 = kRefAltref;
           } else {
-            ref0 = decoder_.read_symbol(
-                       cdf_.inter.single_ref[ref_context(row, col, kRefKindBackward1)][5], 1)
-                       ? kRefBwdref
-                       : kRefAltref2;
+            ref0 = ref_bit(kRefKindBackward1, 5) ? kRefAltref2 : kRefBwdref;
           }
         } else {
-          if (decoder_.read_symbol(
-                  cdf_.inter.single_ref[ref_context(row, col, kRefKindForward)][2], 1)) {
-            ref0 = decoder_.read_symbol(
-                       cdf_.inter.single_ref[ref_context(row, col, kRefKindForward2)][4], 1)
-                       ? kRefLast3
-                       : kRefLast2;
+          /* the forward half: {LAST3, GOLDEN} or {LAST, LAST2} */
+          if (ref_bit(kRefKindForward, 2)) {
+            ref0 = ref_bit(kRefKindForward2, 4) ? kRefGolden : kRefLast3;
           } else {
-            ref0 = decoder_.read_symbol(
-                       cdf_.inter.single_ref[ref_context(row, col, kRefKindForward1)][3], 1)
-                       ? kRefLast2
-                       : kRefLast;
+            ref0 = ref_bit(kRefKindForward1, 3) ? kRefLast2 : kRefLast;
           }
         }
         ref1 = kRefIntra;
@@ -2177,9 +2189,20 @@ class TileParser {
     entry.mv[0][1] = static_cast<int16_t>(block.mv[0][1]);
     entry.mv[1][0] = static_cast<int16_t>(block.mv[1][0]);
     entry.mv[1][1] = static_cast<int16_t>(block.mv[1][1]);
-    entry.global_subpel =
-        block.is_inter && block.inter_mode == kModeGlobalMv && std::min(bw4, bh4) >= 2;
-    entry.coded_newmv = block.is_inter && block.inter_mode == kModeNewMv;
+    /* The two bits a candidate scan reads off a neighbour: whether its vector
+     * should be replaced by the global motion model's, and whether it was coded
+     * as a new one. A compound block answers both for the pair as a whole, and
+     * its global mode counts even for small blocks (the pair syntax leaves no
+     * other way to code two global vectors). */
+    const int mode = block.inter_mode;
+    const bool inter = block.is_inter;
+    const bool compound_mode = inter && mode >= kModeNearestNearestMv;
+    entry.global_subpel = inter && (compound_mode ? mode == kModeGlobalGlobalMv
+                                                  : (mode == kModeGlobalMv &&
+                                                     std::min(bw4, bh4) >= 2));
+    entry.coded_newmv = inter && (mode == kModeNewMv || mode == kModeNearestNewMv ||
+                                  mode == kModeNewNearestMv || mode == kModeNearNewMv ||
+                                  mode == kModeNewNearMv || mode == kModeNewNewMv);
     entry.filter[0] = static_cast<uint8_t>(filter0);
     entry.filter[1] = static_cast<uint8_t>(filter1);
     entry.comp_type = static_cast<uint8_t>(block.is_inter ? block.compound_type : kCompoundNone);
@@ -3105,6 +3128,8 @@ class TileParser {
 
   RangeDecoder decoder_;
   CdfContext cdf_;
+  /* the tables the frame started from, see run() */
+  CdfContext start_cdf_;
 
   int tile_col_start_ = 0, tile_col_end_ = 0, tile_row_start_ = 0, tile_row_end_ = 0;
   int current_q_ = 0;
@@ -3171,7 +3196,24 @@ class TileParser {
       coef_[plane].left_dc.assign(plane_rows, 0);
     }
     setup_temporal_mvs();
-    init_default_cdf(&cdf_, frame_.base_q_idx);
+    /* The frame's starting probabilities: its primary reference's tables when it
+     * names one, the specification's defaults otherwise. A frame that resets
+     * (error resilient, or a key frame) always falls back to the defaults. */
+    const CdfContext* inherited = nullptr;
+    if (frame_.primary_ref_frame != kPrimaryRefNone && refs_) {
+      const int slot_index = frame_.ref_frame_idx[frame_.primary_ref_frame];
+      if (slot_index >= 0 && slot_index < 8) {
+        inherited = refs_->slots[slot_index].cdf.get();
+      }
+    }
+    if (inherited) {
+      cdf_ = *inherited;
+    } else {
+      init_default_cdf(&cdf_, frame_.base_q_idx);
+    }
+    /* the tables the frame started from: a frame that may not update the
+     * context at its end hands these on instead of the adapted ones */
+    start_cdf_ = cdf_;
     current_q_ = frame_.base_q_idx;
     for (int i = 0; i < 4; ++i) delta_lf_[i] = 0;
     decoder_.init(data_, size_, !frame_.disable_cdf_update);

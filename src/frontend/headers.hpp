@@ -37,6 +37,8 @@
 #include <string>
 #include <vector>
 
+#include "frontend/cdf.hpp"
+
 namespace av1gpu {
 namespace frontend {
 
@@ -277,6 +279,10 @@ struct RefSlot {
    * frame whose tile was not decoded. Shared because one frame can refresh
    * several slots. */
   std::shared_ptr<const RefMvs> ref_mvs;
+  /* The probability tables as they stood at the end of this frame. A later
+   * frame whose primary_ref_frame names this slot starts from them instead of
+   * the defaults, which is how AV1 keeps a whole inter frame's symbols cheap. */
+  std::shared_ptr<const CdfContext> cdf;
 };
 
 /* The eight AV1 reference slots. `parse_frame_header` reads them to resolve
@@ -379,9 +385,11 @@ struct FrameHeader {
 
 /* Applies `frame.refresh_frame_flags` to the reference pool. `ref_mvs` is the
  * motion vector grid the frame's tile produced, if it was decoded; the slots the
- * frame refreshes keep it for the frames that project from them. */
+ * frame refreshes keep it for the frames that project from them. `cdf` is the
+ * frame's adapted probability context, which a later frame may inherit. */
 void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
-                      const std::shared_ptr<const RefMvs>& ref_mvs = nullptr);
+                      const std::shared_ptr<const RefMvs>& ref_mvs = nullptr,
+                      const std::shared_ptr<const CdfContext>& cdf = nullptr);
 
 enum class ParseStatus {
   Ok = 0,

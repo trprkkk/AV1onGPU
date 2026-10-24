@@ -63,7 +63,7 @@ void print_sequence(const SequenceHeader& seq) {
 
 void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const RefPool* refs,
                  const uint8_t* payload, size_t payload_size, ParseStatus parsed,
-                 std::shared_ptr<const RefMvs>* produced) {
+                 std::shared_ptr<const RefMvs>* produced, std::shared_ptr<const CdfContext>* cdf) {
   if (hdr.show_existing_frame) {
     std::printf("  show_existing_frame: slot %d (%s frame, %dx%d)\n",
                 hdr.existing_frame_idx, frame_type_name(hdr.type), hdr.width, hdr.height);
@@ -171,8 +171,10 @@ void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const RefPoo
                   decoded.blocks.size(), decoded.transform_blocks, decoded.coefficients,
                   decoded.bytes_used, tile.size);
       /* the tile just produced the frame's motion vector grid, which the frames
-       * that refer to it will project from */
+       * that refer to it will project from, and the probability tables a later
+       * frame may inherit */
       if (produced) *produced = decoded.ref_mvs;
+      if (cdf) *cdf = decoded.cdf;
     } else if (status == ParseStatus::Unsupported) {
       std::printf("  tile: %zu block(s) parsed, %zu of %zu bytes used, then: %s\n",
                   decoded.blocks.size(), decoded.bytes_used, tile.size,
@@ -234,11 +236,12 @@ int probe_temporal_unit(const std::vector<uint8_t>& unit, size_t index,
         return 1;
       }
       std::shared_ptr<const RefMvs> produced;
-      print_frame(*seq, hdr, refs, obu.data, obu.size, parsed, &produced);
+      std::shared_ptr<const CdfContext> cdf;
+      print_frame(*seq, hdr, refs, obu.data, obu.size, parsed, &produced, &cdf);
       if (parsed == ParseStatus::Unsupported) {
         std::printf("  front-end: %s\n", error.c_str());
       }
-      refresh_ref_pool(hdr, refs, produced);
+      refresh_ref_pool(hdr, refs, produced, cdf);
     }
   }
   return status;
