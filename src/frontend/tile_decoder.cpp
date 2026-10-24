@@ -1506,14 +1506,22 @@ class TileParser {
     return std::min(3, std::min(lw, lh));
   }
 
-  /* Whether a neighbour's second reference points backwards. An intra
-   * neighbour stores no reference at all, and for these contexts it counts as a
-   * backward one: the reference decoders compare the stored value as unsigned,
-   * which turns the intra sentinel into the largest one. */
-  static bool neighbour_is_backward(const MiRef& n) {
-    return n.intra || n.ref[0] >= kRefBwdref;
+  /* A neighbour that pointed at a backward reference. An intra neighbour is
+   * *not* one: the reference it would have pointed at does not exist. The
+   * compound flag's context is the one place where intra is scored as if it
+   * were backward (see neighbour_is_backward_or_intra below), so the two tests
+   * are kept apart. */
+  static bool neighbour_is_backward(const MiRef& n) { return n.ref[0] >= kRefBwdref; }
+
+  /* The test the two mixed cases of get_comp_ctx use: with one compound and one
+   * single reference neighbour, an intra neighbour counts as backward, because
+   * the compound block it abuts cannot itself have used two directions. */
+  static bool neighbour_is_backward_or_intra(const MiRef& n) {
+    return n.intra || neighbour_is_backward(n);
   }
 
+  /* A neighbour that coded a second reference, which is what "compound" means
+   * for a context: an intra neighbour stores none. */
   static bool neighbour_is_compound(const MiRef& n) { return !n.intra && n.ref[1] > kRefIntra; }
 
   /* get_comp_ctx: how likely the two neighbours make a compound block, which
@@ -1527,9 +1535,9 @@ class TileParser {
     if (a && l) {
       if (neighbour_is_compound(*a)) {
         if (neighbour_is_compound(*l)) return 4;
-        return 2 + (neighbour_is_backward(*l) ? 1 : 0);
+        return 2 + (neighbour_is_backward_or_intra(*l) ? 1 : 0);
       }
-      if (neighbour_is_compound(*l)) return 2 + (neighbour_is_backward(*a) ? 1 : 0);
+      if (neighbour_is_compound(*l)) return 2 + (neighbour_is_backward_or_intra(*a) ? 1 : 0);
       return neighbour_is_backward(*l) == neighbour_is_backward(*a) ? 0 : 1;
     }
     if (a) return neighbour_is_compound(*a) ? 3 : (neighbour_is_backward(*a) ? 1 : 0);
