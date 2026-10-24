@@ -32,11 +32,13 @@ void RangeDecoder::init(const uint8_t* data, size_t size, bool update_cdf) {
   cnt_ = -15;
   update_cdf_ = update_cdf;
   overrun_ = false;
+  failed_ = false;
   refill();
 }
 
-/* Pulls bytes into the window. When the tile data runs out the missing bytes
- * read as 0xff, which is what the specification prescribes. */
+/* Pulls bytes into the window. The bytes are complemented on the way in, and
+ * when the tile data runs out the missing bits read as ones, which is what the
+ * specification prescribes. */
 void RangeDecoder::refill() {
   int shift = kWindowBits - cnt_ - 24;
   uint64_t dif = dif_;
@@ -56,35 +58,55 @@ void RangeDecoder::refill() {
 
 /* Renormalises the range into [2^15, 2^16), pulling in bytes as it shifts. */
 void RangeDecoder::normalize(uint64_t dif, unsigned rng) {
-  const int shift = 15 - (bit_length(rng) - 1);
+  if (rng == 0 || failed_) {
+    failed_ = true;
+    return;
+  }
+  const int shift = 16 - bit_length(rng);
+  const int old_cnt = cnt_;
   dif_ = dif << shift;
   rng_ = rng << shift;
-  cnt_ -= shift;
-  if (cnt_ < shift) refill();
+  cnt_ = old_cnt - shift;
+  /* The unsigned comparison skips the refill when the counter is already
+   * saturated, exactly like the reference decoders. */
+  if (static_cast<unsigned>(old_cnt) < static_cast<unsigned>(shift)) refill();
 }
 
 unsigned RangeDecoder::decode_bool_equi() {
+  if (failed_) return 0;
   const unsigned r = rng_;
   const uint64_t dif = dif_;
   /* probability 1/2: the multiply degenerates into a shift */
-  unsigned split = ((r >> 8) << 7) + kMinProb;
-  const uint64_t threshold = static_cast<uint64_t>(split) << (kWindowBits - 16);
+  unsigned v = ((r >> 8) << 7) + kMinProb;
+  const uint64_t threshold = static_cast<uint64_t>(v) << (kWindowBits - 16);
   const unsigned above = dif >= threshold;
-  normalize(dif - (above ? threshold : 0), above ? split : r - split);
-  return 1 - above;
+  if (above) {
+    v += r - 2 * v;
+    normalize(dif - threshold, v);
+    return 0;
+  }
+  normalize(dif, v);
+  return 1;
 }
 
 unsigned RangeDecoder::decode_bool(unsigned probability) {
+  if (failed_) return 0;
   const unsigned r = rng_;
   const uint64_t dif = dif_;
-  unsigned split = ((r >> 8) * (probability >> kProbShift) >> (7 - kProbShift)) + kMinProb;
-  const uint64_t threshold = static_cast<uint64_t>(split) << (kWindowBits - 16);
+  unsigned v = ((r >> 8) * (probability >> kProbShift) >> (7 - kProbShift)) + kMinProb;
+  const uint64_t threshold = static_cast<uint64_t>(v) << (kWindowBits - 16);
   const unsigned above = dif >= threshold;
-  normalize(dif - (above ? threshold : 0), above ? split : r - split);
-  return 1 - above;
+  if (above) {
+    v += r - 2 * v;
+    normalize(dif - threshold, v);
+    return 0;
+  }
+  normalize(dif, v);
+  return 1;
 }
 
 unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
+  if (failed_) return 0;
   const unsigned c = static_cast<unsigned>(dif_ >> (kWindowBits - 16));
   const unsigned r = rng_ >> 8;
   unsigned u = 0;
@@ -95,8 +117,22 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
     u = v;
     v = r * (cdf[symbol] >> kProbShift);
     v >>= 7 - kProbShift;
+    /* Every interval keeps at least kMinProb per remaining symbol of range.
+     * Without the term a very skewed table can produce a zero width interval,
+     * and the range coder collapses. */
     v += kMinProb * static_cast<unsigned>(nsymbols - symbol);
-  } while (symbol < nsymbols - 1 && c < v);
+    /* The reference decoders rely on the counter entry (cdf[nsymbols] <= 32) to
+     * terminate the loop; the bound keeps a corrupt table from walking past the
+     * end of the array. */
+  } while (c < v && symbol < nsymbols);
+
+  if (symbol >= nsymbols) {
+    /* no interval matched: the stream (or the table) is corrupt. Report it as
+     * nsymbols, which no table lookup can confuse with a real symbol, and mark
+     * the decoder so the caller can abandon the tile. */
+    failed_ = true;
+    return static_cast<unsigned>(symbol);
+  }
 
   normalize(dif_ - (static_cast<uint64_t>(v) << (kWindowBits - 16)), u - v);
 
@@ -104,7 +140,9 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
     const unsigned count = cdf[nsymbols];
     const unsigned rate = 4 + (count >> 4) + (nsymbols > 2 ? 1u : 0u);
     int i = 0;
-    for (; i < symbol; ++i) cdf[i] = static_cast<uint16_t>(cdf[i] + ((32768 - cdf[i]) >> rate));
+    for (; i < symbol; ++i) {
+      cdf[i] = static_cast<uint16_t>(cdf[i] + ((32768 - cdf[i]) >> rate));
+    }
     for (; i < nsymbols; ++i) cdf[i] = static_cast<uint16_t>(cdf[i] - (cdf[i] >> rate));
     cdf[nsymbols] = static_cast<uint16_t>(count + (count < 32 ? 1 : 0));
   }
@@ -117,10 +155,13 @@ uint32_t RangeDecoder::read_literal(int bits) {
   return value;
 }
 
+/* ns(): FloorLog2(n) + 1 equiprobable bits, with the top of the range folded
+ * back so every value below n is equally likely. */
 uint32_t RangeDecoder::read_uniform(uint32_t n) {
   if (n <= 1) return 0;
   int width = 0;
-  while ((1u << width) < n) ++width;
+  while ((1u << (width + 1)) <= n) ++width;
+  ++width; /* FloorLog2(n) + 1 */
   const uint32_t m = (1u << width) - n;
   const uint32_t value = read_literal(width - 1);
   if (value < m) return value;

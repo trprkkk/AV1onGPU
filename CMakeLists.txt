@@ -81,6 +81,7 @@ set(AV1GPU_SOURCES
     src/frontend/ivf.cpp
     src/frontend/obu.cpp
     src/frontend/headers.cpp
+    src/frontend/range_decoder.cpp
     src/backends/cpu/cpu_backend.cpp
 )
 
@@ -129,7 +130,7 @@ endif()
 
 if(AV1GPU_BUILD_TESTS)
   enable_testing()
-  foreach(test test_kernels test_pipeline test_frontend)
+  foreach(test test_kernels test_pipeline test_frontend test_entropy)
     add_executable(${test} tests/${test}.cpp)
     target_link_libraries(${test} PRIVATE av1gpu)
     set_target_properties(${test} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

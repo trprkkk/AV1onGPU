@@ -30,6 +30,13 @@ not disagreements between backends.
 * **Colour conversion.** One integer matrix per (matrix, range, bit depth),
   Q16 coefficients with the level/range offsets folded into the constant term,
   so limited-range black is (0,0,0) and limited-range white is 255.
+* **The boolean range decoder.** `src/frontend/range_decoder.cpp` is a port of
+  the reference algorithm (dav1d's `msac`, which is the same arithmetic as
+  libaom's `od_ec`): a 64 bit window over complemented input bytes, a range
+  renormalised into [2^15, 2^16), `EC_PROB_SHIFT` 6 and `EC_MIN_PROB` 4, and a
+  tail that pads with one bits once the tile data runs out. There is no
+  tolerance knob here on purpose: the tile payload is either decoded exactly
+  like a reference decoder or it desynchronises within a few symbols.
 * **Scheduling.** The wavefront order is a scheduling detail only: the tests
   require the output to be independent of `dependency_cell`, and it is.
 
@@ -127,6 +134,38 @@ The dav1d comparison found two real bugs:
 The only disagreements left are cases where dav1d's *strict* mode additionally
 requires the header to end exactly on a byte boundary; the default dav1d accepts
 them the same way this parser does.
+
+### The entropy decoder
+
+The range decoder is checked the same way, and it had to be, because a range
+coder cannot be tested by round trip: an encoder that is wrong in exactly the
+same way as the decoder passes every round trip and still cannot read a real
+stream. Instead:
+
+* A differential harness decoded identical payloads with dav1d's `msac` and with
+  this decoder: random but conforming Q15 tables, alphabets from 2 to 16
+  symbols, adaptation on, 192,802 symbols and 120,000 boolean/equiprobable
+  reads over 200 runs. **Zero mismatches**, and not just in the symbol values:
+  the adapted CDF was compared entry by entry after every trial, because that
+  table, not the symbol, is what keeps the next block in sync. The same harness
+  also covers the "no symbol fits" case where the padding dominates.
+* `tests/entropy_vectors.hpp` freezes that result. It holds six symbol streams
+  (2, 3, 4, 8, 11 and 16 symbols, payloads picked so every symbol is exercised),
+  the tables they adapt to, plus boolean, equiprobable, `L(n)` and `ns(n)`
+  payloads. The expected values were produced by dav1d's `msac`, and
+  `tests/test_entropy.cpp` re-decodes them on every run: 683 checks.
+* `disable_cdf_update`, the overflow of the adaptation counter at 32, and the
+  end-of-tile contract (`overrun()` becomes true, decoding stays in the
+  alphabet, `bytes_used()` never passes the tile size) are unit tested directly.
+
+Two honest caveats. The adaptation *rate schedule* used here is the one the
+reference decoders implement (`4 + (cdf[N] >> 4) + (N > 2)`); it is what every
+encoder in the field writes, and matching it is what makes real streams decode,
+so it is the schedule we test against. And decoding a real tile has not been
+demonstrated yet: it needs the CDF tables and the tile syntax layer above the
+symbol reader. Until that lands, "matches dav1d symbol for symbol" is the
+strongest claim this file makes about the entropy path, and the fixture's tile
+data is the next thing to decode.
 
 The third layer is what found the deblocking group index bug: the kernel was
 handed a group number where the shared helper expects a sample offset, so edges

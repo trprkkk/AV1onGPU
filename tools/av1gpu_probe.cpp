@@ -119,10 +119,10 @@ void print_frame(const FrameHeader& hdr, size_t payload_size, ParseStatus parsed
   if (hdr.reduced_tx_set) std::printf("  reduced transform set\n");
 
   if (parsed == ParseStatus::Ok && payload_size > hdr.tile_data_offset) {
-    std::printf("  tile data: %zu bytes at offset %zu; decoding is not implemented yet\n",
+    std::printf("  tile data: %zu bytes at offset %zu; tile syntax not implemented yet\n",
                 payload_size - hdr.tile_data_offset, hdr.tile_data_offset);
   } else if (parsed == ParseStatus::Ok) {
-    std::printf("  no tile data in this OBU; decoding is not implemented yet\n");
+    std::printf("  no tile data in this OBU; tile syntax not implemented yet\n");
   }
 }
 

@@ -122,6 +122,7 @@ tests/                        kernel unit tests, pipeline tests, OpenCL parity
 | `obu.{hpp,cpp}` | OBU header, extension header, leb128 sizes, temporal unit splitting |
 | `ivf.{hpp,cpp}` | the IVF container used by the AV1 test tools |
 | `headers.{hpp,cpp}` | sequence header and frame header syntax |
+| `range_decoder.{hpp,cpp}` | the boolean range decoder: symbols, `L(n)`, `ns(n)`, overrun handling |
 
 What parses today: the complete sequence header (profiles 0/1/2, 8/10/12 bit,
 4:2:0 / 4:2:2 / 4:4:4, operating points, timing info, all the feature flags) and
@@ -137,8 +138,13 @@ maintains (`refresh_ref_pool()` applies a parsed frame's refresh flags).
 
 What is *refused with a message* instead of being misparsed: superres, intra
 block copy, restoration filters, film grain data, global motion parameters,
-short reference signalling and frame ids. The arithmetic coded tile payload is
-the next milestone (`docs/ROADMAP.md`).
+short reference signalling and frame ids.
+
+The tile payload is coded with AV1's boolean range decoder, which
+`src/frontend/range_decoder.hpp` implements: adaptive Q15 symbol CDFs, boolean
+and equiprobable bits, `L(n)` and `ns(n)`, and the padded end-of-tile tail. It is
+bit identical to dav1d's `msac`; the specification's default CDF tables and the
+tile syntax on top of it are the next milestone (`docs/ROADMAP.md`).
 
 The parser is checked against a real stream (`tests/data/svt_av1_320x240.ivf`,
 encoded with SVT-AV1) whose fields were cross-checked with FFmpeg's
@@ -160,7 +166,7 @@ sequence header
   key frame, 320x240, base_q_idx 51, 1 tile(s) (1x1)
   deblock 2/2 luma, 1/1 chroma, sharpness 0; cdef damping 3, y strengths 0
   delta Q per superblock (res 0)
-  tile data: 15466 bytes at offset 11; decoding is not implemented yet
+  tile data: 15466 bytes at offset 11; tile syntax not implemented yet
 temporal unit 1 (491 bytes)
   ...
   inter frame (not shown), 320x240 from reference, base_q_idx 138, 1 tile(s) (1x1)
@@ -168,7 +174,7 @@ temporal unit 1 (491 bytes)
   refresh flags 0x01, primary ref 0, order hint 4, not error resilient
   compound reference select, skip mode off, ref frame mvs
   deblock 7/7 luma, 3/3 chroma, sharpness 0; cdef damping 5, y strengths 62
-  tile data: 147 bytes at offset 16; decoding is not implemented yet
+  tile data: 147 bytes at offset 16; tile syntax not implemented yet
 ```
 
 `tests/test_frontend.cpp` writes the same syntax with a small bit writer and
@@ -203,6 +209,10 @@ cd build && ctest --output-on-failure
 
 * `test_kernels` — transform bases, intra/inter prediction, subpel filters,
   deblock, CDEF, grain, colour conversion, on the host.
+* `test_entropy` — the boolean range decoder: symbol decoding over adaptive
+  Q15 CDFs, `L(n)`/`ns(n)`, frozen (`disable_cdf_update`) tables, and end of
+  tile handling. The expectations are golden vectors decoded by dav1d's `msac`,
+  not round trips against our own encoder.
 * `test_frontend` — bit reader, OBU framing, IVF demuxing, sequence and frame
   header parsing, and the error paths of all of them.
 * `test_pipeline` — closed loop decode of a synthetic clip on every available

@@ -24,12 +24,20 @@ ids, film grain data) are reported with a message instead of being misparsed.
 `tests/data/svt_av1_320x240.ivf` keeps the parser honest against bytes from a
 real encoder.
 
+**Done: the boolean range decoder.** `src/frontend/range_decoder.hpp` reads the
+tile payload: symbols over adaptive Q15 CDFs, boolean and equiprobable bits,
+`L(n)` and `ns(n)`, with `overrun()`/`bytes_used()` for tile end handling. It is
+bit identical to dav1d's `msac` and libaom's `od_ec`, which
+`tests/test_entropy.cpp` pins against golden vectors decoded by dav1d itself
+(see `docs/ACCURACY.md`). What is still missing is everything *above* the
+symbol reader: the specification's default CDF tables, the tile/superblock
+loop, and the syntax layer that turns symbols into `FrameSyntax`.
+
 **Next, in order:**
 
-1. *Arithmetic decoder.* The tile payload is coded with the AV1 boolean range
-   decoder over adaptive CDFs. Needs the CDF tables from the specification and
-   the symbol reader; testable against payloads produced by a reference encoder,
-   the way the header parser is now tested against a real stream.
+1. *CDF tables and the tile syntax.* The default probability tables from the
+   specification, then mode info, partition, transform and coefficient syntax on
+   top of the range decoder, plus tile group and `exit_symbol` handling.
 2. *Tile and partition tree.* Superblock loop, partition symbols, block sizes,
    transform selection, and the coefficient syntax with its scan tables. This is
    the bulk of the work and the point where the front-end first emits a
