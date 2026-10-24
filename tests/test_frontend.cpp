@@ -13,12 +13,14 @@
 #include <string>
 #include <vector>
 
+#include "av1gpu/av1gpu.hpp"
 #include "frontend/bitreader.hpp"
 #include "frontend/coef_tables.hpp"
 #include "frontend/dequant.hpp"
 #include "frontend/headers.hpp"
 #include "frontend/ivf.hpp"
 #include "frontend/obu.hpp"
+#include "frontend/reconstruct.hpp"
 #include "frontend/tile_decoder.hpp"
 #include "frontend/tiles.hpp"
 #include "test_common.hpp"
@@ -1065,11 +1067,20 @@ void test_tile_decoder() {
    * to place the 32x32 block on the grid, not just read symbols in a row */
   CHECK(result.bytes_used > 0);
   CHECK(result.bytes_used <= tile_size);
-  /* The whole frame, as dav1d decodes it: 306 blocks, 1063 transform blocks
-   * and 64301 coded coefficients. The tile's bytes are exactly consumed, which
-   * is the end to end check that every symbol was read with the right table. */
+  /* The whole frame, as dav1d decodes it: 306 blocks and 64301 coded
+   * coefficients in 1063 transform blocks. The tile's bytes are exactly
+   * consumed, which is the end to end check that every symbol was read with the
+   * right table.
+   *
+   * The frame has 1075 transform blocks in total: the three skipped 8x8 blocks
+   * still have the specification's residual structure (residual() runs for
+   * every block; a skipped one just carries no coefficients), so they add 12
+   * transform blocks with EOB 0 - one of them splits its luma into four 4x4
+   * transforms. Predicting such a block as one rectangle instead would leave
+   * the parts it does not cover untouched, and every neighbour that predicts
+   * from those samples would inherit the error. */
   CHECK_EQ(result.blocks.size(), 306u);
-  CHECK_EQ(result.transform_blocks, 1063);
+  CHECK_EQ(result.transform_blocks, 1075);
   CHECK_EQ(result.coefficients, 64301u);
   CHECK_EQ(result.levels.size(), 64301u);
   CHECK_EQ(result.bytes_used, tile_size);
@@ -1092,6 +1103,82 @@ void test_tile_decoder() {
   }
   CHECK_EQ(non_zero, 26102);
   CHECK_EQ(magnitude_sum, 3329521LL);
+
+  /* ---- the plan: every sample has exactly one owner ----------------------- */
+  using av1gpu::BlockSyntax;
+  using av1gpu::FrameSyntax;
+  FrameSyntax syntax;
+  CHECK(plan_from_tile(seq, header, result, dequantised, &syntax, &error));
+  CHECK_EQ(syntax.blocks.size(), static_cast<size_t>(result.transform_blocks));
+  CHECK_EQ(syntax.ss_x, 1);
+  CHECK_EQ(syntax.ss_y, 1);
+
+  /* One prediction block per transform block, and all of them together tile the
+   * frame. A sample no block covers is never written - it stays at zero and
+   * every neighbour that predicts from it inherits the error - and a sample two
+   * blocks claim is reconstructed twice in an order the syntax does not define.
+   * Both are silent pixel errors, so they are worth an explicit check on a real
+   * frame: the skipped 8x8 block at (32,136) is coded with 4x4 transforms and
+   * was exactly the hole in this frame. */
+  {
+    const int w = syntax.width, h = syntax.height;
+    std::vector<int> owner(static_cast<size_t>(w) * h, -1);
+    int overlaps = 0;
+    for (size_t i = 0; i < syntax.blocks.size(); ++i) {
+      const BlockSyntax& b = syntax.blocks[i];
+      if (b.plane != 0) continue;
+      for (int y = b.y; y < b.y + b.h && y < h; ++y) {
+        for (int x = b.x; x < b.x + b.w && x < w; ++x) {
+          int& o = owner[static_cast<size_t>(y) * w + x];
+          if (o >= 0) ++overlaps;
+          o = static_cast<int>(i);
+        }
+      }
+    }
+    int uncovered = 0;
+    for (int o : owner) uncovered += o < 0 ? 1 : 0;
+    CHECK_EQ(uncovered, 0);
+    CHECK_EQ(overlaps, 0);
+    /* the frame really does exercise chroma from luma */
+    int cfl_blocks = 0;
+    for (const BlockSyntax& b : syntax.blocks)
+      if (b.mode == av1gpu::PredictionMode::ChromaFromLuma) ++cfl_blocks;
+    CHECK(cfl_blocks > 0);
+
+    /* ---- the reconstruction ------------------------------------------------ */
+    /* The engine's own arithmetic, on the syntax of a real frame, compared with
+     * dav1d's reference picture for it. dav1d was run with the in-loop filters
+     * disabled because the plan carries no filter parameters, and the two
+     * pictures are bit identical; the hash below is that picture, so any change
+     * in parsing, prediction, chroma from luma or the inverse transforms that
+     * costs a single least significant bit fails here. */
+    av1gpu::BackendOptions options;
+    options.kind = av1gpu::BackendKind::Cpu;
+    std::string decode_error;
+    std::unique_ptr<av1gpu::Decoder> decoder = av1gpu::Decoder::create(options, &decode_error);
+    CHECK(decoder != nullptr);
+    if (!decoder) return;
+    av1gpu::Frame picture;
+    CHECK(decoder->decode(syntax, &picture, &decode_error));
+    if (!decode_error.empty()) std::printf("  decode failed: %s\n", decode_error.c_str());
+    CHECK(picture.matches(w, h, 8, 1, 1));
+
+    uint64_t hash = 1469598103934665603ull; /* FNV-1a, 64 bit */
+    for (int p = 0; p < 3; ++p) {
+      const int pw = picture.plane_width(p), ph = picture.plane_height(p);
+      for (int y = 0; y < ph; ++y) {
+        const uint16_t* row = picture.plane(p) + static_cast<size_t>(y) * picture.stride[p];
+        for (int x = 0; x < pw; ++x) {
+          hash = (hash ^ static_cast<uint64_t>(row[x] & 0xff)) * 1099511628211ull;
+        }
+      }
+    }
+    std::printf("  frame hash %016llx (%d chroma-from-luma blocks)\n",
+                static_cast<unsigned long long>(hash), cfl_blocks);
+    /* dav1d's picture, plane by plane, 8 bits per sample, is this frame:
+     * 320x240 luma then 160x120 of each chroma plane. */
+    CHECK_EQ(hash, 0x6112581932b92e2cULL);
+  }
 
   /* inter frames are refused rather than misparsed */
   TileDecodeResult other;

@@ -124,7 +124,7 @@ endif()
 # tools and tests
 # ---------------------------------------------------------------------------
 if(AV1GPU_BUILD_TOOLS)
-  foreach(tool av1gpu_info av1gpu_bench av1gpu_play av1gpu_dump av1gpu_probe)
+  foreach(tool av1gpu_info av1gpu_bench av1gpu_play av1gpu_dump av1gpu_probe av1gpu_decode)
     add_executable(${tool} tools/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE av1gpu)
     set_target_properties(${tool} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

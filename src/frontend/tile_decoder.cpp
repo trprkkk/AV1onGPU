@@ -509,10 +509,9 @@ class TileParser {
     mark_block(row, col, bw4, bh4, size, block.skip, block.y_mode);
     mark_tx(row, col, tx);
 
-    if (block.skip) {
-      reset_coef_context(row, col, bw4, bh4, 1 + (has_chroma ? 2 : 0));
-    } else {
-      const ParseStatus status = read_residuals(&block);
+    if (block.skip) reset_coef_context(row, col, bw4, bh4, 1 + (has_chroma ? 2 : 0));
+    {
+      const ParseStatus status = read_residuals(&block, !block.skip);
       if (status != ParseStatus::Ok) {
         out_->blocks.push_back(block);
         ++out_->blocks_needing_residuals;
@@ -693,10 +692,18 @@ class TileParser {
     return is_tx_type_in_set(set, implied, /*is_inter=*/false) ? implied : coef_tables::kDctDct;
   }
 
-  /* Residual syntax of one block: for each 64x64 chunk of it, all luma
-   * transform blocks then both chroma planes, which is the order the encoder
-   * writes them in. */
-  ParseStatus read_residuals(TileBlock* block) {
+  /* The transform blocks of one block, in coding order: for each 64x64 chunk of
+   * it, all luma transform blocks then both chroma planes.
+   *
+   * A block with no coefficient syntax at all (skip) still *has* this structure
+   * - the specification calls residual() for every block, and a skipped block
+   * simply reaches transform_block with skip set, so it is predicted one
+   * transform block at a time and reconstruct_add is not called. Predicting a
+   * skipped block as a single rectangle instead would change its intra
+   * prediction wherever the transform tiling is finer than the block, so the
+   * emit below is shared and `read_coefficients` only decides whether symbols
+   * are consumed. */
+  ParseStatus read_residuals(TileBlock* block, bool read_coefficients) {
     const int bw4 = block_width4(block->size), bh4 = block_height4(block->size);
     const int width_chunks = std::max(1, (bw4 * 4) >> 6);
     const int height_chunks = std::max(1, (bh4 * 4) >> 6);
@@ -734,6 +741,21 @@ class TileParser {
               const int start_x = block_x + 4 * (x + ((chunk_x << 4) >> sx));
               const int start_y = block_y + 4 * (y + ((chunk_y << 4) >> sy));
               if (start_x >= max_x || start_y >= max_y) continue; /* off the frame */
+              if (!read_coefficients) {
+                if (plane == 0) set_tx_type(start_x >> 2, start_y >> 2, tx, coef_tables::kDctDct);
+                TileTransform empty;
+                empty.plane = plane;
+                empty.size = tx;
+                empty.x = start_x;
+                empty.y = start_y;
+                empty.qindex = block->qindex;
+                empty.tx_type = coef_tables::kDctDct;
+                empty.eob = 0;
+                empty.level_offset = out_->levels.size();
+                block->transforms.push_back(empty);
+                ++out_->transform_blocks;
+                continue;
+              }
               const ParseStatus status = read_transform_block(
                   block, plane, start_x >> 2, start_y >> 2, tx, lossless);
               if (status != ParseStatus::Ok) return status;

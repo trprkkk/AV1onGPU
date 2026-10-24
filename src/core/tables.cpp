@@ -84,17 +84,29 @@ struct FilterTable {
 
 } /* namespace */
 
-/* Transform_Row_Shift, keyed by the transform size. The specification indexes
- * it by txSz; the sizes map to indices in a fixed order, and this is that
- * order written out as (width, height) pairs. */
+/* Transform_Row_Shift, keyed by the transform size.
+ *
+ * The specification's table is
+ *
+ *   Transform_Row_Shift[ TX_SIZES_ALL ] = {
+ *     0, 1, 2, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2
+ *   }
+ *
+ * indexed by the specification's Tx_Size numbers, in this order: 4x4, 8x8,
+ * 16x16, 32x32, 64x64, 4x8, 8x4, 8x16, 16x8, 16x32, 32x16, 32x64, 64x32,
+ * 4x16, 16x4, 8x32, 32x8, 16x64, 64x16. Two things in it surprise: the shift
+ * stops growing at 32x32 (larger transforms are coded with the same scale),
+ * and the tall thin sizes 4x16/16x4 shift by 1 while 8x32/32x8 shift by 2 -
+ * it is not a function of the width alone, so it has to be the table, not a
+ * formula. */
 int tx_row_shift(int w, int h) {
   static const struct {
     int w, h, shift;
   } kTable[] = {
-      {4, 4, 0},  {8, 8, 1},   {16, 16, 2}, {32, 32, 3}, {64, 64, 4}, {4, 8, 0},
-      {8, 4, 0},  {8, 16, 1},  {16, 8, 1},  {16, 32, 1}, {32, 16, 1}, {32, 64, 2},
-      {64, 32, 2}, {4, 16, 1}, {16, 4, 1},  {8, 32, 1},  {32, 8, 1},  {16, 64, 2},
-      {64, 16, 2},
+      {4, 4, 0},   {8, 8, 1},   {16, 16, 2}, {32, 32, 2}, {64, 64, 2},
+      {4, 8, 0},   {8, 4, 0},   {8, 16, 1},  {16, 8, 1},  {16, 32, 1},
+      {32, 16, 1}, {32, 64, 1}, {64, 32, 1}, {4, 16, 1},  {16, 4, 1},
+      {8, 32, 2},  {32, 8, 2},  {16, 64, 2}, {64, 16, 2},
   };
   for (const auto& e : kTable)
     if (e.w == w && e.h == h) return e.shift;

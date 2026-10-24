@@ -3,18 +3,20 @@
  *
  * Turning a FrameSyntax into GPU work happens here. The interesting part is the
  * scheduler: intra prediction reads reconstructed neighbours, so the blocks of a
- * frame cannot all run at the same time. The engine records which block covers
- * which part of the frame on a coarse grid and gives every block the earliest
- * "wave" in which all of its neighbours are already decoded:
+ * frame cannot all run at the same time. The engine records exactly which block
+ * owns every sample of every plane, works out precisely which samples each
+ * block's prediction reads, and gives every block the earliest "wave" in which
+ * all of them are already reconstructed:
  *
- *     wave(block) = 1 + max(wave(above), wave(left), wave(above-left),
- *                           [wave(co-located luma) when using CFL])
+ *     wave(block) = 1 + max(wave(owner(sample)) for every sample it reads)
  *
- * Inter blocks read reference frames only, so they always land in wave 0. Waves
- * are executed in order and inside a wave the jobs are completely independent,
- * which is exactly what a GPU wants. The grid cell size (`dependency_cell`)
- * trades kernel launches against parallelism; it is conservative, so a coarser
- * grid can only serialise more than necessary, never break correctness.
+ * where the samples are the row above (extended by another block width when
+ * above-right is available), the column to the left (extended by another block
+ * height for below-left) and the corner, plus the co-located luma samples for
+ * chroma-from-luma. Inter blocks read reference frames only, so they always
+ * land in wave 0. Waves are executed in order and inside a wave the jobs are
+ * completely independent, which is exactly what a GPU wants; the number of
+ * waves is the length of the longest such chain, not a tunable.
  *
  * Frames live in one flat buffer (three planes back to back) so every job can
  * carry a plain sample offset and the backends need a single allocation.
@@ -27,46 +29,6 @@
 namespace av1gpu {
 namespace internal {
 namespace {
-
-/* Dependency grid: one cell per `cell` luma samples holding the wave index of
- * the block that reconstructed that area, or -1. */
-struct DepGrid {
-  int cell = 32;
-  int cols = 0;
-  int rows = 0;
-  std::vector<int> wave;
-
-  void init(int width, int height, int cell_size) {
-    cell = cell_size > 0 ? cell_size : 32;
-    cols = (width + cell - 1) / cell;
-    rows = (height + cell - 1) / cell;
-    wave.assign(static_cast<size_t>(cols) * rows, -1);
-  }
-
-  int col(int v) const {
-    int c = v / cell;
-    if (c < 0) c = 0;
-    if (c >= cols) c = cols - 1;
-    return c;
-  }
-
-  int row(int v) const {
-    int r = v / cell;
-    if (r < 0) r = 0;
-    if (r >= rows) r = rows - 1;
-    return r;
-  }
-
-  int at(int vx, int vy) const {
-    return wave[static_cast<size_t>(row(vy)) * cols + col(vx)];
-  }
-
-  void fill(int x0, int y0, int x1, int y1, int value) {
-    for (int cy = row(y0); cy <= row(y1 - 1); ++cy)
-      for (int cx = col(x0); cx <= col(x1 - 1); ++cx)
-        wave[static_cast<size_t>(cy) * cols + cx] = value;
-  }
-};
 
 } /* namespace */
 
@@ -212,41 +174,109 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     }
 
     /* ---- wavefront schedule ---------------------------------------------- */
-    DepGrid grid;
-    grid.init(geom.width, geom.height, options.dependency_cell);
+    /* Every block has to run after the blocks that own the samples it reads.
+     * That is a property of the *reconstruction*, not of the syntax: a block
+     * may read samples of a block that comes later in coding order (the
+     * above-right and below-left neighbours of intra prediction), and it must
+     * read them once their residual has been added, not just their
+     * prediction. So instead of a coarse "who owns this area" grid, work out
+     * exactly which block owns every sample and let each block wait for the
+     * owners of the samples it touches.
+     *
+     * Within a wave the backends run every prediction first and every residual
+     * add afterwards, so a same-wave neighbour would be read before its
+     * residual exists. The schedule below therefore requires a *strictly*
+     * earlier wave for every sample a block reads. */
+    std::vector<std::vector<int>> owner(3);
+    for (int p = 0; p < 3; ++p)
+      owner[p].assign(static_cast<size_t>(g.plane_w[p]) * g.plane_h[p], -1);
+    for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
+      const BlockSyntax& b = syntax.blocks[bi];
+      const int p = b.plane;
+      const int x1 = std::min(b.x + b.w, g.plane_w[p]);
+      const int y1 = std::min(b.y + b.h, g.plane_h[p]);
+      for (int y = b.y; y < y1; ++y)
+        for (int x = b.x; x < x1; ++x)
+          owner[p][static_cast<size_t>(y) * g.plane_w[p] + x] = static_cast<int>(bi);
+    }
+    auto sample_owner = [&](int p, int x, int y) {
+      if (x < 0 || y < 0 || x >= g.plane_w[p] || y >= g.plane_h[p]) return -1;
+      return owner[p][static_cast<size_t>(y) * g.plane_w[p] + x];
+    };
+    /* True when every in-frame sample of the rectangle already belongs to a
+     * block earlier in coding order - the question BlockDecoded answers for
+     * the above-right and below-left neighbours. */
+    auto already_decoded = [&](int p, int x0, int x1, int y0, int y1, size_t bi) {
+      for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+          const int o = sample_owner(p, x, y);
+          if (o >= 0 && static_cast<size_t>(o) >= bi) return false;
+        }
+      }
+      return true;
+    };
+
     std::vector<int> block_wave(syntax.blocks.size(), 0);
-    /* availability of the above-right and below-left samples: the specification
-     * only lets intra prediction read them when the block that produced them
-     * has already been reconstructed, which a wavefront schedule can tell by
-     * looking at the dependency grid. */
     std::vector<char> above_right(syntax.blocks.size(), 0);
     std::vector<char> below_left(syntax.blocks.size(), 0);
     int max_wave = 0;
-    for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
-      const BlockSyntax& b = syntax.blocks[bi];
-      /* everything in luma coordinates, so one grid covers all three planes */
-      const int lx = b.x << (b.plane ? geom.ss_x : 0);
-      const int ly = b.y << (b.plane ? geom.ss_y : 0);
-      const int lw = b.w << (b.plane ? geom.ss_x : 0);
-      const int lh = b.h << (b.plane ? geom.ss_y : 0);
-
-      int dep = -1;
-      if (b.is_intra) {
-        dep = std::max(dep, grid.at(lx - 1, ly));
-        dep = std::max(dep, grid.at(lx - 1, ly + lh - 1));
-        dep = std::max(dep, grid.at(lx, ly - 1));
-        dep = std::max(dep, grid.at(lx + lw - 1, ly - 1));
-        dep = std::max(dep, grid.at(lx - 1, ly - 1));
+    /* Dependencies point backwards in coding order for everything the syntax
+     * guarantees, so one pass is enough; the repeat loop is a safety net for a
+     * plan that violates that (nothing should, but a wrong wave is a silent
+     * pixel error, so it is not worth trusting a single pass). */
+    bool changed = true;
+    for (int pass = 0; changed && pass < 4; ++pass) {
+      changed = false;
+      for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
+        const BlockSyntax& b = syntax.blocks[bi];
+        const int p = b.plane;
+        int dep = -1;
+        if (b.is_intra) {
+          /* The edge samples, plus the extensions the specification allows:
+           * the row above by another block width and the column to the left by
+           * another block height. */
+          above_right[bi] = static_cast<char>(
+              b.have_above_right >= 0
+                  ? (b.have_above_right != 0)
+                  : (b.y > 0 && already_decoded(p, b.x + b.w, b.x + 2 * b.w - 1, b.y - 1,
+                                                b.y - 1, bi)));
+          below_left[bi] = static_cast<char>(
+              b.have_below_left >= 0
+                  ? (b.have_below_left != 0)
+                  : (b.x > 0 && already_decoded(p, b.x - 1, b.x - 1, b.y + b.h,
+                                                b.y + 2 * b.h - 1, bi)));
+          const int left_x = b.x - 1;
+          const int left_y1 = b.y + (below_left[bi] ? 2 * b.h : b.h) - 1;
+          for (int y = b.y; y <= left_y1; ++y) {
+            const int o = sample_owner(p, left_x, y);
+            if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+          }
+          const int above_y = b.y - 1;
+          const int above_x1 = b.x + (above_right[bi] ? 2 * b.w : b.w) - 1;
+          for (int x = b.x; x <= above_x1; ++x) {
+            const int o = sample_owner(p, x, above_y);
+            if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+          }
+          /* the sample diagonally above-left, used as the corner */
+          const int o = sample_owner(p, left_x, above_y);
+          if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+        }
+        if (b.mode == PredictionMode::ChromaFromLuma) {
+          /* the co-located luma samples, one per chroma sample */
+          for (int y = 0; y < b.h; ++y) {
+            for (int x = 0; x < b.w; ++x) {
+              const int o = sample_owner(0, (b.x + x) << geom.ss_x, (b.y + y) << geom.ss_y);
+              if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+            }
+          }
+        }
+        const int wave = dep + 1;
+        if (wave > block_wave[bi]) {
+          block_wave[bi] = wave;
+          changed = true;
+        }
+        max_wave = std::max(max_wave, block_wave[bi]);
       }
-      if (b.mode == PredictionMode::ChromaFromLuma)
-        dep = std::max(dep, grid.at(lx, ly)); /* the co-located luma block */
-
-      const int wave = dep + 1;
-      above_right[bi] = static_cast<char>(b.is_intra && grid.at(lx + lw, ly - 1) >= 0);
-      below_left[bi] = static_cast<char>(b.is_intra && grid.at(lx - 1, ly + lh) >= 0);
-      block_wave[bi] = wave;
-      grid.fill(lx, ly, lx + lw, ly + lh, wave);
-      max_wave = std::max(max_wave, wave);
     }
     plan->waves.assign(static_cast<size_t>(max_wave) + 1, WaveJobs());
 
@@ -271,8 +301,10 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.y = b.y;
         job.have_left = b.have_left && b.x > 0;
         job.have_above = b.have_above && b.y > 0;
-        job.have_above_right = above_right[bi];
-        job.have_below_left = below_left[bi];
+        job.have_above_right =
+            b.have_above_right >= 0 ? b.have_above_right != 0 : above_right[bi] != 0;
+        job.have_below_left =
+            b.have_below_left >= 0 ? b.have_below_left != 0 : below_left[bi] != 0;
         /* The edge filter strength table depends on filterType, which comes
          * from the neighbours, and on whether the sequence enables the filter
          * at all. -1 means "do not touch the edge". */
@@ -281,7 +313,10 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.filter_intra_mode = static_cast<int>(b.filter_intra_mode);
         job.angle = b.angle_delta;
         job.cfl_alpha = b.cfl_alpha;
-        job.luma_off = at(0, b.x << geom.ss_x, b.y << geom.ss_y);
+        /* The kernel derives the co-located luma position from the block's own
+         * x/y (`(job.x + j) << subX`), so this is the start of the luma plane,
+         * not the block's first luma sample. */
+        job.luma_off = g.plane_off[0];
         job.luma_stride = g.stride[0];
         job.luma_w = (b.x + b.w) << geom.ss_x;
         job.luma_h = (b.y + b.h) << geom.ss_y;

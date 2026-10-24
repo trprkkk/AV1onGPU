@@ -111,8 +111,9 @@ typedef struct {
                         already know the edge is not to be filtered) */
   int filter_intra;  /* 1: use the recursive filter intra predictor        */
   int filter_intra_mode;
-  int cfl_alpha;     /* Q3 alpha for AV1G_PRED_CFL                         */
-  int luma_off;      /* CFL: offset of the co-located luma samples         */
+  int cfl_alpha;     /* CfL alpha (CflAlphaU/V), 6 bit fractional scale    */
+  int luma_off;      /* CFL: start of the luma plane; the co-located      */
+  /* sample is derived from x/y and ss_x/ss_y                       */
   int luma_stride;
   int luma_w, luma_h; /* CFL: the co-located luma block's right/bottom edge */
   int ss_x, ss_y;    /* chroma subsampling shifts (0/1)                    */
@@ -1075,41 +1076,42 @@ AV1G_FN void av1g_intra_block(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plan
   int i, j;
 
   if (job->mode == AV1G_PRED_CFL) {
-    /* Chroma from luma: the block is DC predicted first (the specification's
-     * CfL process reads the chroma samples back and adds the luma's high
-     * frequencies to them), then the projected luma is added on top. */
+    /* Chroma from luma: the DC prediction of the chroma block plus the luma
+     * block's high frequencies, scaled by alpha. The projected luma samples
+     * carry three fractional bits, so they do not fit the frame's sample type:
+     * the luma is projected twice instead of being parked in the output. */
     const int subx = job->ss_x, suby = job->ss_y;
     long long sum = 0;
     int dc;
+    const int luma_x_limit = job->luma_w - (1 << subx);
+    const int luma_y_limit = job->luma_h - (1 << suby);
     av1g_intra_edges(job, plane, above, left);
     dc = av1g_intra_dc(job, above, left);
-    for (i = 0; i < h; ++i)
-      for (j = 0; j < w; ++j) out[i * stride + j] = (av1g_px)av1g_clip_px(dc, maxv);
     for (i = 0; i < h; ++i) {
-      int ly = (job->y + i) << suby;
-      ly = av1g_min(ly, job->luma_h - (1 << suby));
+      int ly = av1g_min((job->y + i) << suby, luma_y_limit);
       for (j = 0; j < w; ++j) {
-        int lx = (job->x + j) << subx;
-        int t = 0, dy, dx, v;
-        lx = av1g_min(lx, job->luma_w - (1 << subx));
+        int t = 0, dy, dx;
+        const int lx = av1g_min((job->x + j) << subx, luma_x_limit);
         for (dy = 0; dy <= suby; ++dy)
           for (dx = 0; dx <= subx; ++dx)
             t += (int)plane[job->luma_off + (ly + dy) * job->luma_stride + lx + dx];
-        v = t << (3 - subx - suby);
-        sum += v;
-        /* the luma sample is stored here so that the second pass is free of
-         * the addressing; it is overwritten below */
-        out[i * stride + j] = (av1g_px)av1g_clip_px(v, 65535);
+        sum += t << (3 - subx - suby);
       }
     }
     {
       const int shift = av1g_log2(w) + av1g_log2(h);
-      const long long avg = (sum + (1LL << (shift - 1))) >> shift;
+      const int avg = (int)((sum + (1LL << (shift - 1))) >> shift);
       for (i = 0; i < h; ++i) {
+        int ly = av1g_min((job->y + i) << suby, luma_y_limit);
         for (j = 0; j < w; ++j) {
-          const int l = (int)out[i * stride + j];
-          const int scaled = av1g_round2_signed(job->cfl_alpha * (l - (int)avg), 6);
-          out[i * stride + j] = (av1g_px)av1g_clip_px(dc + scaled, maxv);
+          int t = 0, dy, dx, v;
+          const int lx = av1g_min((job->x + j) << subx, luma_x_limit);
+          for (dy = 0; dy <= suby; ++dy)
+            for (dx = 0; dx <= subx; ++dx)
+              t += (int)plane[job->luma_off + (ly + dy) * job->luma_stride + lx + dx];
+          v = t << (3 - subx - suby);
+          out[i * stride + j] =
+              (av1g_px)av1g_clip_px(dc + av1g_round2_signed(job->cfl_alpha * (v - avg), 6), maxv);
         }
       }
     }

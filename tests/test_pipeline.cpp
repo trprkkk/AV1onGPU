@@ -138,15 +138,17 @@ int main() {
     CHECK(source_psnr.y > 25.0);
   }
 
-  /* ---- 2. the scheduler must not change the result ----------------------- */
+  /* ---- 2. the scheduler must be reproducible ------------------------------ */
   {
-    BackendOptions a;
-    a.kind = BackendKind::Cpu;
-    a.dependency_cell = 4;
-    BackendOptions b = a;
-    b.dependency_cell = 64;
-    const Run ra = decode_clip(a, clip);
-    const Run rb = decode_clip(b, clip);
+    /* The wavefront is built from exact sample ownership, so two decodes of the
+     * same syntax have to produce the same picture, the same number of waves
+     * and no leftover samples: an uninitialised or unowned sample would show up
+     * as a difference between the two runs (or as a mismatch against the
+     * encoder's reconstruction, checked above). */
+    BackendOptions options;
+    options.kind = BackendKind::Cpu;
+    const Run ra = decode_clip(options, clip);
+    const Run rb = decode_clip(options, clip);
     CHECK(ra.ok && rb.ok);
     if (ra.ok && rb.ok)
       for (size_t f = 0; f < clip.source.size(); ++f) CHECK(identical(ra.frames[f], rb.frames[f]));

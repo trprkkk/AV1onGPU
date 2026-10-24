@@ -203,6 +203,14 @@ struct BlockSyntax {
   PredictionMode mode = PredictionMode::Dc;
   bool have_left = true;
   bool have_above = true;
+  /* Availability of the samples immediately above the block's top right
+   * corner and immediately left of its bottom left corner. The specification
+   * answers this with BlockDecoded, a per-4x4 map of what has already been
+   * reconstructed, which is *not* the same as "inside the frame": at a
+   * superblock edge the samples exist but have not been decoded yet.
+   * -1 means "derive it from the wavefront schedule" (see build_frame_plan). */
+  int have_above_right = -1;
+  int have_below_left = -1;
   int angle_delta = 0; /* -3..3, in ANGLE_STEP = 3 degree steps */
   /* The specification's filterType: 1 when a neighbouring block was predicted
    * with a smooth mode, which switches the intra edge filter's strength table.
@@ -335,11 +343,6 @@ struct BackendOptions {
   /* Fall back to the CPU reference when the requested GPU backend cannot be
    * initialised. Set to false to make a missing GPU a hard error. */
   bool allow_cpu_fallback = true;
-  /* Size of the dependency grid cell, in luma samples, used to schedule the
-   * wavefront. Bigger cells serialise more (and therefore launch more, smaller
-   * waves); 16 matches the smallest block the engine is typically fed, so a
-   * block rarely shares a cell with an independent neighbour. */
-  int dependency_cell = 16;
   /* Append device/driver/compiler diagnostics to error strings. */
   bool verbose = false;
 };

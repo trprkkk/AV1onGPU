@@ -50,7 +50,6 @@ void usage() {
       "  --width N --height N              frame size (default 1280x720)\n"
       "  --frames N                        frames to decode (default 30)\n"
       "  --qstep N                         quantiser step (default 8)\n"
-      "  --cell N                          scheduler dependency cell (default 32)\n"
       "  --all                             benchmark every available backend\n"
       "  --no-gpu-verify                   skip the CPU/GPU comparison\n");
 }
@@ -156,10 +155,6 @@ int main(int argc, char** argv) {
       frames = next_int(frames);
     } else if (arg == "--qstep") {
       cfg.qstep = next_int(cfg.qstep);
-    } else if (arg == "--cell") {
-      options.dependency_cell = next_int(options.dependency_cell);
-    } else if (arg == "--skip") {
-      options.dependency_cell = next_int(options.dependency_cell);
     } else if (arg == "--all") {
       all = true;
     } else if (arg == "--no-gpu-verify") {

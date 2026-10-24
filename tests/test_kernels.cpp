@@ -479,28 +479,120 @@ void test_intra() {
 
   /* ---- chroma from luma ---------------------------------------------- */
   {
-    /* a flat luma block has no AC, so CfL must reproduce the DC prediction */
+    /* A flat luma block has no AC, so CfL must reproduce the DC prediction. */
     TestPlane p;
     for (int x = 0; x < 8; ++x) p.at(8 + x, 7) = 60;
     for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = 60;
-    std::vector<uint16_t> luma(static_cast<size_t>(40) * 40, 90);
     Av1gIntraJob job = make_intra_job(4, 4);
     job.mode = AV1G_PRED_CFL;
     job.cfl_alpha = 1;
     job.ss_x = 1;
     job.ss_y = 1;
-    job.luma_off = 8 * 40 + 8;
+    job.luma_off = 0; /* the start of the luma plane: see below */
     job.luma_stride = 40;
-    job.luma_w = 16;
-    job.luma_h = 16;
-    /* the chroma plane holds the prediction, the luma is a separate buffer, so
-     * call the kernel with the chroma plane and a luma pointer: the job's
-     * luma_off is applied to the same buffer the decoder passes, which is the
-     * luma plane of the same frame - emulate that by putting the luma samples
-     * well clear of the block under test */
+    job.luma_w = 24;
+    job.luma_h = 24;
     av1g_intra_block(&job, p.data.data(), 255);
     CHECK_EQ(p.at(8, 8), 60);
     CHECK_EQ(p.at(11, 11), 60);
+  }
+  {
+    /* The luma position comes from the block's own x and y: the job carries the
+     * start of the luma plane, and the kernel scales x/y by the subsampling
+     * factors itself. Getting this wrong (adding the block position twice) can
+     * only be seen with luma that has structure, so the luma here is a
+     * gradient placed exactly where the specification says the co-located
+     * samples are, and the prediction is compared with the specification's
+     * formula:
+     *
+     *   L[i][j]  = (sum of the 2x2 luma samples) << (3 - 2)
+     *   lumaAvg  = Round2(sum of L, log2(w) + log2(h))
+     *   pred     = Clip1(dc + Round2Signed(alpha * (L[i][j] - lumaAvg), 6))
+     */
+    const int kAlpha = -2;
+    TestPlane p;
+    for (int x = 0; x < 8; ++x) p.at(8 + x, 7) = 60;
+    for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = 60;
+    /* co-located luma of the chroma block at (8,8): 4x4 chroma -> 8x8 luma at
+     * (16,16); the top left 2x2 of each chroma sample is enough because the
+     * block is 4x4, and the extra 2x2 of the last column and row is clamped */
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) p.at(16 + x, 16 + y) = static_cast<uint16_t>(100 + 3 * x + 5 * y);
+    Av1gIntraJob job = make_intra_job(4, 4);
+    job.mode = AV1G_PRED_CFL;
+    job.cfl_alpha = kAlpha;
+    job.ss_x = 1;
+    job.ss_y = 1;
+    job.luma_off = 0;
+    job.luma_stride = 40;
+    job.luma_w = 24;
+    job.luma_h = 24;
+    av1g_intra_block(&job, p.data.data(), 255);
+
+    int L[4][4];
+    long long sum = 0;
+    for (int i = 0; i < 4; ++i) {
+      for (int j = 0; j < 4; ++j) {
+        int t = 0;
+        for (int dy = 0; dy <= 1; ++dy)
+          for (int dx = 0; dx <= 1; ++dx)
+            t += p.at(16 + 2 * j + dx, 16 + 2 * i + dy);
+        L[i][j] = t << 1;
+        sum += L[i][j];
+      }
+    }
+    const int avg = static_cast<int>((sum + 8) >> 4);
+    for (int i = 0; i < 4; ++i)
+      for (int j = 0; j < 4; ++j) {
+        const int want = clip1(60 + round2_signed(kAlpha * (L[i][j] - avg), 6), 8);
+        CHECK_EQ(p.at(8 + j, 8 + i), want);
+      }
+    /* the gradient must actually have moved the samples away from DC */
+    CHECK(p.at(8, 8) != 60 || p.at(11, 11) != 60);
+  }
+  {
+    /* An 8x8 chroma block (16x16 luma) with a positive alpha, driven through
+     * the same formula, so the block size does not take a different path. */
+    const int kAlpha = 3;
+    TestPlane p;
+    for (int x = 0; x < 16; ++x) p.at(8 + x, 7) = 128;
+    for (int y = 0; y < 16; ++y) p.at(7, 8 + y) = 128;
+    /* the luma buffer of this test is the same array, so the co-located samples
+     * of a block at (8,8) start at (16,16) and overlap the block itself from
+     * (16,16) on: keep them clear of the 8x8 block under test by using x >= 8
+     * only beyond the block, which is what the clamp does not do - so this case
+     * uses the block at (8,8) with a luma block at (16,16) that starts exactly
+     * where the chroma block ends */
+    for (int y = 0; y < 16; ++y)
+      for (int x = 0; x < 16; ++x) p.at(16 + x, 16 + y) = static_cast<uint16_t>(40 + 6 * x + 2 * y);
+    Av1gIntraJob job = make_intra_job(8, 8);
+    job.mode = AV1G_PRED_CFL;
+    job.cfl_alpha = kAlpha;
+    job.ss_x = 1;
+    job.ss_y = 1;
+    job.luma_off = 0;
+    job.luma_stride = 40;
+    job.luma_w = 32;
+    job.luma_h = 32;
+    av1g_intra_block(&job, p.data.data(), 255);
+    int L[8][8];
+    long long sum = 0;
+    for (int i = 0; i < 8; ++i) {
+      for (int j = 0; j < 8; ++j) {
+        int t = 0;
+        for (int dy = 0; dy <= 1; ++dy)
+          for (int dx = 0; dx <= 1; ++dx)
+            t += p.at(16 + 2 * j + dx, 16 + 2 * i + dy);
+        L[i][j] = t << 1;
+        sum += L[i][j];
+      }
+    }
+    const int avg = static_cast<int>((sum + 32) >> 6);
+    for (int i = 0; i < 8; ++i)
+      for (int j = 0; j < 8; ++j) {
+        const int want = clip1(128 + round2_signed(kAlpha * (L[i][j] - avg), 6), 8);
+        CHECK_EQ(p.at(8 + j, 8 + i), want);
+      }
   }
 
   /* ---- filter intra --------------------------------------------------- */
