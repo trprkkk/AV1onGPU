@@ -64,13 +64,15 @@ __kernel void av1g_k_intra(__global const Av1gIntraJob *jobs, int njobs,
 
 __kernel void av1g_k_inter(__global const Av1gInterJob *jobs,
                            __global const int *joff, int njobs, int total,
-                           __global const av1g_px *ref0,
-                           __global const av1g_px *ref1,
+                           __global const av1g_px *cur,
+                           __global const av1g_px *pool,
                            __global av1g_px *dst,
                            __global const int *filters, int maxv) {
   AV1G_JOB_LOOKUP(job_idx, elem);
   Av1gInterJob job = jobs[job_idx];
-  av1g_inter_px(&job, dst, ref0, ref1, filters, elem % job.w, elem / job.w,
+  /* every reference is an absolute offset into the pool; a job that names no
+   * slot reads the picture being decoded */
+  av1g_inter_px(&job, dst, cur, pool, filters, elem % job.w, elem / job.w,
                 maxv);
 }
 

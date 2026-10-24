@@ -361,6 +361,28 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.ref1_off = g.plane_off[plane];
         job.ref0_stride = stride;
         job.ref1_stride = stride;
+        /* OBMC strips: the neighbour's vector, filters and reference frame. The
+         * offset starts at the plane and the backend adds the slot, exactly as
+         * it does for ref0/ref1. */
+        job.obmc_count = 0;
+        for (const ObmcCandidate& c : b.obmc) {
+          if (job.obmc_count >= static_cast<int>(sizeof(job.obmc) / sizeof(job.obmc[0])))
+            break;
+          Av1gObmcCandidate& o = job.obmc[job.obmc_count];
+          std::memset(&o, 0, sizeof(o));
+          o.pass = c.pass;
+          o.rx = c.x;
+          o.ry = c.y;
+          o.w = c.w;
+          o.h = c.h;
+          o.mv_x = c.mv[0];
+          o.mv_y = c.mv[1];
+          o.filt = static_cast<int>(c.filter);
+          o.filt_v = static_cast<int>(c.filter_v);
+          o.ref_slot = resolve_slot(syntax, c.ref);
+          o.ref_off = g.plane_off[plane];
+          ++job.obmc_count;
+        }
         wj.inter.push_back(job);
       }
 

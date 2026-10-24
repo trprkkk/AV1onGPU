@@ -209,6 +209,9 @@ class CudaBackend final : public Backend {
             job.ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
           if (job.ref1_slot >= 0)
             job.ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
+          for (int k = 0; k < job.obmc_count; ++k)
+            if (job.obmc[k].ref_slot >= 0)
+              job.obmc[k].ref_off += job.obmc[k].ref_slot * static_cast<int>(g.buffer_size);
         }
         int total = 0;
         CUdeviceptr job_mem = 0, pref_mem = 0;
@@ -220,7 +223,7 @@ class CudaBackend final : public Backend {
         add_mem(a, pref_mem);
         add_int(a, static_cast<int>(jobs.size()));
         add_int(a, total);
-        add_mem(a, ref_pool_);
+        add_mem(a, frame_);
         add_mem(a, ref_pool_);
         add_mem(a, frame_);
         add_mem(a, filters_);

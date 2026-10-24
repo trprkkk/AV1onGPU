@@ -122,6 +122,25 @@ typedef struct {
   int max_x, max_y;  /* last valid sample of this plane                    */
 } Av1gIntraJob;
 
+/*
+ * One overlapped block motion compensation candidate: the top (or left) strip
+ * of the current block predicted from a *neighbouring* block's motion vector,
+ * blended into the current prediction with a tapered mask. The region is stored
+ * relative to the block, so a sample can be tested against it with the sample's
+ * own coordinates, and the vector, the filters and the reference frame are the
+ * neighbour's, not the block's.
+ */
+typedef struct {
+  int pass;       /* 0: the strip from above, 1: the strip from the left    */
+  int rx, ry;     /* region origin, relative to the block                   */
+  int w, h;       /* region size                                            */
+  int mv_x, mv_y; /* the neighbour's vector, 1/8 luma sample                */
+  int filt;       /* the neighbour's filters, AV1G_FILT_*                   */
+  int filt_v;
+  int ref_slot;   /* the pool slot the neighbour predicts from              */
+  int ref_off;    /* absolute offset of that plane inside the pool          */
+} Av1gObmcCandidate;
+
 /* one inter prediction block (single reference or compound) */
 typedef struct {
   int dst_off;
@@ -141,6 +160,11 @@ typedef struct {
   int compound;       /* AV1G_COMPOUND_*                                  */
   int w0, w1;         /* compound blend weights, Q4, sum == 16            */
   int bitdepth;
+  /* OBMC: at most two strips from above and two from the left (the
+   * specification caps the scan at four each, but a block is at most 16 mi
+   * wide, so a strip is at least 2 mi wide and two of each fit). */
+  int obmc_count;
+  Av1gObmcCandidate obmc[4];
 } Av1gInterJob;
 
 /*
@@ -1232,7 +1256,25 @@ AV1G_FN int av1g_fetch(AV1G_GLOBAL const av1g_px *p, int stride, int x, int y, i
   return (int)p[y * stride + x];
 }
 
-/* The two stage separable interpolation of one sample, in the specification's
+/* The parts of a prediction that are the same for every sample of the job. */
+typedef struct {
+  int sub_x, sub_y;   /* plane subsampling; the vector is halved per axis  */
+  int ref_w, ref_h;   /* visible reference size, for clamping             */
+  int border;         /* extra border samples available (0)               */
+  int bitdepth;
+} Av1gInterCtx;
+
+AV1G_FN void av1g_inter_ctx(const Av1gInterJob *job, Av1gInterCtx *ctx) {
+  ctx->sub_x = job->sub_x;
+  ctx->sub_y = job->sub_y;
+  ctx->ref_w = job->ref_w;
+  ctx->ref_h = job->ref_h;
+  ctx->border = job->border;
+  ctx->bitdepth = job->bitdepth;
+}
+
+/*
+ * The two stage separable interpolation of one sample, in the specification's
  * own arithmetic: the horizontal pass rounds by InterRound0 (3, or 5 at 12
  * bit), which leaves the intermediate at 16 times the sample precision, and
  * the vertical pass rounds by InterRound1 (11 for a single prediction, 7 for
@@ -1245,24 +1287,31 @@ AV1G_FN int av1g_fetch(AV1G_GLOBAL const av1g_px *p, int stride, int x, int y, i
  * (2 * mv) >> sub, and the integer part is the same value shifted four more
  * bits, i.e. floor(mv / 8) in luma and floor(mv / 16) in chroma. Both are
  * arithmetic shifts, which is what makes a negative vector land below the
- * sample rather than above it. */
-AV1G_FN int av1g_inter_tap(const Av1gInterJob *job, AV1G_GLOBAL const av1g_px *ref,
-                           int ref_off, int ref_stride, int x, int y, int mvx,
-                           int mvy, AV1G_GLOBAL const int *filters,
-                           int compound) {
+ * sample rather than above it.
+ *
+ * (x, y) is relative to the patch origin (base_x, base_y), and extent_w/
+ * extent_h size the *region being predicted*: a region only four samples wide
+ * uses the four tap filters, which for an OBMC strip is the strip's size, not
+ * the block's.
+ */
+AV1G_FN int av1g_inter_tap(const Av1gInterCtx *ctx, AV1G_GLOBAL const av1g_px *ref,
+                           int ref_off, int ref_stride, int base_x, int base_y,
+                           int extent_w, int extent_h, int mvx, int mvy, int filt,
+                           int filt_v, int x, int y, int compound,
+                           AV1G_GLOBAL const int *filters) {
   const int mx = mvx * 2, my = mvy * 2;
-  const int xs = mx >> (4 + job->sub_x), xf = (mx >> job->sub_x) & (AV1G_FILT_PHASES - 1);
-  const int ys = my >> (4 + job->sub_y), yf = (my >> job->sub_y) & (AV1G_FILT_PHASES - 1);
-  const int bx0 = -job->border, bx1 = job->ref_w - 1 + job->border;
-  const int by0 = -job->border, by1 = job->ref_h - 1 + job->border;
+  const int xs = mx >> (4 + ctx->sub_x), xf = (mx >> ctx->sub_x) & (AV1G_FILT_PHASES - 1);
+  const int ys = my >> (4 + ctx->sub_y), yf = (my >> ctx->sub_y) & (AV1G_FILT_PHASES - 1);
+  const int bx0 = -ctx->border, bx1 = ctx->ref_w - 1 + ctx->border;
+  const int by0 = -ctx->border, by1 = ctx->ref_h - 1 + ctx->border;
   /* absolute position of the patch origin inside the reference plane */
-  const int ax = job->ref_x + x + xs;
-  const int ay = job->ref_y + y + ys;
-  const int fh = av1g_filt_row(job->filt, job->w);
-  const int fv = av1g_filt_row(job->filt_v, job->h);
-  int round0 = job->bitdepth >= 12 ? 5 : 3;
+  const int ax = base_x + x + xs;
+  const int ay = base_y + y + ys;
+  const int fh = av1g_filt_row(filt, extent_w);
+  const int fv = av1g_filt_row(filt_v, extent_h);
+  int round0 = ctx->bitdepth >= 12 ? 5 : 3;
   int round1 = compound ? 7 : 11;
-  if (job->bitdepth >= 12 && !compound) round1 -= 2;
+  if (ctx->bitdepth >= 12 && !compound) round1 -= 2;
   int acc = 0, i, j;
   for (j = 0; j < AV1G_FILT_TAPS; ++j) {
     int rowacc = 0;
@@ -1277,39 +1326,102 @@ AV1G_FN int av1g_inter_tap(const Av1gInterJob *job, AV1G_GLOBAL const av1g_px *r
   return (acc + (1 << (round1 - 1))) >> round1;
 }
 
-AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
-                           AV1G_GLOBAL const av1g_px *ref0,
-                           AV1G_GLOBAL const av1g_px *ref1,
-                           AV1G_GLOBAL const int *filters, int x, int y, int maxv) {
-  const int compound = job->compound != AV1G_COMPOUND_NONE;
-  const int v0 = av1g_inter_tap(job, ref0, job->ref0_off, job->ref0_stride, x, y,
-                                job->mv0_x, job->mv0_y, filters, compound);
-  int out = v0;
-  if (compound) {
-    const int v1 = av1g_inter_tap(job, ref1, job->ref1_off, job->ref1_stride, x, y,
-                                  job->mv1_x, job->mv1_y, filters, 1);
-    /* Both halves are at 16 times the sample precision here, and
-     * InterPostRound (2 * FILTER_BITS - InterRound0 - InterRound1, so 4 at 8
-     * bit) is the shift that takes them back down. Neither half is clipped
-     * before the blend: the sum is what gets rounded and clipped. */
-    const int round0 = job->bitdepth >= 12 ? 5 : 3;
-    const int post = 2 * 7 - (round0 + 7);
-    if (job->compound == AV1G_COMPOUND_AVG)
-      out = (v0 + v1 + (1 << post)) >> (1 + post);
-    else
-      out = (job->w0 * v0 + job->w1 * v1 + (1 << (3 + post))) >> (4 + post);
+/*
+ * get_obmc_mask: the taper an overlap prediction is blended with, 64 at the
+ * edge it shares with the block's own prediction and smaller towards the block
+ * boundary. `index` runs along the direction the blend varies in - the row for
+ * a strip from above, the column for one from the left.
+ */
+AV1G_FN int av1g_obmc_mask(int length, int index) {
+  if (length == 2) {
+    const int m[2] = {45, 64};
+    return m[index];
   }
-  dst[job->dst_off + y * job->dst_stride + x] = (av1g_px)av1g_clip_px(out, maxv);
+  if (length == 4) {
+    const int m[4] = {39, 50, 59, 64};
+    return m[index];
+  }
+  if (length == 8) {
+    const int m[8] = {36, 42, 48, 53, 57, 61, 64, 64};
+    return m[index];
+  }
+  if (length == 16) {
+    const int m[16] = {34, 37, 40, 43, 46, 49, 52, 54,
+                       56, 58, 60, 61, 64, 64, 64, 64};
+    return m[index];
+  }
+  {
+    const int m[32] = {33, 35, 36, 38, 40, 41, 43, 44, 45, 47, 48, 50,
+                       51, 52, 53, 55, 56, 57, 58, 59, 60, 60, 61, 62,
+                       64, 64, 64, 64, 64, 64, 64, 64};
+    return m[index];
+  }
+}
+
+AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
+                           AV1G_GLOBAL const av1g_px *cur,
+                           AV1G_GLOBAL const av1g_px *pool,
+                           AV1G_GLOBAL const int *filters, int x, int y, int maxv) {
+  Av1gInterCtx ctx;
+  const int compound = job->compound != AV1G_COMPOUND_NONE;
+  int out, k;
+  av1g_inter_ctx(job, &ctx);
+  {
+    const int v0 = av1g_inter_tap(&ctx, job->ref0_slot >= 0 ? pool : cur, job->ref0_off,
+                                  job->ref0_stride, job->ref_x, job->ref_y, job->w,
+                                  job->h, job->mv0_x, job->mv0_y, job->filt, job->filt_v,
+                                  x, y, compound, filters);
+    out = v0;
+    if (compound) {
+      const int v1 = av1g_inter_tap(&ctx, job->ref1_slot >= 0 ? pool : cur, job->ref1_off,
+                                    job->ref1_stride, job->ref_x, job->ref_y, job->w,
+                                    job->h, job->mv1_x, job->mv1_y, job->filt, job->filt_v,
+                                    x, y, 1, filters);
+      /* Both halves are at 16 times the sample precision here, and
+       * InterPostRound (2 * FILTER_BITS - InterRound0 - InterRound1, so 4 at 8
+       * bit) is the shift that takes them back down. Neither half is clipped
+       * before the blend: the sum is what gets rounded and clipped. */
+      const int round0 = job->bitdepth >= 12 ? 5 : 3;
+      const int post = 2 * 7 - (round0 + 7);
+      if (job->compound == AV1G_COMPOUND_AVG)
+        out = (v0 + v1 + (1 << post)) >> (1 + post);
+      else
+        out = (job->w0 * v0 + job->w1 * v1 + (1 << (3 + post))) >> (4 + post);
+    }
+  }
+  out = av1g_clip_px(out, maxv);
+
+  /* Overlapped block motion compensation: a strip of this block predicted from
+   * a neighbour's vector, blended in with the taper. The strips of one pass do
+   * not overlap each other, but a sample in the top left corner sees one from
+   * above and one from the left, so the order here is the specification's. */
+  for (k = 0; k < job->obmc_count; ++k) {
+    const Av1gObmcCandidate *c = &job->obmc[k];
+    int i, j, m, pred;
+    if (x < c->rx || x >= c->rx + c->w) continue;
+    if (y < c->ry || y >= c->ry + c->h) continue;
+    j = x - c->rx;
+    i = y - c->ry;
+    m = c->pass == 0 ? av1g_obmc_mask(c->h, i) : av1g_obmc_mask(c->w, j);
+    pred = av1g_inter_tap(&ctx, c->ref_slot >= 0 ? pool : cur, c->ref_off,
+                          job->ref0_stride, job->ref_x + c->rx, job->ref_y + c->ry,
+                          c->w, c->h, c->mv_x, c->mv_y, c->filt, c->filt_v, j, i, 0,
+                          filters);
+    pred = av1g_clip_px(pred, maxv);
+    out = (m * out + (64 - m) * pred + 32) >> 6;
+  }
+
+  dst[job->dst_off + y * job->dst_stride + x] = (av1g_px)out;
 }
 
 #if !defined(AV1G_DEVICE)
 AV1G_HOST_FN void av1g_inter_block(const Av1gInterJob *job, av1g_px *dst,
-                              const av1g_px *ref0, const av1g_px *ref1,
+                              const av1g_px *cur, const av1g_px *pool,
                               const int *filters, int maxv) {
   int x, y;
   for (y = 0; y < job->h; ++y)
     for (x = 0; x < job->w; ++x)
-      av1g_inter_px(job, dst, ref0, ref1, filters, x, y, maxv);
+      av1g_inter_px(job, dst, cur, pool, filters, x, y, maxv);
 }
 
 #endif

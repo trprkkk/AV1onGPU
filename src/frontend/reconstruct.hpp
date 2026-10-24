@@ -346,6 +346,35 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
   st.y_mode.init(st.mi_cols, st.mi_rows);
   st.uv_mode.init(st.mi_cols, st.mi_rows);
 
+  /* MiSizes / RefFrames / Mvs / InterpFilters, as one map from a 4x4 unit to
+   * the block that covers it. Overlapped block motion compensation reads the
+   * above and left neighbours of a block through it; the block itself is in the
+   * map too, but a candidate is never the block's own cell. */
+  std::vector<int> mi_owner(static_cast<size_t>(st.mi_cols) * st.mi_rows, -1);
+  for (size_t bi = 0; bi < tile.blocks.size(); ++bi) {
+    const TileBlock& owner = tile.blocks[bi];
+    if (owner.mi_col >= mi_cols || owner.mi_row >= mi_rows) continue;
+    const int ow4 = block_width4(owner.size);
+    const int oh4 = block_height4(owner.size);
+    for (int y = 0; y < oh4; ++y) {
+      for (int x = 0; x < ow4; ++x) {
+        const int r = owner.mi_row + y, c = owner.mi_col + x;
+        if (r >= st.mi_rows || c >= st.mi_cols) continue;
+        mi_owner[static_cast<size_t>(r) * st.mi_cols + c] = static_cast<int>(bi);
+      }
+    }
+  }
+  auto mi_block = [&](int row, int col) -> const TileBlock* {
+    if (row < 0 || col < 0 || row >= st.mi_rows || col >= st.mi_cols) return nullptr;
+    const int idx = mi_owner[static_cast<size_t>(row) * st.mi_cols + col];
+    return idx < 0 ? nullptr : &tile.blocks[static_cast<size_t>(idx)];
+  };
+  auto mi_log2 = [](int v) {
+    int n = 0;
+    while ((1 << n) < v) ++n;
+    return n;
+  };
+
   out->coefficients.assign(quant.coefficients.begin(), quant.coefficients.end());
   out->blocks.reserve(tile.blocks.size());
 
@@ -407,10 +436,6 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
         *error = "reconstruct: inter/intra compound prediction is not implemented";
         return false;
       }
-      if (block.motion_mode == kMotionObmc) {
-        *error = "reconstruct: overlapped block motion compensation is not implemented";
-        return false;
-      }
       if (block.motion_mode == kMotionWarped) {
         *error = "reconstruct: warped motion is not implemented";
         return false;
@@ -469,10 +494,79 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
         bs.mv[1][1] = mv[1][1];
         bs.filter = filter_h;
         bs.filter_v = filter_v;
+        bs.motion_mode = block.motion_mode;
         bs.compound = compound;
         bs.blend[0] = blend[0];
         bs.blend[1] = blend[1];
+        bs.obmc.clear();
         inter_used[plane] = false;
+        if (block.motion_mode == kMotionObmc) {
+          /* The overlapped motion compensation process (7.11.3.9). The strips
+           * of one side tile the block, so the mask an overlap prediction is
+           * blended with is sized by the strip and not by the block. */
+          const int block_x = (block.mi_col >> sub_x) * 4;
+          const int block_y = (block.mi_row >> sub_y) * 4;
+          /* from above: only where the plane's residual is at least 8x8, and
+           * with the candidate scanned along the top row of the block */
+          if (avail_u && plane_residual_size(block.size, plane, ss_x, ss_y) >= kBlock8x8) {
+            int x4 = block.mi_col;
+            int count = 0;
+            const int limit = std::min(4, mi_log2(bw4));
+            const int end = std::min(st.mi_cols, block.mi_col + bw4);
+            while (count < limit && x4 < end) {
+              const TileBlock* cand = mi_block(block.mi_row - 1, x4 | 1);
+              const int step4 = cand ? clip3(2, 16, block_width4(cand->size)) : 1;
+              if (cand && cand->is_inter) {
+                ++count;
+                ObmcCandidate c;
+                c.pass = 0;
+                c.x = ((x4 * 4) >> sub_x) - block_x;
+                c.y = 0;
+                c.w = std::min(bs.w - c.x, (step4 * 4) >> sub_x);
+                c.h = std::min(bs.h >> 1, 32 >> sub_y);
+                c.mv[0] = cand->mv[0][0];
+                c.mv[1] = cand->mv[0][1];
+                c.filter = to_filter_type(cand->interp_filter[1]);
+                c.filter_v = to_filter_type(cand->interp_filter[0]);
+                c.ref = cand->ref_frame[0] - 1;
+                if (c.w > 0 && c.h > 0 && c.ref >= 0 && c.ref < 7 &&
+                    (!refs || refs->slot[c.ref] >= 0))
+                  bs.obmc.push_back(c);
+              }
+              x4 += step4;
+            }
+          }
+          /* from the left: no residual size gate, the candidate is scanned
+           * down the left column */
+          if (avail_l) {
+            int y4 = block.mi_row;
+            int count = 0;
+            const int limit = std::min(4, mi_log2(bh4));
+            const int end = std::min(st.mi_rows, block.mi_row + bh4);
+            while (count < limit && y4 < end) {
+              const TileBlock* cand = mi_block(y4 | 1, block.mi_col - 1);
+              const int step4 = cand ? clip3(2, 16, block_height4(cand->size)) : 1;
+              if (cand && cand->is_inter) {
+                ++count;
+                ObmcCandidate c;
+                c.pass = 1;
+                c.x = 0;
+                c.y = ((y4 * 4) >> sub_y) - block_y;
+                c.w = std::min(bs.w >> 1, 32 >> sub_x);
+                c.h = std::min(bs.h - c.y, (step4 * 4) >> sub_y);
+                c.mv[0] = cand->mv[0][0];
+                c.mv[1] = cand->mv[0][1];
+                c.filter = to_filter_type(cand->interp_filter[1]);
+                c.filter_v = to_filter_type(cand->interp_filter[0]);
+                c.ref = cand->ref_frame[0] - 1;
+                if (c.w > 0 && c.h > 0 && c.ref >= 0 && c.ref < 7 &&
+                    (!refs || refs->slot[c.ref] >= 0))
+                  bs.obmc.push_back(c);
+              }
+              y4 += step4;
+            }
+          }
+        }
       }
     }
 

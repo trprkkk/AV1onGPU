@@ -37,10 +37,13 @@ double now_ms() {
  * always needs a buffer of its own. */
 constexpr int kReferenceSlots = 9;
 
+/* The slots live in one flat buffer, slot after slot, so a job can name any
+ * reference (a compound prediction, or the neighbour of an OBMC strip) with an
+ * absolute offset instead of a second pointer - which is exactly what the GPU
+ * backends do, where every reference is an offset into one pool buffer. */
 struct RefFrame {
   bool used = false;
   int width = 0, height = 0, bit_depth = 8, ss_x = 1, ss_y = 1;
-  std::vector<uint16_t> samples;
 };
 
 class CpuBackend final : public Backend {
@@ -73,6 +76,8 @@ class CpuBackend final : public Backend {
     const size_t size = g.buffer_size;
     if (frame_.size() < size) frame_.resize(size, 0);
     if (scratch_.size() < size) scratch_.resize(size, 0);
+    if (ref_pool_.size() < size * kReferenceSlots)
+      ref_pool_.assign(size * kReferenceSlots, 0);
     layout_ = g;
     return g;
   }
@@ -92,12 +97,13 @@ class CpuBackend final : public Backend {
     ref.bit_depth = frame.bit_depth;
     ref.ss_x = frame.ss_x;
     ref.ss_y = frame.ss_y;
-    ref.samples.assign(g.buffer_size, 0);
+    uint16_t* base = ref_pool_.data() + static_cast<size_t>(slot) * g.buffer_size;
+    std::fill(base, base + g.buffer_size, 0);
     for (int p = 0; p < 3; ++p) {
       const int w = g.plane_w[p];
       const int h = g.plane_h[p];
       for (int y = 0; y < h; ++y)
-        std::memcpy(ref.samples.data() + g.plane_off[p] + static_cast<size_t>(y) * g.stride[p],
+        std::memcpy(base + g.plane_off[p] + static_cast<size_t>(y) * g.stride[p],
                     frame.plane(p) + static_cast<size_t>(y) * frame.stride[p],
                     static_cast<size_t>(w) * sizeof(uint16_t));
     }
@@ -149,25 +155,61 @@ class CpuBackend final : public Backend {
 #pragma omp parallel for schedule(dynamic, 4)
 #endif
       for (int i = 0; i < ninter; ++i) {
-        const Av1gInterJob& job = wave.inter[static_cast<size_t>(i)];
-        const uint16_t* r0 = job.ref0_slot >= 0 ? refs_[job.ref0_slot].samples.data() : frame;
-        const uint16_t* r1 = job.ref1_slot >= 0 ? refs_[job.ref1_slot].samples.data() : r0;
+        /* every reference - the two a compound block names, and the ones its
+         * OBMC strips name - is an absolute offset into the pool */
+        Av1gInterJob job = wave.inter[static_cast<size_t>(i)];
+        if (job.ref0_slot >= 0)
+          job.ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
+        if (job.ref1_slot >= 0)
+          job.ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
+        for (int k = 0; k < job.obmc_count; ++k)
+          if (job.obmc[k].ref_slot >= 0)
+            job.obmc[k].ref_off += job.obmc[k].ref_slot * static_cast<int>(g.buffer_size);
+        if (job.obmc_count > 0 && std::getenv("AV1GPU_OBMCDUMP")) {
+          static int obmc_dumped = 0;
+          if (obmc_dumped < 4) {
+            ++obmc_dumped;
+            std::fprintf(stderr, "OUROBMC w=%d h=%d refxy=%d,%d mv=%d,%d filt=%d/%d comp=%d "
+                                 "slots=%d,%d strips=%d\n",
+                         job.w, job.h, job.ref_x, job.ref_y, job.mv0_x, job.mv0_y, job.filt,
+                         job.filt_v, job.compound, job.ref0_slot, job.ref1_slot, job.obmc_count);
+            for (int k = 0; k < job.obmc_count; ++k)
+              std::fprintf(stderr, "  strip %d pass=%d rect=%d,%d %dx%d mv=%d,%d filt=%d/%d "
+                                   "slot=%d off=%d\n",
+                           k, job.obmc[k].pass, job.obmc[k].rx, job.obmc[k].ry, job.obmc[k].w,
+                           job.obmc[k].h, job.obmc[k].mv_x, job.obmc[k].mv_y, job.obmc[k].filt,
+                           job.obmc[k].filt_v, job.obmc[k].ref_slot, job.obmc[k].ref_off);
+          }
+        }
         if (std::getenv("AV1GPU_MCDUMP") && job.dst_off == g.plane_off[0]) {
           static int dumped = 0;
           if (dumped < 3) {
             ++dumped;
             std::fprintf(stderr,
                          "OURMC w=%d h=%d refxy=%d,%d mv=%d,%d sub=%d,%d filt=%d/%d comp=%d "
-                         "slots=%d,%d dst=%d:",
+                         "slots=%d,%d obmc=%d dst=%d\n",
                          job.w, job.h, job.ref_x, job.ref_y, job.mv0_x, job.mv0_y, job.sub_x,
                          job.sub_y, job.filt, job.filt_v, job.compound, job.ref0_slot,
-                         job.ref1_slot, job.dst_off);
-            for (int i = 0; i < 4; ++i)
-              std::fprintf(stderr, " %d", static_cast<int>(r0[g.plane_off[0] + 9 * g.stride[0] + 68 + i]));
-            std::fprintf(stderr, "\n");
+                         job.ref1_slot, job.obmc_count, job.dst_off);
           }
         }
-        av1g_inter_block(&job, frame, r0, r1, filters, maxv);
+        av1g_inter_block(&job, frame, frame, ref_pool_.data(), filters, maxv);
+        if (job.obmc_count > 0 && std::getenv("AV1GPU_OBMCDUMP")) {
+          static int obmc_dumped = 0;
+          if (obmc_dumped < 4) {
+            ++obmc_dumped;
+            std::fprintf(stderr, "OUROBMC w=%d h=%d refxy=%d,%d mv=%d,%d filt=%d/%d comp=%d "
+                                 "slots=%d,%d strips=%d\n",
+                         job.w, job.h, job.ref_x, job.ref_y, job.mv0_x, job.mv0_y, job.filt,
+                         job.filt_v, job.compound, job.ref0_slot, job.ref1_slot, job.obmc_count);
+            for (int k = 0; k < job.obmc_count; ++k)
+              std::fprintf(stderr, "  strip %d pass=%d rect=%d,%d %dx%d mv=%d,%d filt=%d/%d "
+                                   "slot=%d off=%d\n",
+                           k, job.obmc[k].pass, job.obmc[k].rx, job.obmc[k].ry, job.obmc[k].w,
+                           job.obmc[k].h, job.obmc[k].mv_x, job.obmc[k].mv_y, job.obmc[k].filt,
+                           job.obmc[k].filt_v, job.obmc[k].ref_slot, job.obmc[k].ref_off);
+          }
+        }
         if (std::getenv("AV1GPU_MCDUMP") && job.dst_off == g.plane_off[0]) {
           static int dumped2 = 0;
           if (dumped2 < 3) {
@@ -298,7 +340,8 @@ class CpuBackend final : public Backend {
       ref.bit_depth = g.frame.bit_depth;
       ref.ss_x = g.frame.ss_x;
       ref.ss_y = g.frame.ss_y;
-      ref.samples.assign(frame, frame + g.buffer_size);
+      std::memcpy(ref_pool_.data() + static_cast<size_t>(slot) * g.buffer_size, frame,
+                  g.buffer_size * sizeof(uint16_t));
     }
     if (out_slot) *out_slot = slot;
     last_slot_ = slot;
@@ -319,9 +362,9 @@ class CpuBackend final : public Backend {
               std::string* error) override {
     const uint16_t* samples = nullptr;
     if (slot >= 0 && slot < kReferenceSlots && refs_[slot].used)
-      samples = refs_[slot].samples.data();
+      samples = ref_pool_.data() + static_cast<size_t>(slot) * layout_.buffer_size;
     else if (last_slot_ >= 0 && refs_[last_slot_].used)
-      samples = refs_[last_slot_].samples.data();
+      samples = ref_pool_.data() + static_cast<size_t>(last_slot_) * layout_.buffer_size;
     else
       samples = frame_.data();
     if (!samples) {
@@ -347,6 +390,7 @@ class CpuBackend final : public Backend {
   void reset() override {
     for (int i = 0; i < kReferenceSlots; ++i) refs_[i].used = false;
     std::fill(frame_.begin(), frame_.end(), 0);
+    std::fill(ref_pool_.begin(), ref_pool_.end(), 0);
   }
 
  private:
@@ -361,6 +405,8 @@ class CpuBackend final : public Backend {
   PlanLayout layout_;
   std::vector<uint16_t> frame_;
   std::vector<uint16_t> scratch_;
+  /* kReferenceSlots pictures of buffer_size samples, one after another */
+  std::vector<uint16_t> ref_pool_;
   RefFrame refs_[kReferenceSlots];
   int last_slot_ = -1;
 };

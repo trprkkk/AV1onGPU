@@ -189,6 +189,23 @@ struct TransformBlock {
   TransformType tx_type = TransformType::DctDct;
 };
 
+/* One overlapped block motion compensation strip of an inter block: the top
+ * (or left) strip of the block predicted from a neighbouring block's motion
+ * vector and blended in with a tapered mask. `x`/`y` are relative to the
+ * block's top left sample in the plane, because a strip is a region of the
+ * block, not a block of its own. */
+struct ObmcCandidate {
+  int pass = 0;   /* 0: a strip from above, 1: from the left */
+  int x = 0;
+  int y = 0;
+  int w = 0;
+  int h = 0;
+  int mv[2] = {0, 0};   /* the neighbour's vector, 1/8 luma samples */
+  FilterType filter = FilterType::Regular;   /* the neighbour's filters */
+  FilterType filter_v = FilterType::Regular;
+  int ref = -1;         /* index into FrameSyntax::reference_slots */
+};
+
 /* One prediction block of one plane. Chroma blocks are addressed in their own
  * (subsampled) sample grid. */
 struct BlockSyntax {
@@ -239,10 +256,16 @@ struct BlockSyntax {
    * order. A frame with dual_filter off sets both to the same class. */
   FilterType filter = FilterType::Regular;
   FilterType filter_v = FilterType::Regular;
+  /* 0 translation, 1 OBMC, 2 local warped motion (the specification's
+   * MotionMode), kept for diagnostics and dumps. */
+  int motion_mode = 0;
   CompoundType compound = CompoundType::None;
   /* Distance weighted compound weights, Q4 and summing to 16 (the
    * specification's FwdWeight/BckWeight). */
   int blend[2] = {8, 8};
+  /* Overlapped block motion compensation strips, in the order the
+   * specification blends them: the ones from above first, then from the left. */
+  std::vector<ObmcCandidate> obmc;
 
   /* When set, the transform blocks carry raw residual samples
    * (FrameSyntax::residual) instead of an inverse transform. Used for block

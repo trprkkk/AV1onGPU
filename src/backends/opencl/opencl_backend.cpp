@@ -226,6 +226,9 @@ class OpenCLBackend final : public Backend {
             job.ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
           if (job.ref1_slot >= 0)
             job.ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
+          for (int k = 0; k < job.obmc_count; ++k)
+            if (job.obmc[k].ref_slot >= 0)
+              job.obmc[k].ref_off += job.obmc[k].ref_slot * static_cast<int>(g.buffer_size);
         }
         int total = 0;
         cl_mem job_mem = 0, pref_mem = 0;
@@ -238,7 +241,7 @@ class OpenCLBackend final : public Backend {
         set_mem(k, 1, pref_mem);
         set_int(k, 2, static_cast<int>(jobs.size()));
         set_int(k, 3, total);
-        set_mem(k, 4, ref_pool);
+        set_mem(k, 4, frame_);
         set_mem(k, 5, ref_pool);
         set_mem(k, 6, frame_);
         set_mem(k, 7, filters_);

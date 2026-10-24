@@ -410,7 +410,8 @@ int main(int argc, char** argv) {
                       b.transforms.empty() ? -1 : static_cast<int>(b.transforms[0].tx_type),
                       b.transforms.empty() ? -1 : b.transforms[0].coef_offset);
           if (!b.is_intra)
-            std::printf(" refs %d,%d mv %d,%d %d,%d filt %d/%d comp %d blend %d,%d",
+            std::printf(" obmc %d mm %d refs %d,%d mv %d,%d %d,%d filt %d/%d comp %d blend %d,%d",
+                        static_cast<int>(b.obmc.size()), b.motion_mode,
                         b.ref[0], b.ref[1], b.mv[0][0], b.mv[0][1], b.mv[1][0], b.mv[1][1],
                         static_cast<int>(b.filter), static_cast<int>(b.filter_v),
                         static_cast<int>(b.compound), b.blend[0], b.blend[1]);
