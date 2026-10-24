@@ -142,8 +142,10 @@ void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const uint8_
     const ParseStatus status =
         decode_intra_tile(seq, hdr, payload + tile.offset, tile.size, &decoded, &tile_error);
     if (status == ParseStatus::Ok) {
-      std::printf("  tile decoded: %zu block(s), %zu of %zu bytes used\n",
-                  decoded.blocks.size(), decoded.bytes_used, tile.size);
+      std::printf("  tile decoded: %zu block(s), %d transform block(s), %zu coefficient(s),"
+                  " %zu of %zu bytes used\n",
+                  decoded.blocks.size(), decoded.transform_blocks, decoded.coefficients,
+                  decoded.bytes_used, tile.size);
     } else if (status == ParseStatus::Unsupported) {
       std::printf("  tile: %zu block(s) parsed, %zu of %zu bytes used, then: %s\n",
                   decoded.blocks.size(), decoded.bytes_used, tile.size,

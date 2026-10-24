@@ -162,7 +162,8 @@ class TileParser {
  public:
   TileParser(const SequenceHeader& seq, const FrameHeader& frame, const uint8_t* data,
              size_t size, TileDecodeResult* out, std::string* error)
-      : seq_(seq), frame_(frame), data_(data), size_(size), out_(out), error_(error) {}
+      : seq_(seq), frame_(frame), data_(data), size_(size), out_(out), error_(error),
+        trace_(std::getenv("AV1GPU_TRACE") != nullptr) {}
 
   ParseStatus run() {
     if (!frame_.tiles.col_start_sb.empty()) {
@@ -273,7 +274,7 @@ class TileParser {
       const int nsymbols = kPartitionSymbols[level];
       partition = static_cast<PartitionType>(
           decoder_.read_symbol(cdf_.partition.row(level, ctx), nsymbols));
-      if (static_cast<int>(partition) >= nsymbols) return corrupt("partition");
+      if (static_cast<int>(partition) > nsymbols) return corrupt("partition");
     } else if (have_cols) {
       const int ctx = partition_context(row, col, level);
       const unsigned probability = gather_split_probability(
@@ -453,7 +454,7 @@ class TileParser {
       const int nsymbols = kModeChromaCount - 1 - (cfl_allowed ? 0 : 1);
       block.uv_mode = static_cast<int>(
           decoder_.read_symbol(cdf_.mode.uv_mode[cfl_allowed ? 1 : 0][block.y_mode], nsymbols));
-      if (block.uv_mode >= nsymbols) return corrupt("uv_mode");
+      if (block.uv_mode > nsymbols) return corrupt("uv_mode");
       if (block.uv_mode == kModeChromaFromLuma) {
         const int sign = static_cast<int>(decoder_.read_symbol(cdf_.mode.cfl_sign, 7)) + 1;
         const int sign_u = sign / 3, sign_v = sign % 3;
@@ -508,7 +509,9 @@ class TileParser {
     mark_block(row, col, bw4, bh4, size, block.skip, block.y_mode);
     mark_tx(row, col, tx);
 
-    if (!block.skip) {
+    if (block.skip) {
+      reset_coef_context(row, col, bw4, bh4, 1 + (has_chroma ? 2 : 0));
+    } else {
       const ParseStatus status = read_residuals(&block);
       if (status != ParseStatus::Ok) {
         out_->blocks.push_back(block);
@@ -603,6 +606,27 @@ class TileParser {
       else if (sign == 2) dc_sign++;
     }
     return dc_sign < 0 ? 1 : (dc_sign > 0 ? 2 : 0);
+  }
+
+  /* A block that is skipped carries no residual at all, and the specification
+   * clears the coefficient contexts over the whole block's area rather than
+   * letting a neighbour's levels leak into the next block (reset_block_context).
+   * All planes, with the chroma bounds subsampled like the plane's own grid. */
+  void reset_coef_context(int row, int col, int bw4, int bh4, int planes) {
+    for (int plane = 0; plane < planes; ++plane) {
+      const int subx = plane > 0 ? sub_x() : 0;
+      const int suby = plane > 0 ? sub_y() : 0;
+      CoefPlaneContext& ctx = coef_[plane];
+      const int end_x = (col + bw4) >> subx, end_y = (row + bh4) >> suby;
+      for (int x = col >> subx; x < end_x && x < static_cast<int>(ctx.above_level.size()); ++x) {
+        ctx.above_level[x] = 0;
+        ctx.above_dc[x] = 0;
+      }
+      for (int y = row >> suby; y < end_y && y < static_cast<int>(ctx.left_level.size()); ++y) {
+        ctx.left_level[y] = 0;
+        ctx.left_dc[y] = 0;
+      }
+    }
   }
 
   /* Writes the level and DC contexts of a transform block over the area it
@@ -739,17 +763,19 @@ class TileParser {
 
     const int zero_ctx = all_zero_context(*block, plane, x4, y4, tx);
     if (zero_ctx < 0 || zero_ctx > 12) return corrupt("all_zero");
-    if (std::getenv("AV1GPU_TRACE")) {
-      std::fprintf(stderr, "all_zero ctx=%d/%d prob=%u rng=%u q=%d\n", tx_ctx, zero_ctx,
-                   cdf_.coef.skip[tx_ctx][zero_ctx][0], decoder_.state().range, block->qindex);
+    if (trace_) {
+      std::fprintf(stderr, "cf plane=%d x4=%d y4=%d tx=%dx%d blk=%dx%d@(%d,%d) ctx=%d/%d q=%d\n",
+                   plane, x4, y4, tx.width(), tx.height(), block_width4(block->size) * 4,
+                   block_height4(block->size) * 4, block->mi_col, block->mi_row, tx_ctx,
+                   zero_ctx, block->qindex);
     }
     if (decoder_.read_symbol(cdf_.coef.skip[tx_ctx][zero_ctx], 1)) {
       /* empty: the transform kernels still run, they just have nothing to add */
       if (plane == 0) set_tx_type(x4, y4, tx, coef_tables::kDctDct);
       set_coef_context(plane, x4, y4, tx, 0, 0);
-      if (std::getenv("AV1GPU_TRACE")) {
-        std::fprintf(stderr, "cf plane=%d x4=%d y4=%d tx=%dx%d zero rng=%u\n", plane, x4, y4,
-                     tx.width(), tx.height(), decoder_.state().range);
+      if (trace_) {
+        std::fprintf(stderr, "cf plane=%d x4=%d y4=%d tx=%dx%d zero\n", plane, x4, y4,
+                     tx.width(), tx.height());
       }
       block->transforms.push_back(transform);
       ++out_->transform_blocks;
@@ -810,11 +836,7 @@ class TileParser {
     uint16_t (*br_cdf)[4] = cdf_.coef.br_tok[std::min(tx_ctx, 3)][chroma_index];
     for (int c = eob - 1; c >= 0; --c) {
       const int pos = scan.at(c);
-      if (pos < 0) {
-        std::fprintf(stderr, "scan fail plane=%d tx=%dx%d c=%d eob=%d count=%d area=%d\n",
-                     plane, tx.width(), tx.height(), c, eob, scan.count, grid.area());
-        return corrupt("scan");
-      }
+      if (pos < 0) return corrupt("scan");
       int level;
       if (c == eob - 1) {
         const int ctx = coeff_base_context(grid, tx_class, quant, pos, tx, c, /*is_eob=*/true) -
@@ -879,9 +901,9 @@ class TileParser {
     set_coef_context(plane, x4, y4, tx, cul_level, dc_category);
 
     transform.eob = eob;
-    if (std::getenv("AV1GPU_TRACE")) {
-      std::fprintf(stderr, "cf plane=%d x4=%d y4=%d tx=%dx%d txtp=%d eob=%d rng=%u\n", plane, x4,
-                   y4, tx.width(), tx.height(), plane_tx_type, eob, decoder_.state().range);
+    if (trace_) {
+      std::fprintf(stderr, "cf plane=%d x4=%d y4=%d tx=%dx%d txtp=%d eob=%d\n", plane, x4, y4,
+                   tx.width(), tx.height(), plane_tx_type, eob);
     }
     out_->coefficients += static_cast<size_t>(eob);
     block->transforms.push_back(transform);
@@ -919,6 +941,8 @@ class TileParser {
   std::vector<uint8_t> tx_type_map_;
   /* coefficient level and DC statistics, per plane */
   CoefPlaneContext coef_[3];
+  /* AV1GPU_TRACE: one line per transform block on stderr, for debugging */
+  bool trace_ = false;
 
  public:
   void init_state() {

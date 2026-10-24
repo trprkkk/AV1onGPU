@@ -47,12 +47,14 @@ inline int tx_square_class(TxSize tx) { return tx.lw > tx.lh ? tx.lw : tx.lh; }
  * for rectangles. */
 inline int tx_min_class(TxSize tx) { return tx.lw < tx.lh ? tx.lw : tx.lh; }
 
-/* Splitting a transform once halves the longer side: 64x64 -> 32x64 and
- * 32x64 -> 32x32, which is what Split_Tx_Size does. */
+/* Split_Tx_Size: one level of the transform tree halves the longer side, and
+ * halving a square goes to the next square down (64x64 -> 32x32, not 32x64),
+ * because the tree splits it both ways at once. */
 inline TxSize split_tx_size(TxSize tx) {
-  if (tx.lw > 0 && tx.lw >= tx.lh) return TxSize{tx.lw - 1, tx.lh};
-  if (tx.lh > 0) return TxSize{tx.lw, tx.lh - 1};
-  return tx;
+  if (tx.lw > tx.lh) return TxSize{tx.lw - 1, tx.lh};
+  if (tx.lh > tx.lw) return TxSize{tx.lw, tx.lh - 1};
+  const int side = tx.lw > 0 ? tx.lw - 1 : 0;
+  return TxSize{side, side};
 }
 
 /* Max_Tx_Size_Rect for a block of `w4` by `h4` 4x4 units: the block size with

@@ -1,5 +1,9 @@
 #include "frontend/range_decoder.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 namespace av1gpu {
 namespace frontend {
 namespace {
@@ -10,6 +14,49 @@ constexpr int kWindowBits = 64;
  * bitstream, not just the speed. */
 constexpr int kProbShift = 6;
 constexpr unsigned kMinProb = 4;
+
+/* Symbol level tracing, off unless AV1GPU_TRACE_SYM is set.
+ *
+ * The format is the reference decoder's: one line per decoded symbol, with the
+ * table it used and the decoder state afterwards, so a trace of this decoder
+ * can be diffed against a trace of dav1d symbol by symbol. That is the only
+ * practical way to find where two implementations of the same tile start to
+ * disagree, because a desynchronised range coder produces plausible symbols
+ * for thousands of blocks before anything looks wrong. */
+FILE* trace_file() {
+  static FILE* file = nullptr;
+  static bool tried = false;
+  if (!tried) {
+    const char* name = std::getenv("AV1GPU_TRACE_SYM");
+    if (name) file = std::strcmp(name, "-") == 0 ? stdout : std::fopen(name, "w");
+    tried = true;
+  }
+  return file;
+}
+
+void trace_bool(const char* tag, unsigned bit, unsigned probability) {
+  FILE* file = trace_file();
+  if (!file) return;
+  if (probability) {
+    std::fprintf(file, "%s %u %u\n", tag, bit, probability);
+  } else {
+    std::fprintf(file, "%s %u\n", tag, bit);
+  }
+}
+
+void trace_state(uint64_t dif, unsigned range, int count) {
+  FILE* file = trace_file();
+  if (!file) return;
+  std::fprintf(file, "D %016llx %u %d\n", static_cast<unsigned long long>(dif), range, count);
+}
+
+void trace_symbol(unsigned value, const uint16_t* cdf, int nsymbols) {
+  FILE* file = trace_file();
+  if (!file) return;
+  std::fprintf(file, "S %u %d [%u]", value, nsymbols, cdf[nsymbols]);
+  for (int i = 0; i < nsymbols; ++i) std::fprintf(file, " %u", cdf[i]);
+  std::fprintf(file, "\n");
+}
 
 /* Number of significant bits of `value` (value > 0). */
 int bit_length(unsigned value) {
@@ -34,6 +81,7 @@ void RangeDecoder::init(const uint8_t* data, size_t size, bool update_cdf) {
   overrun_ = false;
   failed_ = false;
   refill();
+  if (trace_file()) std::fprintf(trace_file(), "I\n");
 }
 
 /* Pulls bytes into the window. The bytes are complemented on the way in, and
@@ -83,9 +131,13 @@ unsigned RangeDecoder::decode_bool_equi() {
   if (above) {
     v += r - 2 * v;
     normalize(dif - threshold, v);
+    trace_bool("E", 0, 0);
+    trace_state(dif_, rng_, cnt_);
     return 0;
   }
   normalize(dif, v);
+  trace_bool("E", 1, 0);
+  trace_state(dif_, rng_, cnt_);
   return 1;
 }
 
@@ -99,9 +151,13 @@ unsigned RangeDecoder::decode_bool(unsigned probability) {
   if (above) {
     v += r - 2 * v;
     normalize(dif - threshold, v);
+    trace_bool("B", 0, probability);
+    trace_state(dif_, rng_, cnt_);
     return 0;
   }
   normalize(dif, v);
+  trace_bool("B", 1, probability);
+  trace_state(dif_, rng_, cnt_);
   return 1;
 }
 
@@ -109,6 +165,12 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
   if (failed_) return 0;
   const unsigned c = static_cast<unsigned>(dif_ >> (kWindowBits - 16));
   const unsigned r = rng_ >> 8;
+  /* the trace shows the table as it was before this symbol adapted it */
+  uint16_t before[kMaxCdfSymbols + 1] = {0};
+  const bool tracing = trace_file() != nullptr;
+  if (tracing) {
+    for (int i = 0; i <= nsymbols; ++i) before[i] = cdf[i];
+  }
   unsigned u = 0;
   unsigned v = rng_;
   int symbol = 0;
@@ -132,6 +194,11 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
   }
 
   normalize(dif_ - (static_cast<uint64_t>(v) << (kWindowBits - 16)), u - v);
+
+  if (tracing) {
+    trace_symbol(static_cast<unsigned>(symbol), before, nsymbols);
+    trace_state(dif_, rng_, cnt_);
+  }
 
   if (update_cdf_) {
     const unsigned count = cdf[nsymbols];

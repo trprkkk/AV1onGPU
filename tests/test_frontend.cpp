@@ -938,8 +938,10 @@ void test_block_geometry() {
   CHECK(max_tx_size(8, 8) == (TxSize{3, 3}));
   CHECK(max_tx_size(32, 32) == (TxSize{4, 4}));
   CHECK(max_tx_size(4, 16) == (TxSize{2, 4}));
-  CHECK(split_tx_size(TxSize{4, 4}) == (TxSize{3, 4}));
+  CHECK(split_tx_size(TxSize{4, 4}) == (TxSize{3, 3}));
   CHECK(split_tx_size(TxSize{3, 4}) == (TxSize{3, 3}));
+  CHECK(split_tx_size(TxSize{1, 2}) == (TxSize{1, 1}));
+  CHECK(split_tx_size(TxSize{0, 2}) == (TxSize{0, 1}));
   CHECK_EQ(max_tx_depth(TxSize{4, 4}), 4);
   CHECK_EQ(tx_square_class(TxSize{2, 3}), 3);
   CHECK_EQ(tx_min_class(TxSize{2, 3}), 2);
@@ -1062,8 +1064,14 @@ void test_tile_decoder() {
    * to place the 32x32 block on the grid, not just read symbols in a row */
   CHECK(result.bytes_used > 0);
   CHECK(result.bytes_used <= tile_size);
-  CHECK(result.transform_blocks > 3);
-  CHECK(result.levels.size() > 1000u);
+  /* The whole frame, as dav1d decodes it: 306 blocks, 1063 transform blocks
+   * and 64301 coded coefficients. The tile's bytes are exactly consumed, which
+   * is the end to end check that every symbol was read with the right table. */
+  CHECK_EQ(result.blocks.size(), 306u);
+  CHECK_EQ(result.transform_blocks, 1063);
+  CHECK_EQ(result.coefficients, 64301u);
+  CHECK_EQ(result.levels.size(), 64301u);
+  CHECK_EQ(result.bytes_used, tile_size);
 
   /* inter frames are refused rather than misparsed */
   TileDecodeResult other;
