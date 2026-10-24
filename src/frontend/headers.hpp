@@ -33,6 +33,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -209,6 +210,54 @@ struct GlobalMotion {
   bool translation_only() const { return type == kGmTranslation; }
 };
 
+/* The specification's RefMvTemporalBlock: what one 8x8 cell of a frame
+ * contributes to the temporal motion vector candidates of a later frame.
+ *
+ * `ref` is the reference *type* the vector points at, and zero means the cell
+ * contributed nothing - the block was intra predicted, or its vector pointed
+ * forwards in time, in which case it cannot be projected onto a future frame.
+ * The two reference decoders use the invalid motion vector value as the marker;
+ * a zero reference type is the same information without the sentinel. */
+struct TemporalMv {
+  int16_t x = 0;
+  int16_t y = 0;
+  uint8_t ref = 0;
+
+  bool valid() const { return ref != 0; }
+};
+
+/* A frame's motion vector grid, one entry per 8x8 cell, saved when the frame is
+ * decoded (`load_tmvs`/`save_tmvs` in the reference decoders). A later frame
+ * projects these vectors onto its own grid and scans the result next to the
+ * spatial candidates, which is what `use_ref_frame_mvs` buys. */
+struct RefMvs {
+  int cols = 0; /* in 8x8 cells */
+  int rows = 0;
+  std::vector<TemporalMv> cells;
+
+  void resize(int new_cols, int new_rows) {
+    cols = new_cols;
+    rows = new_rows;
+    cells.assign(static_cast<size_t>(new_cols) * new_rows, TemporalMv());
+  }
+  TemporalMv& at(int col, int row) {
+    return cells[static_cast<size_t>(row) * cols + col];
+  }
+  const TemporalMv& at(int col, int row) const {
+    return cells[static_cast<size_t>(row) * cols + col];
+  }
+};
+
+/* mv_projection, one component: scale a stored motion vector by the ratio of
+ * two order hint distances, `num / den`, both in [-31, 31] and `den` non-zero.
+ *
+ * The scaling is done in 1/64 steps (the table is 2^14 / den rounded, and the
+ * result is shifted back by 14), rounded away from zero, and clipped to the
+ * range a projectable vector can span (2^14 - 1). This is the specification's
+ * section 7.9.3 arithmetic, bit for bit: a decoder that rounds differently gets
+ * a different candidate and then a different dynamic reference list index. */
+int project_mv_component(int mv, int num, int den);
+
 /* One entry of the reference frame store: enough for the bitstream front-end to
  * resolve inter frame sizes and skip-mode decisions. */
 struct RefSlot {
@@ -220,6 +269,14 @@ struct RefSlot {
   /* The frame's global motion model per reference type, which the next frame
    * reads to decode its own model differentially. */
   GlobalMotion global_motion[8];
+  /* The order hints of the seven frames *this* frame referenced. Projecting a
+   * stored vector needs both ends of its trajectory, so the next frame reads
+   * them together with the grid itself. */
+  int ref_poc[7] = {0, 0, 0, 0, 0, 0, 0};
+  /* The motion vectors this frame saved, null for an intra frame and for a
+   * frame whose tile was not decoded. Shared because one frame can refresh
+   * several slots. */
+  std::shared_ptr<const RefMvs> ref_mvs;
 };
 
 /* The eight AV1 reference slots. `parse_frame_header` reads them to resolve
@@ -320,8 +377,11 @@ struct FrameHeader {
   size_t tile_data_offset = 0;
 };
 
-/* Applies `frame.refresh_frame_flags` to the reference pool. */
-void refresh_ref_pool(const FrameHeader& frame, RefPool* pool);
+/* Applies `frame.refresh_frame_flags` to the reference pool. `ref_mvs` is the
+ * motion vector grid the frame's tile produced, if it was decoded; the slots the
+ * frame refreshes keep it for the frames that project from them. */
+void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
+                      const std::shared_ptr<const RefMvs>& ref_mvs = nullptr);
 
 enum class ParseStatus {
   Ok = 0,

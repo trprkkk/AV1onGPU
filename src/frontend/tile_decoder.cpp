@@ -199,6 +199,32 @@ int coeff_br_context(const CoefGrid& grid, int tx_class, const int16_t* levels, 
 constexpr int kMvVertical = 0;
 constexpr int kMvHorizontal = 1;
 
+/* Sign extended distance between two order hints, `a - b`: positive when `a` is
+ * the later of the two, wrapped into the sequence header's bit width. Zero when
+ * the stream does not carry order hints at all, which is also what disables
+ * temporal motion vector prediction. */
+int order_hint_delta(const SequenceHeader& seq, int a, int b) {
+  if (!seq.enable_order_hint) return 0;
+  int diff = a - b;
+  const int m = 1 << (seq.order_hint_n_bits - 1);
+  return (diff & (m - 1)) - (diff & m);
+}
+
+/* AV1GPU_TRACE_T=1 dumps the temporal motion vector grids: what a frame saved
+ * ("T" lines) and what it projected onto itself ("U" lines), in the shape the
+ * reference decoder prints, so the two projections can be diffed cell by cell.
+ * The projection is integer arithmetic with a sign convention per reference
+ * type, which is exactly the kind of thing that decodes plausibly and is wrong
+ * for a handful of blocks. */
+bool trace_tmvs() {
+  static const bool enabled = std::getenv("AV1GPU_TRACE_T") != nullptr;
+  return enabled;
+}
+
+/* INVALID_REF2CUR: a contributing reference frame whose distance to this one is
+ * too large to be projected (the order hint wrapped around). */
+constexpr int kInvalidRef2Cur = -32;
+
 /* Filter_Intra_Mode_To_Intra_Dir: a filter intra mode stands in for a luma
  * direction when the transform type alphabet is selected. */
 constexpr int8_t kFilterIntraToIntraDir[5] = {kModeDc, kModeVertical, kModeHorizontal,
@@ -229,6 +255,11 @@ class TileParser {
       }
     }
     out_->complete = true;
+    if (frame_.type == FrameType::Inter || frame_.type == FrameType::Switch) {
+      auto store = std::make_shared<RefMvs>();
+      save_temporal_mvs(store.get());
+      out_->ref_mvs = std::move(store);
+    }
     return ParseStatus::Ok;
   }
 
@@ -461,6 +492,318 @@ class TileParser {
   const GlobalMotion& global_motion_of(int ref_type) const {
     return frame_.global_motion[ref_type];
   }
+
+  /* --- projected (temporal) motion vectors --------------------------------
+   *
+   * `use_ref_frame_mvs` lets a block borrow motion vectors from the frames it
+   * refers to: each of those frames saved, per 8x8 cell, the vector of the block
+   * covering it, and this frame projects every saved vector forward along its
+   * own trajectory onto the cell it would reach here. The projection of a whole
+   * frame is cheap and depends on nothing but the reference frames, so it is
+   * done once, before the first block, and the candidate scan then reads it like
+   * a spatial neighbour.
+   *
+   * Two things make this fiddly. The projection is a rational scaling by the
+   * ratio of two "distance in time" values, and it has to land in the *same*
+   * 8x8 row band it started in, so cells only move within a band plus one
+   * above and below the band's left/right edges. And which reference frames
+   * contribute is not simply "the ones this frame refers to": the specification
+   * names at most three (or two, when one of them is the last frame), preferring
+   * the ones closest in time, and each contributes with its own reference
+   * distance, which is what the `mfmv_` arrays hold.
+   */
+
+  static int apply_sign(int magnitude, int sign_source) {
+    return sign_source < 0 ? -magnitude : magnitude;
+  }
+
+  /* The frame's temporal candidate setup: which reference frames contribute
+   * (`mfmv_ref_`), how far each is from this frame (`mfmv_ref2cur_`) and, for
+   * the vectors they stored, how far the frame *they* stored them from is
+   * (`mfmv_ref2ref_`). `pocdiff_` is this frame's distance to each of its own
+   * seven references, which is the numerator of every projection. */
+  void setup_temporal_mvs() {
+    const int iw8 = (frame_.frame_width + 7) >> 3;
+    const int ih8 = (frame_.height + 7) >> 3;
+    proj_cols_ = iw8;
+    proj_.assign(static_cast<size_t>(iw8) * ih8, TemporalMv());
+    mfmv_count_ = 0;
+    if (!refs_) return;
+
+    for (int i = 0; i < 7; ++i) {
+      const int to_ref = order_hint_delta(seq_, frame_.order_hint, frame_.ref_order_hint[i]);
+      pocdiff_[i] = std::max(-31, std::min(31, to_ref));
+      /* a vector that points at a frame before this one can be projected onto a
+       * frame after it; the other direction is not usable */
+      mfmv_sign_[i] = order_hint_delta(seq_, frame_.ref_order_hint[i], frame_.order_hint) < 0;
+    }
+    if (!frame_.use_ref_frame_mvs || !seq_.enable_order_hint) return;
+
+    /* The frames whose saved grid this frame can read: an inter frame of the
+     * same size, in the slot its reference type names. */
+    const RefMvs* stored[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    int stored_poc[7][7] = {};
+    for (int i = 0; i < 7; ++i) {
+      const int slot_index = frame_.ref_frame_idx[i];
+      if (slot_index < 0 || slot_index > 7) continue;
+      const RefSlot& slot = refs_->slots[slot_index];
+      for (int r = 0; r < 7; ++r) stored_poc[i][r] = slot.ref_poc[r];
+      if (slot.ref_mvs && slot.ref_mvs->cols == iw8 && slot.ref_mvs->rows == ih8) {
+        stored[i] = slot.ref_mvs.get();
+      }
+    }
+
+    for (int n = 0; n < 3; ++n) mfmv_stored_[n] = nullptr;
+    const auto relative = [this](int a, int b) { return order_hint_delta(seq_, a, b); };
+
+    int total = 2;
+    if (stored[kRefIdxLast] && stored_poc[kRefIdxLast][kRefIdxAltref] !=
+                                   frame_.ref_order_hint[kRefIdxGolden]) {
+      /* the last frame was predicted from something other than the frame this
+       * one calls golden, so the two are distinct points in time: it is worth a
+       * candidate of its own */
+      mfmv_ref_[mfmv_count_++] = kRefIdxLast;
+      total = 3;
+    }
+    if (stored[kRefIdxBwdref] &&
+        relative(frame_.ref_order_hint[kRefIdxBwdref], frame_.order_hint) > 0)
+      mfmv_ref_[mfmv_count_++] = kRefIdxBwdref;
+    if (stored[kRefIdxAltref2] &&
+        relative(frame_.ref_order_hint[kRefIdxAltref2], frame_.order_hint) > 0)
+      mfmv_ref_[mfmv_count_++] = kRefIdxAltref2;
+    if (mfmv_count_ < total && stored[kRefIdxAltref] &&
+        relative(frame_.ref_order_hint[kRefIdxAltref], frame_.order_hint) > 0)
+      mfmv_ref_[mfmv_count_++] = kRefIdxAltref;
+    if (mfmv_count_ < total && stored[kRefIdxLast2]) mfmv_ref_[mfmv_count_++] = kRefIdxLast2;
+
+    if (trace_tmvs()) {
+      std::fprintf(stderr, "TS per=%d n=%d hint=%d refs=", pocdiff_[0], mfmv_count_,
+                   frame_.order_hint);
+      for (int i = 0; i < 7; ++i) std::fprintf(stderr, " %d", frame_.ref_order_hint[i]);
+      std::fprintf(stderr, "\n");
+    }
+    for (int n = 0; n < mfmv_count_; ++n) {
+      const int ref = mfmv_ref_[n];
+      mfmv_stored_[n] = stored[ref];
+      const int ref_hint = frame_.ref_order_hint[ref];
+      const int distance = relative(ref_hint, frame_.order_hint);
+      if (std::abs(distance) > 31) {
+        mfmv_ref2cur_[n] = kInvalidRef2Cur;
+        continue;
+      }
+      /* A backward reference (bwd, altref2, altref) is stored with the sign the
+       * specification gives it; the forward ones are negated. */
+      mfmv_ref2cur_[n] = ref < kRefIdxBwdref ? -distance : distance;
+      for (int m = 0; m < 7; ++m) {
+        const int their_distance = relative(ref_hint, stored_poc[ref][m]);
+        /* a distance the wrong way round, or too large to be representable, is
+         * stored as zero, which means "this vector cannot be projected" */
+        mfmv_ref2ref_[n][m] =
+            static_cast<uint8_t>(their_distance <= 0 || their_distance > 31 ? 0 : their_distance);
+      }
+    }
+    if (trace_tmvs()) {
+      for (int n = 0; n < mfmv_count_; ++n) {
+        std::fprintf(stderr, "TA n=%d ref=%d ref2cur=%d ref2ref=", n, mfmv_ref_[n],
+                     mfmv_ref2cur_[n]);
+        for (int m = 0; m < 7; ++m) std::fprintf(stderr, " %d", mfmv_ref2ref_[n][m]);
+        std::fprintf(stderr, "\n");
+      }
+    }
+    project_temporal_mvs(iw8, ih8);
+  }
+
+  /* load_tmvs: project every stored vector of the contributing reference frames
+   * onto this frame's grid. Later contributors overwrite earlier ones, which is
+   * the specification's way of preferring the closer frames (they come later in
+   * `mfmv_ref_`). */
+  void project_temporal_mvs(int iw8, int ih8) {
+    for (int n = 0; n < mfmv_count_; ++n) {
+      const RefMvs* stored = mfmv_stored_[n];
+      if (!stored || mfmv_ref2cur_[n] == kInvalidRef2Cur) continue;
+      /* the reference type the stored vector points at is inverted for the
+       * forward references, and the projection follows the same sign */
+      const int ref_sign = mfmv_ref_[n] - kRefIdxBwdref;
+      for (int y = 0; y < ih8; ++y) {
+        /* a vector only reaches the same 8x8 band of rows it started in */
+        const int band = y & ~7;
+        const int band_end = std::min(band + 8, ih8);
+        for (int x = 0; x < iw8; ++x) {
+          const TemporalMv& cell = stored->at(x, y);
+          if (!cell.valid()) continue;
+          const int ref2ref = mfmv_ref2ref_[n][cell.ref - 1];
+          if (!ref2ref) continue;
+          const int offset_x = project_mv_component(cell.x, mfmv_ref2cur_[n], ref2ref);
+          const int offset_y = project_mv_component(cell.y, mfmv_ref2cur_[n], ref2ref);
+          /* 8x8 cells: the stored vector is in 1/8 sample units, the projection
+           * divides by 64 to land on one */
+          const int pos_x = x + apply_sign(std::abs(offset_x) >> 6, offset_x ^ ref_sign);
+          const int pos_y = y + apply_sign(std::abs(offset_y) >> 6, offset_y ^ ref_sign);
+          if (pos_y < band || pos_y >= band_end) continue;
+          /* and it only spreads one cell to either side of its own band */
+          const int x_band = x & ~7;
+          if (pos_x < std::max(x_band - 8, 0) || pos_x >= std::min(x_band + 16, iw8)) continue;
+          TemporalMv& dst = proj_[static_cast<size_t>(pos_y) * proj_cols_ + pos_x];
+          dst.x = cell.x;
+          dst.y = cell.y;
+          dst.ref = static_cast<uint8_t>(ref2ref);
+        }
+      }
+    }
+    if (trace_tmvs()) {
+      for (int y = 0; y < ih8; ++y) {
+        for (int x = 0; x < iw8; ++x) {
+          const TemporalMv& cell = projected_at(x, y);
+          if (cell.valid()) {
+            std::fprintf(stderr, "U %d %d %d %d %d\n", x, y, cell.ref, cell.x, cell.y);
+          }
+        }
+      }
+    }
+  }
+
+  const TemporalMv& projected_at(int col, int row) const {
+    static const TemporalMv kEmpty;
+    if (col < 0 || row < 0 || col >= proj_cols_) return kEmpty;
+    if (static_cast<size_t>(row) * proj_cols_ + col >= proj_.size()) return kEmpty;
+    return proj_[static_cast<size_t>(row) * proj_cols_ + col];
+  }
+
+  /* Two cells belong to the same "run" when they would contribute the same
+   * candidate: the scan counts identical neighbours instead of visiting one
+   * candidate per cell. Cells with no vector compare equal to each other
+   * whatever they contain, because adding them is a no-op either way. */
+  static bool same_temporal_cell(const TemporalMv& a, const TemporalMv& b) {
+    if (a.valid() != b.valid()) return false;
+    if (!a.valid()) return true;
+    return a.ref == b.ref && a.x == b.x && a.y == b.y;
+  }
+
+  /* add_temporal_candidate: one projected vector, from a run of `weight / 2`
+   * cells. The first call of the whole scan also settles `globalmv_ctx`, the
+   * context bit that says whether the temporal prediction already agrees with
+   * the global motion model (in which case the far/near modes are cheap). */
+  void add_temporal_candidate(MvCand* stack, int* count, const TemporalMv& cell, int ref0,
+                              int* globalmv_ctx, int gmv_x, int gmv_y, int weight) {
+    if (!cell.valid()) return;
+    int x = project_mv_component(cell.x, pocdiff_[ref0 - 1], cell.ref);
+    int y = project_mv_component(cell.y, pocdiff_[ref0 - 1], cell.ref);
+    lower_mv_precision(&x, &y);
+    if (globalmv_ctx)
+      *globalmv_ctx = (std::abs(x - gmv_x) | std::abs(y - gmv_y)) >= 16;
+    const int last = *count;
+    for (int n = 0; n < last; ++n) {
+      if (stack[n].x == x && stack[n].y == y) {
+        stack[n].weight += weight;
+        return;
+      }
+    }
+    if (last < 8) {
+      stack[last].x = x;
+      stack[last].y = y;
+      stack[last].weight = weight;
+      *count = last + 1;
+    }
+  }
+
+  /* The temporal part of find_ref_mvs: the block's cells, the small block edge
+   * cases, and the resulting global motion context. */
+  int temporal_candidates(MvCand* stack, int* count, int ref0, int bw4, int bh4, int w4, int h4,
+                          int mi_row, int mi_col, int gmv_x, int gmv_y) {
+    int globalmv_ctx = frame_.use_ref_frame_mvs ? 1 : 0;
+    if (mfmv_count_ == 0) return globalmv_ctx;
+
+    const int bx8 = mi_col >> 1, by8 = mi_row >> 1;
+    const int step_h = bw4 >= 16 ? 2 : 1, step_v = bh4 >= 16 ? 2 : 1;
+    const int w8 = std::min((w4 + 1) >> 1, 8), h8 = std::min((h4 + 1) >> 1, 8);
+
+    /* The scan walks the cells in runs, starting with the one at the block's own
+     * origin (which the traversal below skips) and counting the run instead of
+     * adding the same candidate over and over. */
+    TemporalMv run = projected_at(bx8, by8);
+    int run_len = 1;
+    int* run_gmv_ctx = &globalmv_ctx;
+    for (int y = 0; y < h8; y += step_v) {
+      for (int x = y ? 0 : step_h; x < w8; x += step_h) {
+        const TemporalMv& cell = projected_at(bx8 + x, by8 + y);
+        if (same_temporal_cell(cell, run)) {
+          ++run_len;
+          continue;
+        }
+        add_temporal_candidate(stack, count, run, ref0, run_gmv_ctx, gmv_x, gmv_y, 2 * run_len);
+        run_gmv_ctx = nullptr;
+        run = cell;
+        run_len = 1;
+      }
+    }
+    add_temporal_candidate(stack, count, run, ref0, run_gmv_ctx, gmv_x, gmv_y, 2 * run_len);
+
+    /* Small blocks also look at the cells just past their bottom right corner,
+     * which are the ones a neighbouring block's own scan would not reach. */
+    if (std::min(bw4, bh4) >= 2 && std::max(bw4, bh4) < 16) {
+      const int bw8 = bw4 >> 1, bh8 = bh4 >> 1;
+      const bool has_bottom = by8 + bh8 < std::min(tile_row_end_ >> 1, (by8 & ~7) + 8);
+      if (has_bottom && bx8 - 1 >= std::max(tile_col_start_ >> 1, bx8 & ~7)) {
+        add_temporal_candidate(stack, count, projected_at(bx8 - 1, by8 + bh8), ref0, nullptr, 0,
+                               0, 2);
+      }
+      if (bx8 + bw8 < std::min(tile_col_end_ >> 1, (bx8 & ~7) + 8)) {
+        if (has_bottom) {
+          add_temporal_candidate(stack, count, projected_at(bx8 + bw8, by8 + bh8), ref0, nullptr,
+                                 0, 0, 2);
+        }
+        if (by8 + bh8 - 1 < std::min(tile_row_end_ >> 1, (by8 & ~7) + 8)) {
+          add_temporal_candidate(stack, count, projected_at(bx8 + bw8, by8 + bh8 - 1), ref0,
+                                 nullptr, 0, 0, 2);
+        }
+      }
+    }
+    return globalmv_ctx;
+  }
+
+  /* save_tmvs: what this frame leaves behind for the frames that refer to it.
+   *
+   * One record per 8x8 cell, taken from the block covering the cell's bottom
+   * right 4x4 sample - that is the sample the specification uses, because it is
+   * the one a block's neighbours can see. A block only contributes a vector
+   * that points *backwards* in time (which is what makes it projectable onto a
+   * later frame) and that is small enough to be a real prediction rather than a
+   * scroll; the whole width of the block is filled with the same record. */
+  void save_temporal_mvs(RefMvs* out) const {
+    const int iw8 = (frame_.frame_width + 7) >> 3;
+    const int ih8 = (frame_.height + 7) >> 3;
+    out->resize(iw8, ih8);
+    for (int y = 0; y < ih8; ++y) {
+      const int row = std::min(y * 2 + 1, mi_rows() - 1);
+      int x = 0;
+      while (x < iw8) {
+        const int col = std::min(x * 2 + 1, mi_cols() - 1);
+        const int bw8 = (block_width4(block_size_at(row, col)) + 1) >> 1;
+        TemporalMv cell;
+        const MiRef& mi = mi_at(row, col);
+        if (!mi.intra) {
+          for (int n = 1; n >= 0; --n) {
+            const int ref = mi.ref[n];
+            if (ref <= kRefIntra || !mfmv_sign_[ref - 1]) continue;
+            if ((std::abs(mi.mv[n][0]) | std::abs(mi.mv[n][1])) >= 4096) continue;
+            cell.x = mi.mv[n][0];
+            cell.y = mi.mv[n][1];
+            cell.ref = static_cast<uint8_t>(ref);
+            break;
+          }
+        }
+        for (int n = 0; n < bw8 && x < iw8; ++n, ++x) out->at(x, y) = cell;
+      }
+    }
+    if (trace_tmvs()) {
+      for (int y = 0; y < ih8; ++y)
+        for (int x = 0; x < iw8; ++x)
+          if (out->at(x, y).valid())
+            std::fprintf(stderr, "T %d %d %d %d %d\n", x, y, out->at(x, y).ref,
+                         out->at(x, y).x, out->at(x, y).y);
+    }
+  }
+
   /* --- candidate scan ---------------------------------------------------- */
 
   /* add_spatial_candidate for a single-reference block: the candidates are the
@@ -592,16 +935,19 @@ class TileParser {
     const int nearest_count = *count;
     for (int n = 0; n < nearest_count; ++n) stack[n].weight += 640;
 
-    /* temporal candidates need the reference frames' own motion vectors; they
-     * only exist when this frame uses reference frame MVs and the reference is
-     * an inter frame, which the caller rejects before getting here. */
-    /* The temporal candidate section starts the global motion context at the
-     * frame's use_ref_frame_mvs flag and only ever lowers it: a temporal
-     * candidate whose vector matches the global one leaves it alone, one that
-     * differs clears it. A frame that refers only to intra frames has no
-     * temporal candidates at all, so the flag survives as it is, which is why
-     * this is not simply zero when the projection is empty. */
-    int globalmv_ctx = frame_.use_ref_frame_mvs ? 1 : 0;
+    /* Projected candidates: the vectors the reference frames stored, moved onto
+     * this frame's grid. They come after the nearest group and before the
+     * top/left corner, because the corner and the secondary rows and columns
+     * belong to the "secondary" group.
+     *
+     * The global motion context starts at the frame's use_ref_frame_mvs flag and
+     * the first projected candidate may clear it: a vector that agrees with the
+     * global motion model leaves it alone, one that disagrees clears it. A frame
+     * that refers only to intra frames has no projected candidates at all, so
+     * the flag survives as it is, which is why this is not simply zero when the
+     * projection is empty. */
+    const int globalmv_ctx =
+        temporal_candidates(stack, count, ref0, bw4, bh4, w4, h4, mi_row, mi_col, gmv_x, gmv_y);
 
     /* top/left: the diagonal neighbour, when both scans ran */
     if (top_avail && left_avail) {
@@ -2147,6 +2493,18 @@ class TileParser {
   int delta_lf_[4] = {0, 0, 0, 0};
   bool read_deltas_ = false;
 
+  /* Projected motion vectors: this frame's 8x8 grid, the distances the
+   * projection scales by, and the frames that contributed to it. */
+  std::vector<TemporalMv> proj_;
+  int proj_cols_ = 0;
+  int pocdiff_[7] = {0, 0, 0, 0, 0, 0, 0};
+  bool mfmv_sign_[7] = {false, false, false, false, false, false, false};
+  int mfmv_ref_[3] = {0, 0, 0};
+  int mfmv_ref2cur_[3] = {0, 0, 0};
+  uint8_t mfmv_ref2ref_[3][7] = {};
+  const RefMvs* mfmv_stored_[3] = {nullptr, nullptr, nullptr};
+  int mfmv_count_ = 0;
+
   std::vector<MiRef> mi_ref_;
   std::vector<uint8_t> mi_size_;
   std::vector<uint8_t> skip_map_;
@@ -2189,6 +2547,7 @@ class TileParser {
       coef_[plane].left_level.assign(plane_rows, 0);
       coef_[plane].left_dc.assign(plane_rows, 0);
     }
+    setup_temporal_mvs();
     init_default_cdf(&cdf_, frame_.base_q_idx);
     current_q_ = frame_.base_q_idx;
     for (int i = 0; i < 4; ++i) delta_lf_[i] = 0;
@@ -2240,26 +2599,6 @@ ParseStatus decode_tile(const SequenceHeader& seq, const FrameHeader& frame,
     if (!refs) {
       if (error) *error = "tile: an inter frame needs its reference frames";
       return ParseStatus::Unsupported;
-    }
-    /* Temporal motion vector candidates come from the motion vectors the
-     * reference frames stored. An intra reference frame has none - every cell
-     * of its projected map is a no-op - so a frame whose references are all
-     * intra can be decoded without implementing the projection. */
-    if (frame.use_ref_frame_mvs) {
-      bool have_inter_reference = false;
-      for (int i = 0; i < 7; ++i) {
-        const int slot = frame.ref_frame_idx[i];
-        if (slot < 0 || slot > 7) continue;
-        const RefSlot& reference = refs->slots[slot];
-        if (reference.valid && reference.type != FrameType::Key &&
-            reference.type != FrameType::IntraOnly) {
-          have_inter_reference = true;
-        }
-      }
-      if (have_inter_reference) {
-        if (error) *error = "tile: projected motion vectors are not implemented";
-        return ParseStatus::Unsupported;
-      }
     }
   }
   if (frame.tiles.cols != 1 || frame.tiles.rows != 1) {

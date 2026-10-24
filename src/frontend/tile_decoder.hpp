@@ -24,10 +24,11 @@
  * syntax - are parsed and decoded completely. An inter frame is parsed far
  * enough to be compared against the reference decoder block by block: the skip
  * flags, the intra/inter decision, the reference tree, the motion vector
- * candidates and residual, the motion mode and the subpel filter. The parts
- * still missing (variable transform size, skip mode, compound prediction,
- * overlap and warp, projected motion vectors) stop the tile with a reason
- * instead of guessing, because a guess consumes the wrong number of symbols and
+ * candidates (spatial *and* projected, the latter from the motion vector grid
+ * the reference frames saved) and residual, the motion mode and the subpel
+ * filter. The parts still missing (variable transform size, skip mode, compound
+ * prediction, overlap and warp) stop the tile with a reason instead of
+ * guessing, because a guess consumes the wrong number of symbols and
  * desynchronises the range decoder.
  */
 #ifndef AV1GPU_FRONTEND_TILE_DECODER_HPP
@@ -35,6 +36,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -232,6 +234,11 @@ struct TileDecodeResult {
   int cdef_rows = 0;
   std::vector<int8_t> cdef_idx;
 
+  /* The frame's motion vector grid, saved for the frames that refer back to
+   * this one: their temporal candidate scan projects it onto itself. Null for
+   * an intra frame, which has no motion vectors to store. */
+  std::shared_ptr<const RefMvs> ref_mvs;
+
   /* Range decoder position at the end, for error reporting. */
   size_t bytes_used = 0;
   bool overrun = false;
@@ -253,9 +260,11 @@ ParseStatus decode_intra_tile(const SequenceHeader& seq, const FrameHeader& fram
 /* Decodes the block tree and mode info of one tile of any frame type.
  *
  * `refs` is the reference frame store after the frames this one refers to have
- * been decoded: it resolves `ref_frame_idx` to a slot and tells whether that
- * slot holds an intra frame (which is what decides if the temporal motion
- * vector candidates exist). It may be null for a key frame. */
+ * been decoded: it resolves `ref_frame_idx` to a slot, tells whether that slot
+ * holds an intra frame (which is what decides if temporal motion vector
+ * candidates exist at all) and carries the motion vector grid a reference frame
+ * saved, which the candidate scan projects onto this frame. It may be null for a
+ * key frame. */
 ParseStatus decode_tile(const SequenceHeader& seq, const FrameHeader& frame,
                         const RefPool* refs, const uint8_t* data, size_t size,
                         TileDecodeResult* out, std::string* error);

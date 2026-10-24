@@ -223,8 +223,30 @@ void compute_skip_mode(const SequenceHeader& seq, FrameHeader& h, BitReader* r) 
 
 } /* namespace */
 
-void refresh_ref_pool(const FrameHeader& frame, RefPool* pool) {
+int project_mv_component(int mv, int num, int den) {
+  /* 2^14 / den, rounded, for the denominators the projection can produce */
+  static const int32_t kDivMult[32] = {
+      0,    16384, 8192, 5461, 4096, 3276, 2730, 2340, 2048, 1820, 1638,
+      1489, 1365,  1260, 1170, 1092, 1024, 963,  910,  862,  819,  780,
+      744,  712,   682,  655,  630,  606,  585,  564,  546,  528};
+  if (den <= 0 || den >= 32) return 0;
+  /* 64 bit, so that the product cannot overflow for any input a stored vector
+   * can hold (the reference decoders cap them at 4095, which fits in 32 bits,
+   * but a wider intermediate costs nothing and removes the question) */
+  const int64_t scaled = static_cast<int64_t>(mv) * num * kDivMult[den];
+  /* add the rounding term and the sign bit so that negative values round away
+   * from zero as well */
+  const int64_t rounded = (scaled + 8192 + (scaled >> 63)) >> 14;
+  return std::max(-0x3fff, std::min(0x3fff, static_cast<int>(rounded)));
+}
+
+void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
+                      const std::shared_ptr<const RefMvs>& ref_mvs) {
   if (!pool || frame.show_existing_frame) return;
+  /* An intra frame codes no motion vectors, so it clears the grid of every slot
+   * it refreshes: a later frame must not project the motion vectors of a frame
+   * that is no longer in that slot. */
+  const bool stores_mvs = frame.type == FrameType::Inter || frame.type == FrameType::Switch;
   for (int i = 0; i < 8; ++i) {
     if (frame.refresh_frame_flags & (1 << i)) {
       RefSlot& slot = pool->slots[i];
@@ -234,6 +256,8 @@ void refresh_ref_pool(const FrameHeader& frame, RefPool* pool) {
       slot.order_hint = frame.order_hint;
       slot.type = frame.type;
       for (int ref = 0; ref < 8; ++ref) slot.global_motion[ref] = frame.global_motion[ref];
+      for (int ref = 0; ref < 7; ++ref) slot.ref_poc[ref] = frame.ref_order_hint[ref];
+      slot.ref_mvs = stores_mvs ? ref_mvs : nullptr;
     }
   }
 }

@@ -95,10 +95,20 @@ the first symbol of the fixture's key frame.
    the inter frames of every other fixture do the same. What is left, in the
    order the gateways appear when decoding the rest of the file:
 
-   * *Projected motion vectors.* Frames 2 onwards refer to an inter frame, and
-     `use_ref_frame_mvs` then feeds temporal candidates into `find_ref_mvs`
-     from the reference's stored motion vectors. The tile refuses such a frame
-     at the moment.
+   * *Projected motion vectors.* Done: `RefPool` slots carry a frame's 8x8
+     motion vector grid (`RefMvs`) and the order hints of the frames it referred
+     to, `RefSlot::ref_mvs` is filled by `refresh_ref_pool`/the tile's
+     `save_temporal_mvs`, and `find_ref_mvs` projects the contributing reference
+     frames' grids onto the current one (`setup_temporal_mvs`,
+     `project_temporal_mvs`, `temporal_candidates`) before it scans the
+     top/left corner and the secondary rows. Which frames contribute, and with
+     which distance ratio, follows the reference decoders exactly, including
+     the "at most three, or two when the last frame is not the golden one"
+     rule and the 8x8 band a vector is allowed to land in. `AV1GPU_TRACE_T=1`
+     dumps the saved (`T`) and projected (`U`) grids in the shape a patched
+     dav1d prints, and on the `gm6` fixture the saved grid of frame 1 (1191
+     cells) and the projected grid of frame 2 (1041 cells) are cell for cell
+     identical, block trace included.
    * *Skip mode.* A skipped block takes both references and both motion vectors
      from the pair of reference frames the frame header names; its context is
      already tracked (`skip_mode_map_`).

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -960,6 +961,75 @@ void test_block_geometry() {
   CHECK(plane_tx_size(kBlock16x4, 1, TxSize{0, 0}, true, false) == (TxSize{1, 0}));
 }
 
+/* Temporal (projected) motion vectors: the arithmetic that moves a stored
+ * vector from the frame that saved it onto a later frame, and the reference
+ * store that carries it there.
+ *
+ * The projection is a rational scaling by the ratio of two order hint
+ * distances, and its rounding decides which cells a vector lands on - which
+ * decides which candidates a block sees, which decides a dynamic reference list
+ * index, which is a bit in the stream. It is pinned here because a stream can
+ * only show that *a* choice disagrees, not which step did it. */
+void test_projected_motion_vectors() {
+  std::printf("projected motion vectors\n");
+  /* a ratio of one is the identity */
+  CHECK_EQ(project_mv_component(1234, 1, 1), 1234);
+  CHECK_EQ(project_mv_component(-1234, 1, 1), -1234);
+  CHECK_EQ(project_mv_component(0, 7, 3), 0);
+  /* projecting outwards multiplies exactly */
+  CHECK_EQ(project_mv_component(1000, 3, 1), 3000);
+  CHECK_EQ(project_mv_component(-1000, 3, 1), -3000);
+  /* inwards it rounds away from zero in both directions, and a fraction of a
+   * step lands on zero rather than on plus or minus one */
+  CHECK_EQ(project_mv_component(3, 1, 3), 1);
+  CHECK_EQ(project_mv_component(-3, 1, 3), -1);
+  CHECK_EQ(project_mv_component(1, 1, 3), 0);
+  CHECK_EQ(project_mv_component(-1, 1, 3), 0);
+  /* and the result is clipped to the 14 bit range a projected vector spans;
+   * 4095 is the largest vector a frame can store (see save_temporal_mvs) */
+  CHECK_EQ(project_mv_component(4095, 31, 1), 0x3fff);
+  CHECK_EQ(project_mv_component(-4095, 31, 1), -0x3fff);
+  CHECK_EQ(project_mv_component(4095, 1, 1), 4095);
+  /* a denominator the projection cannot produce contributes nothing instead of
+   * dividing by zero */
+  CHECK_EQ(project_mv_component(1000, 1, 0), 0);
+  CHECK_EQ(project_mv_component(1000, 1, 32), 0);
+
+  /* The reference store: an inter frame hands its motion vector grid and the
+   * order hints *it* referred to to every slot it refreshes; an intra frame
+   * clears both, because a frame that stores no vectors must not leave the
+   * previous occupant's in place for the next frame to project. */
+  RefPool pool;
+  FrameHeader inter;
+  inter.type = FrameType::Inter;
+  inter.width = 320;
+  inter.height = 240;
+  inter.order_hint = 5;
+  inter.refresh_frame_flags = 0x02 | 0x20;
+  for (int i = 0; i < 7; ++i) inter.ref_order_hint[i] = i + 1;
+  auto store = std::make_shared<RefMvs>();
+  store->resize(40, 30);
+  store->at(3, 4).ref = 1;
+  store->at(3, 4).x = 64;
+  store->at(3, 4).y = -32;
+  refresh_ref_pool(inter, &pool, store);
+  CHECK(pool.slots[1].ref_mvs == store);
+  CHECK(pool.slots[5].ref_mvs == store);
+  CHECK(pool.slots[0].ref_mvs == nullptr);
+  CHECK_EQ(pool.slots[1].order_hint, 5);
+  CHECK_EQ(pool.slots[1].ref_poc[6], 7);
+  CHECK_EQ(pool.slots[1].ref_mvs->at(3, 4).x, 64);
+
+  FrameHeader key;
+  key.type = FrameType::Key;
+  key.width = 320;
+  key.height = 240;
+  key.refresh_frame_flags = 0xff;
+  refresh_ref_pool(key, &pool, store);
+  CHECK(pool.slots[1].valid);
+  CHECK(pool.slots[1].ref_mvs == nullptr);
+}
+
 /* The first block of a real key frame, symbol for symbol. dav1d's trace of this
  * frame (see tests/data/tile_trace.hpp) starts with:
  *
@@ -1365,6 +1435,7 @@ int main() {
   test_inter_frame();
   test_segmentation();
   test_block_geometry();
+  test_projected_motion_vectors();
   test_tile_group();
   test_tile_decoder();
   test_real_stream();
