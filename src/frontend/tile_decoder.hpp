@@ -219,6 +219,12 @@ struct TileDecodeResult {
   /* Blocks that were parsed but carry residuals the parser could not read. */
   int blocks_needing_residuals = 0;
 
+  /* Blocks whose motion mode is overlapped block motion compensation or local
+   * warped motion. Their syntax is complete, but the reconstruction stage
+   * still predicts them as plain translation. */
+  int obmc_blocks = 0;
+  int warped_blocks = 0;
+
   /* cdef_idx per 64x64 block, row major over the frame, exactly as
    * read_cdef() fills it: -1 where no block that was not skipped claimed the
    * block, which leaves those blocks to the copy path of the CDEF process. */

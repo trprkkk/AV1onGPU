@@ -3,6 +3,7 @@
 #include "frontend/cdf_tables_inter.hpp"
 
 #include <cstring>
+#include <type_traits>
 
 namespace av1gpu {
 namespace frontend {
@@ -17,15 +18,24 @@ void copy_table(A& dst, const B& src) {
   std::memcpy(&dst, &src, sizeof(dst));
 }
 
-/* A default row that the specification copies once per motion vector component:
- * the two copies start equal and then adapt independently. */
+/* A default table that the specification copies once per motion vector
+ * component: the copies start equal and then adapt independently. The copies
+ * are interleaved per row - a table of ten rows becomes ten pairs of rows, not
+ * ten rows followed by ten more - because the decoder indexes the result as
+ * [row][component]; copying the table as one block would put row 2 where row 1
+ * of component 0 is expected. */
 template <int N, typename A, typename B>
 void broadcast_table(A& dst, const B& src) {
   static_assert(sizeof(dst) == sizeof(src) * static_cast<size_t>(N),
                 "CDF table broadcast shape mismatch");
-  std::memcpy(&dst, &src, sizeof(src));
-  for (int n = 1; n < N; ++n)
-    std::memcpy(reinterpret_cast<char*>(&dst) + n * sizeof(src), &src, sizeof(src));
+  using Elem = std::remove_reference_t<decltype(src[0])>;
+  constexpr size_t kRowBytes = std::is_array_v<Elem> ? sizeof(Elem) : sizeof(src);
+  constexpr size_t kRows = sizeof(src) / kRowBytes;
+  const char* from = reinterpret_cast<const char*>(&src);
+  char* to = reinterpret_cast<char*>(&dst);
+  for (size_t row = 0; row < kRows; ++row)
+    for (int n = 0; n < N; ++n)
+      std::memcpy(to + (row * N + n) * kRowBytes, from + row * kRowBytes, kRowBytes);
 }
 
 } /* namespace */

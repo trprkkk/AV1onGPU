@@ -82,14 +82,23 @@ the first symbol of the fixture's key frame.
      whether a reference is an intra frame, which is what decides if temporal
      candidates exist at all.
 
-   What is left, in the order the gateways appear when decoding the fixture:
+   * *Variable transform size* and the inter transform type sets, both of which
+     are now read: an inter block of 8x8 or more codes a tree of transform
+     splits (`read_var_tx_size`, whose leaves fill `InterTxSizes`; the luma
+     residual then walks that map instead of a uniform grid), and its luma
+     transform type comes from the three inter sets, with the chroma type
+     inherited from the luma one.
 
-   * *Variable transform size.* An inter block of 8x8 or more codes a tree of
-     transform splits (up to four quadrants, each splittable again) instead of
-     the single depth symbol an intra block uses. The residual layer assumes one
-     transform size per block, so this needs the tree to produce the list of
-     luma rectangles the coefficient reader walks - and the same for its chroma
-     size.
+   With those in, the first inter frame of the fixture parses to its last byte
+   with the same block tree, references, motion vectors, motion modes and
+   coefficients as dav1d - 249 blocks, all of the tile's 2004 bytes used - and
+   the inter frames of every other fixture do the same. What is left, in the
+   order the gateways appear when decoding the rest of the file:
+
+   * *Projected motion vectors.* Frames 2 onwards refer to an inter frame, and
+     `use_ref_frame_mvs` then feeds temporal candidates into `find_ref_mvs`
+     from the reference's stored motion vectors. The tile refuses such a frame
+     at the moment.
    * *Skip mode.* A skipped block takes both references and both motion vectors
      from the pair of reference frames the frame header names; its context is
      already tracked (`skip_mode_map_`).
@@ -98,11 +107,9 @@ the first symbol of the fixture's key frame.
      kernels already implement the average and distance blends.
    * *OBMC and local warped motion*, both of which need neighbour motion
      vectors from the map that `mark_inter` already fills.
-   * *Projected motion vectors.* `use_ref_frame_mvs` projects the reference
-     frames' stored motion vectors; a stream that sets it currently stops at
-     the tile.
-   * *Reference sample buffers*, the reference refresh in the decoder loop and
-     `show_existing_frame` output.
+   * *Reference sample buffers and inter reconstruction*: the reference
+     refresh in the decoder loop, the engine's inter jobs for these blocks, and
+     `show_existing_frame` output. The syntax is there; nothing draws it yet.
 
    Two bugs the block level trace found on the way, worth recording because
    both are the kind that decodes plausibly and then desynchronises: the single
@@ -110,6 +117,23 @@ the first symbol of the fixture's key frame.
    coding order, so three second-level tests live in rows 2, 4 and 5), and
    filter intra, palette and the transform depth symbol are intra only - an
    inter block that reads them consumes symbols that belong to the next block.
+
+   The first inter frame of `tests/data/svt_av1_320x240.ivf` now parses block
+   for block against dav1d's own symbol trace up to the first block that codes
+   a variable transform size, and four more of the same kind came out of that
+   comparison:
+
+   * a table that is copied once per motion vector component has to be copied
+     *per row* - copying it as one block puts row 2 where row 1 of the first
+     component belongs, which only shows up once a component's probabilities
+     have adapted;
+   * `mv_joint` counts from `MV_JOINT_HNZVZ`, so bit 0 is the horizontal
+     component, while the two components' tables are indexed vertically first
+     and a block that codes both reads the vertical one first;
+   * OBMC's neighbour test asks whether an odd 4x4 offset along the edge holds
+     an *inter* predicted block (`findoddzero` returns true on a zero entry of
+     the intra map), not an intra one - inverted, the block skips a symbol;
+   * inter/intra compound is only allowed up to 32x32, not 64x64.
 2. *A second intra frame to check against.* One reference picture proves a lot
    but it cannot cover filter intra, every transform shape or a 128x128
    superblock; a stream per feature class is cheap insurance and needs an

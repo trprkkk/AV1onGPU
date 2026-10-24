@@ -192,7 +192,10 @@ int coeff_br_context(const CoefGrid& grid, int tx_class, const int16_t* levels, 
   return row == 0 ? mag + 7 : mag + 14;
 }
 
-/* The specification numbers the motion vector components vertically first. */
+/* The mv_joint symbol is MV_JOINT_HNZVZ first, so bit 0 of the joint value
+ * codes the horizontal component and bit 1 the vertical one. The two
+ * components have their own probability tables: index 0 is the vertical one,
+ * which is also the one a block that codes both components reads first. */
 constexpr int kMvVertical = 0;
 constexpr int kMvHorizontal = 1;
 
@@ -326,6 +329,31 @@ class TileParser {
         }
       }
     }
+  }
+
+  /* InterTxSizes: the transform every 4x4 cell of the frame was coded with.
+   * An intra block fills its whole area with the one transform it chose; an
+   * inter block that splits fills each leaf with its own size, and the cells of
+   * a block that does not split with the block's largest transform. The
+   * transform split tree reads it back through get_above_tx_width and
+   * get_left_tx_height, which is why it has to be per cell and not per edge.
+   *
+   * The values are log2 of the side in 4x4 units, uncapped: a 128x128 block
+   * that does not split stores 5, so that "the neighbour above is at least as
+   * wide as this transform" can still answer no against a 64x64 transform. */
+  std::vector<uint8_t> tx_cell_lw_;
+  std::vector<uint8_t> tx_cell_lh_;
+  void set_cell_tx(int row, int col, int w4, int h4, int lw, int lh) {
+    for (int y = 0; y < h4 && row + y < mi_rows(); ++y)
+      for (int x = 0; x < w4 && col + x < mi_cols(); ++x)
+        tx_cell_lw_[index(row + y, col + x)] = static_cast<uint8_t>(lw),
+        tx_cell_lh_[index(row + y, col + x)] = static_cast<uint8_t>(lh);
+  }
+  int cell_tx_width(int row, int col) const {
+    return 4 << tx_cell_lw_[index(row, col)];
+  }
+  int cell_tx_height(int row, int col) const {
+    return 4 << tx_cell_lh_[index(row, col)];
   }
 
   /* The transform the block uses, which the next block's tx_depth context
@@ -567,7 +595,13 @@ class TileParser {
     /* temporal candidates need the reference frames' own motion vectors; they
      * only exist when this frame uses reference frame MVs and the reference is
      * an inter frame, which the caller rejects before getting here. */
-    const int globalmv_ctx = 0;
+    /* The temporal candidate section starts the global motion context at the
+     * frame's use_ref_frame_mvs flag and only ever lowers it: a temporal
+     * candidate whose vector matches the global one leaves it alone, one that
+     * differs clears it. A frame that refers only to intra frames has no
+     * temporal candidates at all, so the flag survives as it is, which is why
+     * this is not simply zero when the projection is empty. */
+    int globalmv_ctx = frame_.use_ref_frame_mvs ? 1 : 0;
 
     /* top/left: the diagonal neighbour, when both scans ran */
     if (top_avail && left_avail) {
@@ -651,13 +685,14 @@ class TileParser {
       }
     }
 
-    /* a stack shorter than two is filled with the global motion vector */
+    /* A stack shorter than two is filled with the global motion vector, but the
+     * count is what the mode syntax tests: an empty stack still means "no
+     * candidate", which suppresses the dynamic reference list index bits. */
     for (int n = *count; n < 2; ++n) {
       stack[n].x = gmv_x;
       stack[n].y = gmv_y;
       stack[n].weight = 2;
     }
-    if (*count < 2) *count = 2;
 
     *ctx = (refmv_ctx << 4) | (globalmv_ctx << 3) | newmv_ctx;
   }
@@ -672,8 +707,14 @@ class TileParser {
    * joint symbol then one component diff per coded component. */
   void read_mv_residual(int* x, int* y, int mv_prec) {
     const int joint = static_cast<int>(decoder_.read_symbol(cdf_.inter.mv_joint, 3));
-    if (joint & 1) *y += read_mv_component(kMvVertical, mv_prec);
-    if (joint & 2) *x += read_mv_component(kMvHorizontal, mv_prec);
+    if (trace_) {
+      const RangeDecoder::State state = decoder_.state();
+      std::fprintf(stderr, "R joint=%d prec=%d dif=%llu rng=%u cnt=%d\n", joint, mv_prec,
+                   static_cast<unsigned long long>(state.window), state.range, state.count);
+    }
+    /* vertical first: that is the order the specification's tables assume */
+    if (joint & 2) *y += read_mv_component(kMvVertical, mv_prec);
+    if (joint & 1) *x += read_mv_component(kMvHorizontal, mv_prec);
   }
 
   /* read_mv_component_diff: one component of a coded motion vector
@@ -701,6 +742,13 @@ class TileParser {
       }
     }
     const int diff = ((up << 3) | (fp << 1) | hp) + 1;
+    if (trace_) {
+      const RangeDecoder::State state = decoder_.state();
+      std::fprintf(stderr,
+                   "R sign=%d cl=%d up=%d fp=%d hp=%d prec=%d diff=%d dif=%llu rng=%u cnt=%d\n",
+                   sign, cls, up, fp, hp, mv_prec, sign ? -diff : diff,
+                   static_cast<unsigned long long>(state.window), state.range, state.count);
+    }
     return sign ? -diff : diff;
   }
 
@@ -818,15 +866,17 @@ class TileParser {
     return 1;
   }
 
-  /* findoddzero: is there an intra block at an odd 4x4 offset inside this
-   * block's span on that edge? OBMC can only overlap blocks that are not
-   * intra predicted. */
-  bool find_odd_zero(bool top, int row, int col, int bw4, int bh4) const {
+  /* findoddzero: is there an inter predicted block at an odd 4x4 offset
+   * inside this block's span on that edge? OBMC overlaps the neighbours it
+   * finds there, and only inter predicted ones can be overlapped, so this is
+   * the test that decides whether the block codes a motion mode at all. The
+   * odd offsets are the ones a 4x4 aligned blend can reach. */
+  bool find_odd_inter(bool top, int row, int col, int bw4, int bh4) const {
     const int len = top ? (bw4 >> 1) : (bh4 >> 1);
     for (int n = 0; n < len; ++n) {
       const int offset = n * 2;
       const MiRef& n_ref = top ? mi_at(row - 1, col + 1 + offset) : mi_at(row + 1 + offset, col - 1);
-      if (n_ref.intra) return true;
+      if (!n_ref.intra) return true;
     }
     return false;
   }
@@ -1031,6 +1081,11 @@ class TileParser {
     MvCand stack[8];
     int count = 0, ctx = 0;
     find_ref_mvs(stack, &count, &ctx, block->ref_frame[0], size, row, col);
+    if (trace_) {
+      std::fprintf(stderr, "V %d %d n=%d ctx=%d s0=%d,%d s1=%d,%d w0=%d w1=%d\n", col, row,
+                   count, ctx, stack[0].x, stack[0].y, stack[1].x, stack[1].y, stack[0].weight,
+                   stack[1].weight);
+    }
 
     const GlobalMotion& gm = global_motion_of(block->ref_frame[0]);
     int mv_x = 0, mv_y = 0;
@@ -1088,7 +1143,7 @@ class TileParser {
     /* inter/intra compound: allowed for most block sizes, but this decoder
      * predicts with one reference only */
     if (seq_.enable_interintra_compound && std::min(bw4, bh4) >= 2 &&
-        std::max(bw4, bh4) <= 16) {
+        std::max(bw4, bh4) <= 8) {
       const int group = ymode_size_group(size);
       if (decoder_.read_symbol(cdf_.inter.inter_intra[group], 1) != 0) {
         return unsupported("tile: inter/intra compound prediction is not implemented");
@@ -1101,8 +1156,8 @@ class TileParser {
     block->motion_mode = kMotionTranslation;
     if (frame_.is_motion_mode_switchable && std::min(bw4, bh4) >= 2 &&
         !(block->inter_mode == kModeGlobalMv && gm.type > kGmTranslation) &&
-        ((left_avail && find_odd_zero(false, row, col, bw4, bh4)) ||
-         (top_avail && find_odd_zero(true, row, col, bw4, bh4)))) {
+        ((left_avail && find_odd_inter(false, row, col, bw4, bh4)) ||
+         (top_avail && find_odd_inter(true, row, col, bw4, bh4)))) {
       uint64_t masks[2] = {0, 0};
       find_matching_ref(row, col, bw4, bh4, std::min(bw4, 16), std::min(bh4, 16), left_avail,
                         top_avail, block->ref_frame[0], masks);
@@ -1110,16 +1165,17 @@ class TileParser {
                               (masks[0] | masks[1]);
       if (allow_warp) {
         block->motion_mode = static_cast<int>(decoder_.read_symbol(cdf_.inter.motion_mode[size], 2));
-        if (block->motion_mode == kMotionWarped) {
-          return unsupported("tile: local warped motion is not implemented");
-        }
       } else {
         block->motion_mode =
             decoder_.read_symbol(cdf_.inter.use_obmc[size], 1) ? kMotionObmc : kMotionTranslation;
       }
-      if (block->motion_mode == kMotionObmc) {
-        return unsupported("tile: overlapped block motion compensation is not implemented");
-      }
+      /* Both of the switchable modes only change prediction, never the syntax:
+       * OBMC re-derives its vectors from the neighbours, warped motion derives
+       * an affine model from them. The block is therefore parsed and counted;
+       * the reconstruction stage predicts it as plain translation until it
+       * implements them, which is why the counter exists. */
+      if (block->motion_mode == kMotionObmc) ++out_->obmc_blocks;
+      if (block->motion_mode == kMotionWarped) ++out_->warped_blocks;
     }
 
     /* the subpel filter, if this frame switches them */
@@ -1167,6 +1223,42 @@ class TileParser {
     entry.filter = static_cast<uint8_t>(filter);
     for (int y = 0; y < bh4 && row + y < mi_rows(); ++y)
       for (int x = 0; x < bw4 && col + x < mi_cols(); ++x) mi_ref_[index(row + y, col + x)] = entry;
+  }
+
+  /* read_var_tx_size: the transform split tree an inter block codes instead of
+   * the single tx depth symbol an intra block reads. Each node either stops -
+   * a leaf whose size this function writes into InterTxSizes - or splits into
+   * the quadrants Split_Tx_Size describes.
+   *
+   * The context of the split symbol counts two things: whether this node's
+   * square class is already below the block's largest transform (which tells
+   * the tree where it is), and whether the neighbours' transforms are narrower
+   * than this node. `cat` packs the first into the row of the table and
+   * `above + left` the second into the column, which is the same information
+   * the specification's single flat context carries. */
+  void read_var_tx_size(int row, int col, TxSize tx, int depth, BlockSize size) {
+    if (row >= mi_rows() || col >= mi_cols()) return;
+    const int w4 = tx.w4(), h4 = tx.h4();
+    bool split = false;
+    if (tx != TxSize{0, 0} && depth < 2) {
+      /* the block's largest transform, as a square class */
+      const int block_class = std::min(
+          4, std::max(static_cast<int>(kBlockWidthLog2[size]),
+                      static_cast<int>(kBlockHeightLog2[size])));
+      const int above = (row > tile_row_start_ ? cell_tx_width(row - 1, col) : 64) < tx.width();
+      const int left = (col > tile_col_start_ ? cell_tx_height(row, col - 1) : 64) < tx.height();
+      const int cat = (tx_square_class(tx) != block_class ? 1 : 0) + 2 * (4 - block_class);
+      if (cat < 0 || cat > 6) return;
+      split = decoder_.read_symbol(cdf_.mode.txpart[cat][above + left], 1) != 0;
+    }
+    if (!split) {
+      set_cell_tx(row, col, w4, h4, tx.lw, tx.lh);
+      return;
+    }
+    const TxSize sub = split_tx_size(tx);
+    for (int y = 0; y < h4; y += sub.h4())
+      for (int x = 0; x < w4; x += sub.w4())
+        read_var_tx_size(row + y, col + x, sub, depth + 1, size);
   }
 
   ParseStatus decode_partition(int row, int col, BlockSize size) {
@@ -1444,15 +1536,22 @@ class TileParser {
             decoder_.read_symbol(cdf_.mode.txsz[cls - 1][depth_ctx], std::min(cls, 2)));
         for (int i = 0; i < depth; ++i) tx = split_tx_size(tx);
       }
+      set_cell_tx(row, col, bw4, bh4, tx.lw, tx.lh);
     } else if (block.skip || !frame_.tx_mode_select || frame_.coded_lossless) {
       /* A skipped inter block carries no residual, and a frame that does not
        * switch transform sizes codes none: the block keeps its largest. */
       if (!block.skip && frame_.coded_lossless) tx = TxSize{0, 0};
+      set_cell_tx(row, col, bw4, bh4, tx.lw, tx.lh);
     } else if (tx.lw > 0 || tx.lh > 0) {
-      /* Variable transform size: an inter block of 8x8 or more splits its
-       * transform into a tree of up to four quadrants, each of which may split
-       * again, so the block no longer has a single transform size. */
-      return stop_at_residual(block, "tile: inter variable transform size is not implemented");
+      /* Variable transform size: one split tree per largest transform the
+       * block holds, each root the block's own largest transform. The leaves
+       * are what the residual layer reads, one transform block each, so the
+       * block no longer has a single transform size. */
+      for (int y = 0; y < bh4; y += tx.h4())
+        for (int x = 0; x < bw4; x += tx.w4())
+          read_var_tx_size(row + y, col + x, tx, 0, size);
+    } else {
+      set_cell_tx(row, col, bw4, bh4, tx.lw, tx.lh);
     }
     block.tx_size = tx;
     {
@@ -1654,6 +1753,53 @@ class TileParser {
     return tx_type;
   }
 
+  /* compute_tx_type for the luma plane of an inter block: three tables, picked
+   * by the transform's square classes - a 32 point transform (or a frame with
+   * the reduced set) codes one bit that chooses between DCT and identity,
+   * 16 point transforms have their own twelve symbol alphabet and everything
+   * smaller shares a sixteen symbol one. A 64 point transform has no symbol at
+   * all: its set is DCT only. */
+  int inter_luma_tx_type(TileBlock* block, int x4, int y4, TxSize tx) {
+    const int set = tx_set(tx, /*is_inter=*/true, frame_.reduced_tx_set);
+    int tx_type = coef_tables::kDctDct;
+    if (set != coef_tables::kTxSetDctOnly && frame_.base_q_idx > 0) {
+      const int min_class = tx_min_class(tx);
+      uint16_t* cdf = nullptr;
+      if (set == coef_tables::kTxSetInter1 && min_class < 2) {
+        cdf = cdf_.inter.txtp_inter1[min_class];
+      } else if (set == coef_tables::kTxSetInter2) {
+        cdf = cdf_.inter.txtp_inter2;
+      } else if (set == coef_tables::kTxSetInter3 && min_class < 4) {
+        cdf = cdf_.inter.txtp_inter3[min_class];
+      }
+      if (!cdf) return coef_tables::kDctDct;
+      const int symbol = static_cast<int>(
+          decoder_.read_symbol(cdf, tx_type_symbol_count(set, /*is_inter=*/true) - 1));
+      tx_type = tx_type_from_symbol(set, symbol, /*is_inter=*/true);
+    }
+    set_tx_type(x4, y4, tx, tx_type);
+    return tx_type;
+  }
+
+  /* compute_tx_type for a chroma plane of an inter block: the luma transform
+   * type is inherited, except that a 32 point chroma transform can only be DCT
+   * or identity, and a 16 point one cannot carry the one dimensional ADST and
+   * flip variants. `luma_type` is the type of the luma transform that covers
+   * the same samples - the map `set_tx_type` fills. */
+  int inter_chroma_tx_type(TxSize tx, int x4, int y4) const {
+    const int lx = x4 << sub_x(), ly = y4 << sub_y();
+    const int luma_type = tx_type_map_[index(ly, lx)];
+    if (tx_square_class(tx) == 3) {
+      return luma_type == coef_tables::kIdtx ? coef_tables::kIdtx : coef_tables::kDctDct;
+    }
+    if (tx_min_class(tx) == 2 &&
+        (luma_type == coef_tables::kHflipadst || luma_type == coef_tables::kVflipadst ||
+         luma_type == coef_tables::kHadst || luma_type == coef_tables::kVadst)) {
+      return coef_tables::kDctDct;
+    }
+    return luma_type;
+  }
+
   /* compute_tx_type for a chroma plane of an intra frame: derived from the
    * chroma mode, and only if the size's transform set admits it. */
   int chroma_tx_type(const TileBlock& block, TxSize tx) const {
@@ -1699,6 +1845,19 @@ class TileParser {
           if (plane_size >= kBlockSizeCount) {
             return unsupported("tile: this block's chroma residual size is undefined");
           }
+          /* An inter block's luma residual follows its transform tree, which
+           * can give each quadrant its own size; everything else - every
+           * chroma plane, and luma of an intra block - is uniform. */
+          if (!lossless && block->is_inter && plane == 0) {
+            const int cx4 = block->mi_col + (chunk_x << 4);
+            const int cy4 = block->mi_row + (chunk_y << 4);
+            const int cw4 = std::min(16, bw4 - (chunk_x << 4));
+            const int ch4 = std::min(16, bh4 - (chunk_y << 4));
+            const ParseStatus status = read_luma_transform_tree(
+                block, cx4, cy4, cw4, ch4, read_coefficients);
+            if (status != ParseStatus::Ok) return status;
+            continue;
+          }
           const int num_w4 = block_width4(plane_size), num_h4 = block_height4(plane_size);
           const int step_x = tx.w4(), step_y = tx.h4();
           const int block_x = (block->mi_col >> sx) * 4;
@@ -1712,18 +1871,7 @@ class TileParser {
               const int start_y = block_y + 4 * (y + ((chunk_y << 4) >> sy));
               if (start_x >= max_x || start_y >= max_y) continue; /* off the frame */
               if (!read_coefficients) {
-                if (plane == 0) set_tx_type(start_x >> 2, start_y >> 2, tx, coef_tables::kDctDct);
-                TileTransform empty;
-                empty.plane = plane;
-                empty.size = tx;
-                empty.x = start_x;
-                empty.y = start_y;
-                empty.qindex = block->qindex;
-                empty.tx_type = coef_tables::kDctDct;
-                empty.eob = 0;
-                empty.level_offset = out_->levels.size();
-                block->transforms.push_back(empty);
-                ++out_->transform_blocks;
+                emit_empty_transform(block, plane, start_x, start_y, tx);
                 continue;
               }
               const ParseStatus status = read_transform_block(
@@ -1735,6 +1883,72 @@ class TileParser {
       }
     }
     return ParseStatus::Ok;
+  }
+
+  /* A transform block of a skipped block: it costs no coefficients, but the
+   * prediction and residual stages still expect an entry per transform. */
+  void emit_empty_transform(TileBlock* block, int plane, int x, int y, TxSize tx) {
+    if (plane == 0) set_tx_type(x >> 2, y >> 2, tx, coef_tables::kDctDct);
+    TileTransform empty;
+    empty.plane = plane;
+    empty.size = tx;
+    empty.x = x;
+    empty.y = y;
+    empty.qindex = block->qindex;
+    empty.tx_type = coef_tables::kDctDct;
+    empty.eob = 0;
+    empty.level_offset = out_->levels.size();
+    block->transforms.push_back(empty);
+    ++out_->transform_blocks;
+  }
+
+  /* find_tx_size: the transform that covers exactly this many 4x4 blocks. The
+   * residual walk only asks for sizes that come out of halving the block's
+   * largest transform, so both sides are powers of two. */
+  static TxSize find_tx_size(int w4, int h4) {
+    int lw = 0, lh = 0;
+    while ((1 << lw) < w4) ++lw;
+    while ((1 << lh) < h4) ++lh;
+    return TxSize{lw, lh};
+  }
+
+  /* transform_tree: how an inter block's luma residual is cut into transform
+   * blocks. The transform sizes are already known - read_block_tx_size read the
+   * split tree - so this walks InterTxSizes: an area that fits inside the
+   * transform its top left cell names is one transform block, anything larger
+   * is halved along its longer side until it does. */
+  ParseStatus read_luma_transform_tree(TileBlock* block, int x4, int y4, int w4, int h4,
+                                       bool read_coefficients) {
+    if (x4 >= mi_cols() || y4 >= mi_rows()) return ParseStatus::Ok;
+    const int lw = tx_cell_lw_[index(y4, x4)], lh = tx_cell_lh_[index(y4, x4)];
+    if (w4 <= (1 << lw) && h4 <= (1 << lh)) {
+      const TxSize tx = find_tx_size(w4, h4);
+      if (read_coefficients) return read_transform_block(block, 0, x4, y4, tx, false);
+      emit_empty_transform(block, 0, x4 * 4, y4 * 4, tx);
+      return ParseStatus::Ok;
+    }
+    ParseStatus status = ParseStatus::Ok;
+    if (w4 > h4) {
+      status = read_luma_transform_tree(block, x4, y4, w4 / 2, h4, read_coefficients);
+      if (status == ParseStatus::Ok)
+        status = read_luma_transform_tree(block, x4 + w4 / 2, y4, w4 / 2, h4, read_coefficients);
+    } else if (w4 < h4) {
+      status = read_luma_transform_tree(block, x4, y4, w4, h4 / 2, read_coefficients);
+      if (status == ParseStatus::Ok)
+        status = read_luma_transform_tree(block, x4, y4 + h4 / 2, w4, h4 / 2, read_coefficients);
+    } else {
+      status = read_luma_transform_tree(block, x4, y4, w4 / 2, h4 / 2, read_coefficients);
+      if (status == ParseStatus::Ok)
+        status = read_luma_transform_tree(block, x4 + w4 / 2, y4, w4 / 2, h4 / 2,
+                                          read_coefficients);
+      if (status == ParseStatus::Ok)
+        status = read_luma_transform_tree(block, x4, y4 + h4 / 2, w4 / 2, h4 / 2,
+                                          read_coefficients);
+      if (status == ParseStatus::Ok)
+        status = read_luma_transform_tree(block, x4 + w4 / 2, y4 + h4 / 2, w4 / 2, h4 / 2,
+                                          read_coefficients);
+    }
+    return status;
   }
 
   /* One transform block's coefficients. */
@@ -1780,10 +1994,13 @@ class TileParser {
     if (lossless) {
       if (plane == 0) set_tx_type(x4, y4, tx, coef_tables::kDctDct);
     } else if (plane == 0) {
-      plane_tx_type =
-          read_tx_type(block, x4, y4, tx, tx_set(tx, false, frame_.reduced_tx_set));
+      plane_tx_type = block->is_inter
+                          ? inter_luma_tx_type(block, x4, y4, tx)
+                          : read_tx_type(block, x4, y4, tx,
+                                         tx_set(tx, false, frame_.reduced_tx_set));
     } else {
-      plane_tx_type = chroma_tx_type(*block, tx);
+      plane_tx_type = block->is_inter ? inter_chroma_tx_type(tx, x4, y4)
+                                      : chroma_tx_type(*block, tx);
     }
     transform.tx_type = plane_tx_type;
     const int tx_class = tx_class_of(plane_tx_type);
@@ -1956,6 +2173,8 @@ class TileParser {
     y_mode_map_.assign(static_cast<size_t>(cols) * rows, kModeDc);
     above_tx_lw_.assign(static_cast<size_t>(cols), 0);
     left_tx_lh_.assign(static_cast<size_t>(rows), 0);
+    tx_cell_lw_.assign(static_cast<size_t>(cols) * rows, 0);
+    tx_cell_lh_.assign(static_cast<size_t>(cols) * rows, 0);
     tx_type_map_.assign(static_cast<size_t>(cols) * rows, coef_tables::kDctDct);
     const int cdef_cols = (cols + 15) >> 4;
     const int cdef_rows = (rows + 15) >> 4;
