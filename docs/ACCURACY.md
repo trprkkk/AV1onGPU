@@ -39,6 +39,17 @@ not disagreements between backends.
   like a reference decoder or it desynchronises within a few symbols.
 * **Scheduling.** The wavefront order is a scheduling detail only: the tests
   require the output to be independent of `dependency_cell`, and it is.
+* **The chroma of a sub-8x8 block is predicted per luma cell.** In 4:2:0 the
+  chroma block of a luma block that is one 4x4 wide (or high) covers two luma
+  blocks in that direction, and each of them predicts its half with its own
+  vector, reference frames and interpolation filters
+  (`compute_prediction()`: regions of `Block_Width >> subX` by
+  `Block_Height >> subY` samples, taken from the cells at `candRow`/`candCol`).
+  `reconstruct` therefore emits one prediction block per region and hangs the
+  plane's transforms off the first one. A single prediction block per plane -
+  the obvious shape, since a block's motion vector is a block property - is
+  wrong by exactly one 4x4 chroma cell per sub-8x8 block, which is what the
+  `wg` and `w_cu4` fixtures used to show.
 
 ## Approximations (deliberate, documented, tested)
 

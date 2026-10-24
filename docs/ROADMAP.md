@@ -170,7 +170,12 @@ in `preds[][0]`, both spelled out in the specification's sections 7.11.3.11 and
 
 The order in which a decoder meets the remaining inter tools, measured on plain
 libaom encodes with every tool at its default, is masked compound, then warped
-motion, then inter/intra compound. OBMC and warped motion share the neighbour
+motion, then inter/intra compound.
+
+Warped motion is now the one that shows: `w_cu2.ivf` codes global motion of type
+ROTZOOM from its first inter frame on, and a translator that ignores the affine
+part diverges in every following frame (luma included), while every fixture
+whose global motion is TRANSLATION or absent decodes bit exactly. OBMC and warped motion share the neighbour
 search, and the OBMC blend is already implemented (mask table, per strip
 prediction, the two passes, in the shared kernel) - but none of the fixtures
 built so far code `motion_mode` as anything but `SIMPLE`, so the only thing
