@@ -64,21 +64,8 @@ class CpuBackend final : public Backend {
   const BackendOptions& options() const override { return options_; }
 
   PlanLayout prepare(const FrameGeometry& geometry) override {
-    PlanLayout g;
-    g.frame = geometry;
-    g.plane_w[0] = geometry.width;
-    g.plane_h[0] = geometry.height;
-    g.plane_w[1] = g.plane_w[2] =
-        (geometry.width + (1 << geometry.ss_x) - 1) >> geometry.ss_x;
-    g.plane_h[1] = g.plane_h[2] =
-        (geometry.height + (1 << geometry.ss_y) - 1) >> geometry.ss_y;
-    size_t size = 0;
-    for (int p = 0; p < 3; ++p) {
-      g.stride[p] = (g.plane_w[p] + 31) & ~31;
-      g.plane_off[p] = static_cast<int>(size);
-      size += static_cast<size_t>(g.stride[p]) * g.plane_h[p];
-    }
-    g.buffer_size = size;
+    const PlanLayout g = make_plan_layout(geometry, 32);
+    const size_t size = g.buffer_size;
     if (frame_.size() < size) frame_.resize(size, 0);
     if (scratch_.size() < size) scratch_.resize(size, 0);
     layout_ = g;

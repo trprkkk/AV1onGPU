@@ -33,12 +33,34 @@ struct FrameGeometry {
  * sample offset and a backend needs a single allocation per frame. */
 struct PlanLayout {
   FrameGeometry frame;
-  int plane_w[3] = {0, 0, 0};
+  int plane_w[3] = {0, 0, 0};  /* visible samples */
   int plane_h[3] = {0, 0, 0};
-  int stride[3] = {0, 0, 0};
+  int stride[3] = {0, 0, 0};   /* row pitch, including the edge padding */
   int plane_off[3] = {0, 0, 0};
   size_t buffer_size = 0;
 };
+
+/* Edge padding, in luma samples.
+ *
+ * AV1 codes blocks on a 4x4 grid that is rounded up to the frame size, so the
+ * blocks along the right and bottom edges extend past the visible picture: a
+ * 32x32 block whose top left corner is the last 4x4 of the frame is coded and
+ * predicted in full, and only the part inside the picture is ever displayed.
+ * Every reference decoder therefore allocates its planes with a border (libaom
+ * calls it the border, dav1d allocates aligned pictures), and the prediction
+ * kernels here write the full block without clipping - all three of them,
+ * identically, which is what keeps them bit exact against each other.
+ *
+ * 64 samples covers the largest block AV1 codes (a 64x64 superblock with a
+ * 64x64 block; 128 for 128x128 superblocks, which this decoder does not
+ * enable), and a chroma plane inherits it divided by the subsampling, so a
+ * chroma block can never leave the padded area either. */
+constexpr int kPlanePadding = 64;
+
+/* Builds the plane layout the backends share: visible sample counts, padded
+ * strides and plane offsets into one flat sample buffer. `stride_align` is the
+ * row alignment the backend wants (32 for the CPU, 64 for the GPU ones). */
+PlanLayout make_plan_layout(const FrameGeometry& geometry, int stride_align);
 
 /* All work of one dependency level. Within a wave no block reads another
  * block's reconstructed samples, so the jobs can run in any order or in

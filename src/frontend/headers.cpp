@@ -56,6 +56,118 @@ int get_relative_dist(const SequenceHeader& seq, int a, int b) {
   return (diff & (m - 1)) - (diff & m);
 }
 
+/* decode_subexp(): AV1's subexponential code, used for the global motion
+ * parameters. It is a bit reader construct (not arithmetic coded), so it lives
+ * here rather than in the range decoder. */
+int read_subexp(BitReader* r, int num_symbols) {
+  int i = 0;
+  int mk = 0;
+  const int k = 3;
+  for (;;) {
+    const int b2 = i ? k + i - 1 : k;
+    const int a = 1 << b2;
+    if (num_symbols <= mk + 3 * a) {
+      return static_cast<int>(r->read_uniform(static_cast<uint32_t>(num_symbols - mk))) + mk;
+    }
+    if (r->read_bit()) {
+      ++i;
+      mk += a;
+    } else {
+      return static_cast<int>(r->read(b2)) + mk;
+    }
+  }
+}
+
+/* inverse_recenter(): maps the uniformly coded value `v` back around the
+ * reference value `r`, so that values near the reference cost few bits. */
+int inverse_recenter(int r, int v) {
+  if (v > 2 * r) return v;
+  if (v & 1) return r - ((v + 1) >> 1);
+  return r + (v >> 1);
+}
+
+int decode_unsigned_subexp_with_ref(int mx, int r, BitReader* reader) {
+  const int v = read_subexp(reader, mx);
+  if ((r << 1) <= mx) return inverse_recenter(r, v);
+  return mx - 1 - inverse_recenter(mx - 1 - r, v);
+}
+
+int decode_signed_subexp_with_ref(int low, int high, int r, BitReader* reader) {
+  return decode_unsigned_subexp_with_ref(high - low, r - low, reader) + low;
+}
+
+/* read_global_param(): one warp model coefficient, coded as a subexponential
+ * difference from the coefficient the reference frame used.
+ *
+ * The coefficient is stored at WARPEDMODEL_PREC_BITS of precision, but coded at
+ * a coarser one, so the low bits of the reference value are what the coder
+ * predicts from and the decoded value is re-quantised on the way in. `idx % 3
+ * == 2` marks the translation column, which is coded around 1.0 (the identity
+ * model's diagonal) rather than around 0. */
+void read_global_param(const FrameHeader& h, BitReader* r, GlobalMotion* gm, int idx,
+                       const GlobalMotion& prev) {
+  int abs_bits = 12; /* GM_ABS_ALPHA_BITS */
+  int prec_bits = 15; /* GM_ALPHA_PREC_BITS */
+  if (idx < 2) {
+    if (gm->type == kGmTranslation) {
+      abs_bits = 9 - (h.allow_high_precision_mv ? 0 : 1);  /* GM_ABS_TRANS_ONLY_BITS */
+      prec_bits = 3 - (h.allow_high_precision_mv ? 0 : 1); /* GM_TRANS_ONLY_PREC_BITS */
+    } else {
+      abs_bits = 12; /* GM_ABS_TRANS_BITS */
+      prec_bits = 6; /* GM_TRANS_PREC_BITS */
+    }
+  }
+  const int prec_diff = kWarpmodelPrecBits - prec_bits;
+  const int round = (idx % 3) == 2 ? kGmIdentityParam : 0;
+  const int sub = (idx % 3) == 2 ? (1 << prec_bits) : 0;
+  const int mx = 1 << abs_bits;
+  const int ref = (prev.params[idx] >> prec_diff) - sub;
+  gm->params[idx] = (decode_signed_subexp_with_ref(-mx, mx + 1, ref, r) << prec_diff) + round;
+}
+
+/* global_motion_params(): one model per reference type, coded as a difference
+ * from the model the referenced frame used. Reference types the frame does not
+ * code a model for keep the identity model. */
+void read_global_motion_params(const SequenceHeader& seq, FrameHeader& h, BitReader* r,
+                               const RefPool* refs) {
+  (void)seq;
+  for (int ref = 0; ref < 8; ++ref) h.global_motion[ref] = GlobalMotion();
+
+  for (int ref = 1; ref < 8; ++ref) {
+    GlobalMotion& gm = h.global_motion[ref];
+    /* PrevGmParams: the model the reference frame itself used, which is what
+     * the coded difference is relative to. */
+    GlobalMotion prev;
+    if (refs) prev = refs->slots[h.ref_frame_idx[ref - 1]].global_motion[ref];
+
+    h.is_global[ref] = r->read_bit();
+    if (!h.is_global[ref]) {
+      gm.type = kGmIdentity;
+      continue;
+    }
+    if (r->read_bit()) {
+      gm.type = kGmRotZoom;
+    } else {
+      gm.type = r->read_bit() ? kGmTranslation : kGmAffine;
+    }
+    if (gm.type >= kGmRotZoom) {
+      read_global_param(h, r, &gm, 2, prev);
+      read_global_param(h, r, &gm, 3, prev);
+      if (gm.type == kGmAffine) {
+        read_global_param(h, r, &gm, 4, prev);
+        read_global_param(h, r, &gm, 5, prev);
+      } else {
+        gm.params[4] = -gm.params[3];
+        gm.params[5] = gm.params[2];
+      }
+    }
+    if (gm.type >= kGmTranslation) {
+      read_global_param(h, r, &gm, 0, prev);
+      read_global_param(h, r, &gm, 1, prev);
+    }
+  }
+}
+
 /* skip_mode_params(): AV1 only allows skip mode when the reference list holds a
  * frame that is both in the past and in the future of this one. */
 void compute_skip_mode(const SequenceHeader& seq, FrameHeader& h, BitReader* r) {
@@ -121,6 +233,7 @@ void refresh_ref_pool(const FrameHeader& frame, RefPool* pool) {
       slot.height = frame.height;
       slot.order_hint = frame.order_hint;
       slot.type = frame.type;
+      for (int ref = 0; ref < 8; ++ref) slot.global_motion[ref] = frame.global_motion[ref];
     }
   }
 }
@@ -776,17 +889,7 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
   h.reduced_tx_set = r.read_bit();
 
   /* ---- global motion ----------------------------------------------------- */
-  if (!key_or_intra) {
-    bool any_global = false;
-    for (int i = 1; i < 8; ++i) {
-      h.is_global[i] = r.read_bit();
-      any_global = any_global || h.is_global[i];
-    }
-    if (any_global) {
-      *out = h;
-      return unsupported("global motion parameters are not implemented", error);
-    }
-  }
+  if (!key_or_intra) read_global_motion_params(seq, h, &r, refs);
 
   /* ---- film grain -------------------------------------------------------- */
   if (seq.film_grain_params_present && (h.show_frame || h.showable_frame)) {

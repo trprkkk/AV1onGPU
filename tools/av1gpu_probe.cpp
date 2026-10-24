@@ -99,6 +99,20 @@ void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const uint8_
     if (hdr.allow_warped_motion) std::printf(", warped motion");
     if (hdr.use_ref_frame_mvs) std::printf(", ref frame mvs");
     std::printf("\n");
+    /* The global motion models, one line per reference type that codes one. */
+    const int count = hdr.ref_frame_idx[0] < 0 ? 0 : 8;
+    bool any_global = false;
+    for (int ref = 1; ref < count; ++ref) any_global = any_global || hdr.is_global[ref];
+    if (!any_global) std::printf("  global motion: none\n");
+    for (int ref = 1; ref < count; ++ref) {
+      if (!hdr.is_global[ref]) continue;
+      static const char* kGmNames[4] = {"identity", "translation", "rotzoom", "affine"};
+      std::printf("  global motion %s: %s %d %d %d %d %d %d\n", kNames[ref - 1],
+                  kGmNames[hdr.global_motion[ref].type], hdr.global_motion[ref].params[0],
+                  hdr.global_motion[ref].params[1], hdr.global_motion[ref].params[2],
+                  hdr.global_motion[ref].params[3], hdr.global_motion[ref].params[4],
+                  hdr.global_motion[ref].params[5]);
+    }
   }
 
   if (hdr.tiles.cols <= 0) return; /* parsing stopped before the filter parameters */

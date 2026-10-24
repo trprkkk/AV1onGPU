@@ -131,21 +131,8 @@ class CudaBackend final : public Backend {
   }
 
   PlanLayout prepare(const FrameGeometry& geometry) override {
-    PlanLayout g;
-    g.frame = geometry;
-    g.plane_w[0] = geometry.width;
-    g.plane_h[0] = geometry.height;
-    g.plane_w[1] = g.plane_w[2] =
-        (geometry.width + (1 << geometry.ss_x) - 1) >> geometry.ss_x;
-    g.plane_h[1] = g.plane_h[2] =
-        (geometry.height + (1 << geometry.ss_y) - 1) >> geometry.ss_y;
-    size_t size = 0;
-    for (int p = 0; p < 3; ++p) {
-      g.stride[p] = (g.plane_w[p] + 63) & ~63;
-      g.plane_off[p] = static_cast<int>(size);
-      size += static_cast<size_t>(g.stride[p]) * g.plane_h[p];
-    }
-    g.buffer_size = size;
+    const PlanLayout g = make_plan_layout(geometry, 64);
+    const size_t size = g.buffer_size;
     layout_ = g;
     ensure(&frame_, &frame_cap_, size * sizeof(uint16_t));
     ensure(&scratch_, &scratch_cap_, size * sizeof(uint16_t));

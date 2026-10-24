@@ -12,7 +12,8 @@
  *   - KEY, INTRA_ONLY, INTER and SWITCH frame headers, complete up to the tile
  *     data, plus show_existing_frame,
  *   - tile layout, quantiser, segmentation, delta Q / delta LF, deblocking,
- *     CDEF, transform set, reference and skip mode, film grain presence.
+ *     CDEF, transform set, reference and skip mode, global motion, film grain
+ *     presence.
  *
  * Reference frames: inter frame sizes and skip mode depend on the frames a
  * stream has decoded before, so `parse_frame_header` takes the `RefPool` the
@@ -20,7 +21,7 @@
  *
  * Deliberately rejected with a clear message (never silently misparsed)
  *   - superres, intra block copy, restoration filters, film grain *data*,
- *     global motion parameters, short reference signalling and frame ids.
+ *     short reference signalling and frame ids.
  *
  * The field order and the derived values follow the AV1 specification; where a
  * value is derived from a reference frame (loop filter deltas, segmentation
@@ -176,6 +177,38 @@ struct SegmentationParams {
   int feature_data[kMaxSegments][kSegFeatureCount] = {};
 };
 
+/* Global motion models, in specification order. */
+enum GmType {
+  kGmIdentity = 0,
+  kGmTranslation = 1,
+  kGmRotZoom = 2,
+  kGmAffine = 3,
+};
+
+/* WARPEDMODEL_PREC_BITS: the precision the global motion parameters are stored
+ * at. The diagonal entries of the identity model are 1 << 16, so an unscaled,
+ * untranslated frame has no motion at all. */
+constexpr int kWarpmodelPrecBits = 16;
+constexpr int32_t kGmIdentityParam = 1 << kWarpmodelPrecBits;
+
+/* A global motion model: the six warped-motion parameters, in the order
+ * (a, b, c, d, e, f) of the specification's warp matrix.
+ *
+ *   x' = (a x + b y + c) / 2^16
+ *   y' = (d x + e y + f) / 2^16
+ *
+ * The parameters are stored in this coded form rather than as a matrix so that
+ * re-reading the same model from a reference frame gives bit identical
+ * arithmetic: `is_global` codes the *difference* from the reference frame's
+ * model, so a decoder that normalised them would drift. */
+struct GlobalMotion {
+  int type = kGmIdentity;
+  int32_t params[6] = {0, 0, kGmIdentityParam, 0, 0, kGmIdentityParam};
+
+  bool identity() const { return type == kGmIdentity; }
+  bool translation_only() const { return type == kGmTranslation; }
+};
+
 /* One entry of the reference frame store: enough for the bitstream front-end to
  * resolve inter frame sizes and skip-mode decisions. */
 struct RefSlot {
@@ -184,6 +217,9 @@ struct RefSlot {
   int height = 0;
   int order_hint = 0;
   FrameType type = FrameType::Key;
+  /* The frame's global motion model per reference type, which the next frame
+   * reads to decode its own model differentially. */
+  GlobalMotion global_motion[8];
 };
 
 /* The eight AV1 reference slots. `parse_frame_header` reads them to resolve
@@ -241,6 +277,9 @@ struct FrameHeader {
   bool skip_mode_present = false;
   int skip_mode_frame[2] = {0, 0};
   bool is_global[8] = {false, false, false, false, false, false, false, false};
+  /* Global motion, one model per reference type; identity for the reference
+   * types the frame does not code a model for. */
+  GlobalMotion global_motion[8];
 
   TileInfo tiles;
 

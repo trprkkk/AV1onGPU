@@ -17,6 +17,29 @@ namespace {
  * are grouped into the context alphabet of the key frame y mode symbol. */
 constexpr int8_t kIntraModeContext[kModeLumaCount] = {0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0};
 
+/* AV1GPU_TRACE=1 dumps one line per parsed block, in the same shape a patched
+ * dav1d prints for the same stream, so the two decoders can be diffed line by
+ * line. A wrong probability or a context read from the wrong neighbour shows up
+ * as the first line that differs, which is far easier to chase than a PSNR.
+ * This is a debugging aid: it is off unless the variable is set, costs one
+ * branch per block, and never runs on the GPU paths. */
+bool trace_enabled() {
+  static const bool enabled = std::getenv("AV1GPU_TRACE") != nullptr;
+  return enabled;
+}
+
+void trace_block(const TileBlock& block) {
+  std::fprintf(stderr, "B %d %d %d %d cs=%d bs=%d bp=%d intra=1 skip=%d seg=%d y=%d uv=%d "
+               "ya=%d uva=%d cfl=%d,%d fi=%d fim=%d pal=%d,%d tx=%d q=%d\n",
+               block.mi_col, block.mi_row, block_width4(block.size),
+               block_height4(block.size), static_cast<int>(block.size),
+               static_cast<int>(block.size), static_cast<int>(block.partition),
+               block.skip ? 1 : 0, block.segment_id, block.y_mode, block.uv_mode,
+               block.y_angle, block.uv_angle, block.cfl_alpha[0], block.cfl_alpha[1],
+               block.filter_intra ? 1 : 0, block.filter_intra_mode, block.palette_size[0],
+               block.palette_size[1], tx_size_index(block.tx_size), block.qindex);
+}
+
 ParseStatus fail(std::string* error, const char* message) {
   if (error) *error = message;
   return ParseStatus::Invalid;
@@ -156,7 +179,7 @@ int coeff_br_context(const CoefGrid& grid, int tx_class, const int16_t* levels, 
 /* Filter_Intra_Mode_To_Intra_Dir: a filter intra mode stands in for a luma
  * direction when the transform type alphabet is selected. */
 constexpr int8_t kFilterIntraToIntraDir[5] = {kModeDc, kModeVertical, kModeHorizontal,
-                                              kModeHorizontalUp, kModeDc};
+                                              kModeHorizontalDown, kModeDc};
 
 class TileParser {
  public:
@@ -205,7 +228,37 @@ class TileParser {
     return ParseStatus::Unsupported;
   }
 
+  /* The range decoder's position after the block, for comparing against another
+   * decoder: reading the same bits with the same probabilities leaves both in
+   * the same state, so the first block whose state differs is where the parse
+   * went wrong - and it is the *previous* block's syntax that did it. */
+  void trace_state(const TileBlock& block) {
+    if (!trace_enabled()) return;
+    const RangeDecoder::State state = decoder_.state();
+    std::fprintf(stderr, "S %d %d %llu %u %d\n", block.mi_col, block.mi_row,
+                 static_cast<unsigned long long>(state.window), state.range, state.count);
+  }
+
+  /* One line per transform block, in the shape the patched dav1d prints, with
+   * the range decoder's state after it: the state is what makes a desync
+   * visible at the block that caused it rather than at the next mode symbol. */
+  void trace_coef(int plane, int x4, int y4, TxSize tx, int txtp, int eob) {
+    if (!trace_enabled()) return;
+    const RangeDecoder::State state = decoder_.state();
+    std::fprintf(stderr, "C %d %d plane=%d tx=%d txtp=%d eob=%d dif=%llu rng=%u cnt=%d\n", x4,
+                 y4, plane, tx_size_index(adjusted_tx_size(tx)), txtp, eob,
+                 static_cast<unsigned long long>(state.window), state.range, state.count);
+  }
+
+  void trace_point(int row, int col, const char* tag) {
+    if (!trace_enabled()) return;
+    const RangeDecoder::State state = decoder_.state();
+    std::fprintf(stderr, "M %s %d %d %llu %u %d\n", tag, col, row,
+                 static_cast<unsigned long long>(state.window), state.range, state.count);
+  }
+
   ParseStatus stop_at_residual(const TileBlock& block, const char* reason) {
+    if (trace_enabled()) trace_block(block);
     out_->blocks.push_back(block);
     ++out_->blocks_needing_residuals;
     return unsupported(reason);
@@ -248,10 +301,17 @@ class TileParser {
   }
 
   /* The transform the block uses, which the next block's tx_depth context
-   * reads: one value per 4x4 column above and one per row to the left. */
-  void mark_tx(int row, int col, TxSize tx) {
-    for (int x = 0; x < tx.w4() && col + x < mi_cols(); ++x) above_tx_lw_[col + x] = tx.lw;
-    for (int y = 0; y < tx.h4() && row + y < mi_rows(); ++y) left_tx_lh_[row + y] = tx.lh;
+   * reads: one value per 4x4 column above and one per row to the left.
+   *
+   * The *whole block* takes the value, not just the area the transform covers:
+   * InterTxSizes is written over bw4 x bh4 by read_block_tx_size, and the
+   * neighbour lookup reads the entry directly above or to the left, which may
+   * be outside a small transform at the block's far edge. A 64x64 block with a
+   * 32x32 transform would otherwise leave its lower half at the initial 0 and
+   * make the block below use the wrong tx_depth context.*/
+  void mark_tx(int row, int col, int w4, int h4, TxSize tx) {
+    for (int x = 0; x < w4 && col + x < mi_cols(); ++x) above_tx_lw_[col + x] = tx.lw;
+    for (int y = 0; y < h4 && row + y < mi_rows(); ++y) left_tx_lh_[row + y] = tx.lh;
   }
 
   /* --- syntax ------------------------------------------------------------ */
@@ -379,6 +439,7 @@ class TileParser {
     /* read_skip */
     const int sctx = skip_context(row, col);
     block.skip = decoder_.read_symbol(cdf_.skip.row(sctx), 1) != 0;
+    trace_point(row, col, "skip");
 
     /* read_cdef: the first block of a 64x64 that is not skipped carries the
      * index the whole 64x64 filters with; a 64x64 that only holds skipped
@@ -411,6 +472,7 @@ class TileParser {
     }
 
     /* read_delta_qindex / read_delta_lf: at the start of a superblock */
+    trace_point(row, col, "cdef");
     const BlockSize sb_size = seq_.use_128x128_superblock ? kBlock128x128 : kBlock64x64;
     const int sb4 = seq_.use_128x128_superblock ? 32 : 16;
     const bool at_sb_start = ((row - tile_row_start_) % sb4) == 0 &&
@@ -451,6 +513,7 @@ class TileParser {
 
     /* the frame's deltas are coded once per superblock, by its first block */
     read_deltas_ = false;
+    trace_point(row, col, "delta");
 
     /* intra_frame_mode_info: the frame is intra, so the y mode is coded against
      * the neighbour modes and the block is always intra predicted */
@@ -462,6 +525,7 @@ class TileParser {
         cdf_.mode.kfym[kIntraModeContext[above_mode]][kIntraModeContext[left_mode]],
         kModeLumaCount - 1));
     if (block.y_mode >= kModeLumaCount) return corrupt("intra_frame_y_mode");
+    trace_point(row, col, "ymode");
 
     /* intra_angle_info_y */
     const int log2_w = kBlockWidthLog2[size], log2_h = kBlockHeightLog2[size];
@@ -471,6 +535,8 @@ class TileParser {
           decoder_.read_symbol(cdf_.mode.angle_delta[block.y_mode - kModeVertical], 6));
       block.y_angle = value - 3;
     }
+
+    trace_point(row, col, "yangle");
 
     if (has_chroma) {
       /* chroma from luma is allowed for blocks small enough to have a
@@ -506,12 +572,14 @@ class TileParser {
     }
 
     /* palette_mode_info: only for frames that allow screen content tools */
+    trace_point(row, col, "uv");
     if (frame_.allow_screen_content_tools && size >= kBlock8x8 &&
         block_width4(size) * 4 <= 64 && block_height4(size) * 4 <= 64) {
       return stop_at_residual(block, "tile: palette mode syntax is not implemented");
     }
 
     /* filter_intra_mode_info */
+    trace_point(row, col, "pal");
     if (block.y_mode == kModeDc && block.palette_size[0] == 0 &&
         std::max(log2_w, log2_h) <= 3 && seq_.enable_filter_intra) {
       block.filter_intra = decoder_.read_symbol(cdf_.mode.use_filter_intra[size], 1) != 0;
@@ -522,31 +590,45 @@ class TileParser {
 
     /* read_tx_size: an intra block always codes its transform size when the
      * frame allows a choice */
+    trace_point(row, col, "fi");
     TxSize tx = max_tx_size(bw4, bh4);
+    /* the tx_depth context, for the trace only: -1 when no symbol is coded */
+    int tx_size_row = -1, tx_depth_context = -1;
     if (!frame_.coded_lossless && size > kBlock4x4 && frame_.tx_mode_select) {
       const int cls = tx_square_class(tx);
       const int depth_ctx = (above_tx_lw_[col] >= tx.lw ? 1 : 0) + (left_tx_lh_[row] >= tx.lh ? 1 : 0);
+      tx_size_row = cls;
+      tx_depth_context = depth_ctx;
       const int depth = static_cast<int>(
           decoder_.read_symbol(cdf_.mode.txsz[cls - 1][depth_ctx], std::min(cls, 2)));
       for (int i = 0; i < depth; ++i) tx = split_tx_size(tx);
     }
     block.tx_size = tx;
+    {
+      char tag[32];
+      std::snprintf(tag, sizeof(tag), "tx%d/%d", tx_size_row, tx_depth_context);
+      trace_point(row, col, tag);
+    }
     block.qindex = current_q_;
 
     for (int i = 0; i < 4; ++i) block.delta_lf[i] = delta_lf_[i];
 
     mark_block(row, col, bw4, bh4, size, block.skip, block.y_mode);
-    mark_tx(row, col, tx);
+    mark_tx(row, col, bw4, bh4, tx);
 
     if (block.skip) reset_coef_context(row, col, bw4, bh4, 1 + (has_chroma ? 2 : 0));
     {
       const ParseStatus status = read_residuals(&block, !block.skip);
       if (status != ParseStatus::Ok) {
+        if (trace_enabled()) trace_block(block);
+        trace_state(block);
         out_->blocks.push_back(block);
         ++out_->blocks_needing_residuals;
         return status;
       }
     }
+    if (trace_enabled()) trace_block(block);
+    trace_state(block);
     out_->blocks.push_back(block);
     return ParseStatus::Ok;
   }
@@ -828,6 +910,7 @@ class TileParser {
         std::fprintf(stderr, "cf plane=%d x4=%d y4=%d tx=%dx%d zero\n", plane, x4, y4,
                      tx.width(), tx.height());
       }
+      trace_coef(plane, x4, y4, tx, coef_tables::kDctDct, 0);
       block->transforms.push_back(transform);
       ++out_->transform_blocks;
       return ParseStatus::Ok;
@@ -956,6 +1039,7 @@ class TileParser {
       std::fprintf(stderr, "cf plane=%d x4=%d y4=%d tx=%dx%d txtp=%d eob=%d\n", plane, x4, y4,
                    tx.width(), tx.height(), plane_tx_type, eob);
     }
+    trace_coef(plane, x4, y4, tx, plane_tx_type, eob);
     out_->coefficients += static_cast<size_t>(eob);
     block->transforms.push_back(transform);
     ++out_->transform_blocks;

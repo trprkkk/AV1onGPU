@@ -675,9 +675,13 @@ AV1G_FN void av1g_itx_row(const Av1gItxJob *job, AV1G_GLOBAL const int *coef,
   const int lo = -(1 << (colClampRange - 1));
   const int hi = (1 << (colClampRange - 1)) - 1;
   int j;
+  /* Only the low 32x32 quarter of a 64 point transform is coded, so the
+   * coefficient raster is Min(32, w) samples wide even when the transform is
+   * wider (tw in the specification's dequantisation step). */
+  const int coef_stride = job->w < 32 ? job->w : 32;
 
   for (j = 0; j < job->w; ++j)
-    t[j] = (y < 32 && j < 32) ? coef[job->coef_off + y * job->w + j] : 0;
+    t[j] = (y < 32 && j < coef_stride) ? coef[job->coef_off + y * coef_stride + j] : 0;
 
   /* a 2:1 rectangle pre-scales: the round trip through the two passes is not
    * exactly the identity for those sizes */

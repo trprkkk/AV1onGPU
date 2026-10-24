@@ -101,6 +101,37 @@ void Frame::allocate(int w, int h, int bd, int sx, int sy) {
   }
 }
 
+namespace internal {
+
+PlanLayout make_plan_layout(const FrameGeometry& geometry, int stride_align) {
+  PlanLayout g;
+  g.frame = geometry;
+  g.plane_w[0] = geometry.width;
+  g.plane_h[0] = geometry.height;
+  g.plane_w[1] = g.plane_w[2] =
+      (geometry.width + (1 << geometry.ss_x) - 1) >> geometry.ss_x;
+  g.plane_h[1] = g.plane_h[2] =
+      (geometry.height + (1 << geometry.ss_y) - 1) >> geometry.ss_y;
+  size_t size = 0;
+  for (int p = 0; p < 3; ++p) {
+    /* The border is in luma samples, so a subsampled plane gets it subsampled
+     * too - rounding up, because 64 is even and a chroma block needs the same
+     * room relative to its own samples. */
+    const int pad = (p == 0) ? kPlanePadding
+                             : (kPlanePadding >> (geometry.ss_x ? 1 : 0));
+    const int pitch = g.plane_w[p] + pad;
+    g.stride[p] = (pitch + stride_align - 1) & ~(stride_align - 1);
+    g.plane_off[p] = static_cast<int>(size);
+    /* Rows below the picture are padding as well: the flat buffer simply holds
+     * them, and nothing reads them back. */
+    size += static_cast<size_t>(g.stride[p]) * (g.plane_h[p] + pad);
+  }
+  g.buffer_size = size;
+  return g;
+}
+
+} /* namespace internal */
+
 bool Frame::matches(int w, int h, int bd, int sx, int sy) const {
   if (width != w || height != h || bit_depth != bd || ss_x != sx || ss_y != sy)
     return false;
