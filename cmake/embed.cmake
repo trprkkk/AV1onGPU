@@ -8,7 +8,23 @@ if(NOT DEFINED HEADER OR NOT DEFINED BODY OR NOT DEFINED OUTPUT OR NOT DEFINED L
   message(FATAL_ERROR "embed.cmake needs HEADER, BODY, OUTPUT and LANGUAGE")
 endif()
 
+# Inline every quoted include that sits next to the including file, so the
+# device compiler sees one translation unit (a generated table header counts as
+# part of the shared maths, not as a separate module).
+get_filename_component(kernel_dir "${HEADER}" DIRECTORY)
 file(READ "${HEADER}" header_text)
+set(includes "")
+string(REGEX MATCHALL "#include \"[a-z0-9_]+\.h\"" nested "${header_text}")
+foreach(line IN LISTS nested)
+  string(REGEX REPLACE "#include \"([a-z0-9_]+\.h)\"" "\\1" name "${line}")
+  if(EXISTS "${kernel_dir}/${name}")
+    file(READ "${kernel_dir}/${name}" nested_text)
+    set(includes "${includes}${nested_text}\n")
+    string(REPLACE "${line}" "" header_text "${header_text}")
+  endif()
+endforeach()
+set(header_text "${includes}${header_text}")
+
 file(READ "${BODY}" body_text)
 string(REPLACE "#include \"av1gpu_kernels.h\"" "" body_text "${body_text}")
 set(source "${header_text}\n${body_text}")

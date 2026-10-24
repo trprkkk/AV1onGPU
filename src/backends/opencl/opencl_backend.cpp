@@ -156,7 +156,6 @@ class OpenCLBackend final : public Backend {
     ensure(&frame_, &frame_cap_, size * sizeof(uint16_t));
     ensure(&scratch_, &scratch_cap_, size * sizeof(uint16_t));
     ensure_ref_pool(size);
-    ensure(&basis_, &basis_cap_, tables::basis().size() * sizeof(int), true);
     ensure(&filters_, &filters_cap_, tables::filters().size() * sizeof(int), true);
     return g;
   }
@@ -210,10 +209,6 @@ class OpenCLBackend final : public Backend {
 
     /* ---- static tables ---------------------------------------------------- */
     if (!tables_uploaded_) {
-      if (tables::basis().size())
-        api_.EnqueueWriteBuffer(queue_, basis_, opencl::CL_TRUE, 0,
-                                tables::basis().size() * sizeof(int),
-                                tables::basis().data(), 0, nullptr, nullptr);
       if (tables::filters().size())
         api_.EnqueueWriteBuffer(queue_, filters_, opencl::CL_TRUE, 0,
                                 tables::filters().size() * sizeof(int),
@@ -269,26 +264,16 @@ class OpenCLBackend final : public Backend {
         cl_mem job_mem = 0, unused = 0;
         int total = 0;
         if (!upload_jobs(wave.intra, &job_mem, &unused, &total,
-                         [](const Av1gIntraJob& j) { return j.w * j.h; }))
+                         [](const Av1gIntraJob&) { return 1; }))
           return fail(error, "intra job upload failed");
-        ensure(&aux_, &aux_cap_, static_cast<size_t>(n) * sizeof(Av1gIntraAux) + 64);
-        cl_kernel ka = kernel("av1g_k_intra_aux");
-        set_mem(ka, 0, job_mem);
-        set_int(ka, 1, n);
-        set_mem(ka, 2, frame_);
-        set_mem(ka, 3, aux_);
-        if (!enqueue(ka, n, 64)) return fail(error, "av1g_k_intra_aux failed");
-        ++launches;
-
+        (void)total;
+        /* one work item per block: intra prediction is a whole block operation */
         cl_kernel k = kernel("av1g_k_intra");
         set_mem(k, 0, job_mem);
-        set_mem(k, 1, unused);
-        set_int(k, 2, n);
-        set_int(k, 3, total);
-        set_mem(k, 4, frame_);
-        set_mem(k, 5, aux_);
-        set_int(k, 6, maxv);
-        if (!enqueue(k, total, 64)) return fail(error, "av1g_k_intra failed");
+        set_int(k, 1, n);
+        set_mem(k, 2, frame_);
+        set_int(k, 3, maxv);
+        if (!enqueue(k, n, 64)) return fail(error, "av1g_k_intra failed");
         ++launches;
       }
       if (!wave.itx.empty()) {
@@ -307,7 +292,6 @@ class OpenCLBackend final : public Backend {
         set_int(kr, 3, rows);
         set_mem(kr, 4, coef_);
         set_mem(kr, 5, tmp_);
-        set_mem(kr, 6, basis_);
         if (!enqueue(kr, rows, 64)) return fail(error, "av1g_k_itx_rows failed");
         ++launches;
 
@@ -318,8 +302,7 @@ class OpenCLBackend final : public Backend {
         set_int(kc, 3, cols);
         set_mem(kc, 4, tmp_);
         set_mem(kc, 5, frame_);
-        set_mem(kc, 6, basis_);
-        set_int(kc, 7, maxv);
+        set_int(kc, 6, maxv);
         if (!enqueue(kc, cols, 64)) return fail(error, "av1g_k_itx_cols failed");
         ++launches;
       }
@@ -563,14 +546,13 @@ class OpenCLBackend final : public Backend {
       if (entry.second && api_.ReleaseKernel) api_.ReleaseKernel(entry.second);
     }
     kernels_.clear();
-    cl_mem buffers[] = {frame_,  scratch_,  coef_,    tmp_,     residual_,
-                        basis_,  filters_,  ref_pool_, aux_,    grain_,
-                        lut_,    rgb_,      job_a_,   job_b_,   pref_a_,
-                        pref_b_};
+    cl_mem buffers[] = {frame_, scratch_, coef_,    tmp_,     residual_,
+                        filters_, ref_pool_, grain_,   lut_,     rgb_,
+                        job_a_, job_b_,   pref_a_,  pref_b_};
     for (cl_mem m : buffers)
       if (m && api_.ReleaseMemObject) api_.ReleaseMemObject(m);
-    frame_ = scratch_ = coef_ = tmp_ = residual_ = basis_ = filters_ = nullptr;
-    ref_pool_ = aux_ = grain_ = lut_ = rgb_ = job_a_ = job_b_ = nullptr;
+    frame_ = scratch_ = coef_ = tmp_ = residual_ = filters_ = nullptr;
+    ref_pool_ = grain_ = lut_ = rgb_ = job_a_ = job_b_ = nullptr;
     pref_a_ = pref_b_ = nullptr;
     if (program_ && api_.ReleaseProgram) api_.ReleaseProgram(program_);
     program_ = nullptr;
@@ -763,13 +745,13 @@ class OpenCLBackend final : public Backend {
   bool tables_uploaded_ = false;
 
   cl_mem frame_ = nullptr, scratch_ = nullptr, coef_ = nullptr, tmp_ = nullptr;
-  cl_mem residual_ = nullptr, basis_ = nullptr, filters_ = nullptr;
-  cl_mem ref_pool_ = nullptr, aux_ = nullptr, grain_ = nullptr, lut_ = nullptr;
+  cl_mem residual_ = nullptr, filters_ = nullptr;
+  cl_mem ref_pool_ = nullptr, grain_ = nullptr, lut_ = nullptr;
   cl_mem rgb_ = nullptr, job_a_ = nullptr, job_b_ = nullptr;
   cl_mem pref_a_ = nullptr, pref_b_ = nullptr;
   size_t frame_cap_ = 0, scratch_cap_ = 0, coef_cap_ = 0, tmp_cap_ = 0;
-  size_t residual_cap_ = 0, basis_cap_ = 0, filters_cap_ = 0, ref_cap_ = 0;
-  size_t aux_cap_ = 0, grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0;
+  size_t residual_cap_ = 0, filters_cap_ = 0, ref_cap_ = 0;
+  size_t grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0;
   size_t job_a_cap_ = 0, pref_a_cap_ = 0, pref_b_cap_ = 0;
   int max_local_ = 0;
   std::vector<uint16_t> staging_;

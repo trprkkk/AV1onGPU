@@ -109,17 +109,55 @@ class Frame {
 
 /* ----------------------------------------------------------------- syntax */
 
-/* Prediction modes, numbered exactly like the AV1G_PRED_* constants the
- * kernels switch on. */
+/* Prediction modes, numbered exactly like the AV1G_PRED_* constants the kernels
+ * switch on (which are the specification's own numbering, plus chroma from luma
+ * as 13). The eight directional modes are contiguous so that the mode to angle
+ * table can be indexed directly. */
 enum class PredictionMode : int {
   Dc = 0,
   Vertical = 1,
   Horizontal = 2,
-  Paeth = 3,
-  Smooth = 4,
-  SmoothVertical = 5,
-  SmoothHorizontal = 6,
-  ChromaFromLuma = 7,
+  D45 = 3,
+  D135 = 4,
+  D113 = 5,
+  D157 = 6,
+  D203 = 7,
+  D67 = 8,
+  Smooth = 9,
+  SmoothVertical = 10,
+  SmoothHorizontal = 11,
+  Paeth = 12,
+  ChromaFromLuma = 13,
+};
+
+/* Transform types, numbered like Tx_Type in the specification. */
+enum class TransformType : int {
+  DctDct = 0,
+  AdstDct = 1,
+  DctAdst = 2,
+  AdstAdst = 3,
+  FlipadstDct = 4,
+  DctFlipadst = 5,
+  FlipadstFlipadst = 6,
+  AdstFlipadst = 7,
+  FlipadstAdst = 8,
+  Idtx = 9,
+  VDct = 10,
+  HDct = 11,
+  VAdst = 12,
+  HAdst = 13,
+  VFlipadst = 14,
+  HFlipadst = 15,
+};
+
+/* The filter intra (recursive) prediction modes, numbered like
+ * Intra_Filter_Mode in the specification. */
+enum class FilterIntraMode : int {
+  Dc = 0,
+  V = 1,
+  H = 2,
+  D157 = 3,
+  Paeth = 4,
 };
 
 /* Subpel filter classes, numbered like AV1G_FILT_*. */
@@ -146,8 +184,7 @@ struct TransformBlock {
   int h = 0;
   int coef_offset = 0;
   int eob = 0; /* 0 = the whole block is zero, skip the transform */
-  bool adst_horizontal = false;
-  bool adst_vertical = false;
+  TransformType tx_type = TransformType::DctDct;
 };
 
 /* One prediction block of one plane. Chroma blocks are addressed in their own
@@ -166,7 +203,18 @@ struct BlockSyntax {
   PredictionMode mode = PredictionMode::Dc;
   bool have_left = true;
   bool have_above = true;
+  int angle_delta = 0; /* -3..3, in ANGLE_STEP = 3 degree steps */
+  /* The specification's filterType: 1 when a neighbouring block was predicted
+   * with a smooth mode, which switches the intra edge filter's strength table.
+   * Set by whoever builds the frame; it cannot be derived from the block. */
+  int filter_type = 0;
+  bool use_filter_intra = false;
+  FilterIntraMode filter_intra_mode = FilterIntraMode::Dc;
   int cfl_alpha = 0; /* Q3, only used by ChromaFromLuma */
+
+  /* Lossless coding of this block (segment feature or coded lossless): the
+   * transform becomes a Walsh-Hadamard and both shifts are dropped. */
+  bool lossless = false;
 
   /* inter */
   int ref[2] = {-1, -1};  /* indices into FrameSyntax::reference_slots */
@@ -231,6 +279,9 @@ struct FrameSyntax {
   int ss_y = 1;
   int base_q_idx = 0;
   int sharpness = 0;
+  /* The sequence header's enable_intra_edge_filter: when it is off, intra
+   * prediction uses the raw edge samples. */
+  bool enable_intra_edge_filter = true;
 
   /* Short term reference slots the inter blocks index into. */
   std::vector<int> reference_slots;

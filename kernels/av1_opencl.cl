@@ -30,25 +30,24 @@
 /* ---------------------------------------------------------------- transform */
 __kernel void av1g_k_itx_rows(__global const Av1gItxJob *jobs,
                               __global const int *joff, int njobs, int total,
-                              __global const int *coef, __global int *tmp,
-                              __global const int *basis) {
+                              __global const int *coef, __global int *tmp) {
   AV1G_JOB_LOOKUP(job_idx, elem);
   Av1gItxJob job = jobs[job_idx];
   if (job.eob <= 0) return;
   /* one work item per transform row: the element count per job is job.h */
-  av1g_itx_row(&job, coef, tmp, basis, elem);
+  av1g_itx_row(&job, coef, tmp, elem);
 }
 
 __kernel void av1g_k_itx_cols(__global const Av1gItxJob *jobs,
                               __global const int *joff, int njobs, int total,
                               __global const int *tmp, __global av1g_px *dst,
-                              __global const int *basis, int maxv) {
+                              int maxv) {
   AV1G_JOB_LOOKUP(job_idx, elem);
   Av1gItxJob job = jobs[job_idx];
   if (job.eob <= 0) return;
   /* one work item per transform column: the element count per job is job.w.
    * av1g_itx_col_add accumulates, so it must run exactly once per column. */
-  av1g_itx_col_add(&job, tmp, dst, basis, elem, maxv);
+  av1g_itx_col_add(&job, tmp, dst, elem, maxv);
 }
 
 /* --------------------------------------------------------------- prediction */
@@ -61,13 +60,16 @@ __kernel void av1g_k_intra_aux(__global const Av1gIntraJob *jobs, int njobs,
   av1g_intra_aux(&job, plane, aux + j);
 }
 
-__kernel void av1g_k_intra(__global const Av1gIntraJob *jobs,
-                           __global const int *joff, int njobs, int total,
+/* One work item per block: intra prediction is a whole-block operation now,
+ * because the edge filtering and the recursive predictor look at more than one
+ * sample around the position being predicted. */
+__kernel void av1g_k_intra(__global const Av1gIntraJob *jobs, int njobs,
                            __global av1g_px *plane,
                            __global const Av1gIntraAux *aux, int maxv) {
-  AV1G_JOB_LOOKUP(job_idx, elem);
-  Av1gIntraJob job = jobs[job_idx];
-  av1g_intra_px(&job, plane, aux + job_idx, elem % job.w, elem / job.w, maxv);
+  const int j = (int)get_global_id(0);
+  if (j >= njobs) return;
+  Av1gIntraJob job = jobs[j];
+  av1g_intra_block(&job, plane, aux + j, maxv);
 }
 
 __kernel void av1g_k_inter(__global const Av1gInterJob *jobs,

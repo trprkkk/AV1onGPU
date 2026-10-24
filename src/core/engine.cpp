@@ -215,6 +215,12 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     DepGrid grid;
     grid.init(geom.width, geom.height, options.dependency_cell);
     std::vector<int> block_wave(syntax.blocks.size(), 0);
+    /* availability of the above-right and below-left samples: the specification
+     * only lets intra prediction read them when the block that produced them
+     * has already been reconstructed, which a wavefront schedule can tell by
+     * looking at the dependency grid. */
+    std::vector<char> above_right(syntax.blocks.size(), 0);
+    std::vector<char> below_left(syntax.blocks.size(), 0);
     int max_wave = 0;
     for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
       const BlockSyntax& b = syntax.blocks[bi];
@@ -236,6 +242,8 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         dep = std::max(dep, grid.at(lx, ly)); /* the co-located luma block */
 
       const int wave = dep + 1;
+      above_right[bi] = static_cast<char>(b.is_intra && grid.at(lx + lw, ly - 1) >= 0);
+      below_left[bi] = static_cast<char>(b.is_intra && grid.at(lx - 1, ly + lh) >= 0);
       block_wave[bi] = wave;
       grid.fill(lx, ly, lx + lw, ly + lh, wave);
       max_wave = std::max(max_wave, wave);
@@ -259,13 +267,30 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.h = b.h;
         job.mode = static_cast<int>(b.mode);
         job.bitdepth = b.bit_depth;
+        job.x = b.x;
+        job.y = b.y;
         job.have_left = b.have_left && b.x > 0;
         job.have_above = b.have_above && b.y > 0;
+        job.have_above_right = above_right[bi];
+        job.have_below_left = below_left[bi];
+        /* The edge filter strength table depends on filterType, which comes
+         * from the neighbours, and on whether the sequence enables the filter
+         * at all. -1 means "do not touch the edge". */
+        job.filter_type = syntax.enable_intra_edge_filter ? b.filter_type : -1;
+        job.filter_intra = b.use_filter_intra && plane == 0;
+        job.filter_intra_mode = static_cast<int>(b.filter_intra_mode);
+        job.angle = b.angle_delta;
         job.cfl_alpha = b.cfl_alpha;
         job.luma_off = at(0, b.x << geom.ss_x, b.y << geom.ss_y);
         job.luma_stride = g.stride[0];
+        job.luma_w = (b.x + b.w) << geom.ss_x;
+        job.luma_h = (b.y + b.h) << geom.ss_y;
         job.ss_x = geom.ss_x;
         job.ss_y = geom.ss_y;
+        /* maxX/maxY are derived from the frame size rounded up to a multiple
+         * of 8 (MiCols * MI_SIZE), not from the visible size. */
+        job.max_x = (((geom.width + 7) & ~7) >> (plane ? geom.ss_x : 0)) - 1;
+        job.max_y = (((geom.height + 7) & ~7) >> (plane ? geom.ss_y : 0)) - 1;
         wj.intra.push_back(job);
       } else {
         Av1gInterJob job;
@@ -306,11 +331,11 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         itx.dst_stride = stride;
         itx.w = tx.w;
         itx.h = tx.h;
-        itx.row_basis =
-            tx.adst_horizontal ? tables::basis_adst(tx.w) : tables::basis_dct(tx.w);
-        itx.col_basis = tx.adst_vertical ? tables::basis_adst(tx.h) : tables::basis_dct(tx.h);
+        itx.tx_type = static_cast<int>(tx.tx_type);
         itx.eob = tx.eob;
-        itx.shift = 0;
+        itx.lossless = b.lossless ? 1 : 0;
+        itx.row_shift = b.lossless ? 0 : tables::tx_row_shift(tx.w, tx.h);
+        itx.bitdepth = b.bit_depth;
         if (itx.eob <= 0) continue; /* nothing to add */
         if (b.residual_provided)
           wj.residual.push_back(itx);

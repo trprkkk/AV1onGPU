@@ -244,31 +244,18 @@ class CudaBackend final : public Backend {
       if (!wave.intra.empty()) {
         const int n = static_cast<int>(wave.intra.size());
         int total = 0;
-        CUdeviceptr job_mem = 0, pref_mem = 0;
-        if (!upload_jobs(wave.intra, &job_mem, &pref_mem, &total,
-                         [](const Av1gIntraJob& j) { return j.w * j.h; }))
+        CUdeviceptr job_mem = 0, unused = 0;
+        if (!upload_jobs(wave.intra, &job_mem, &unused, &total,
+                         [](const Av1gIntraJob&) { return 1; }))
           return fail(error, "intra job upload failed");
-        ensure(&aux_, &aux_cap_, static_cast<size_t>(n) * sizeof(Av1gIntraAux) + 64);
+        (void)total;
         {
           Launcher a;
           add_mem(a, job_mem);
           add_int(a, n);
           add_mem(a, frame_);
-          add_mem(a, aux_);
-          if (!launch("av1g_k_intra_aux", n, a))
-            return fail(error, "av1g_k_intra_aux failed");
-          ++launches;
-        }
-        {
-          Launcher a;
-          add_mem(a, job_mem);
-          add_mem(a, pref_mem);
-          add_int(a, n);
-          add_int(a, total);
-          add_mem(a, frame_);
-          add_mem(a, aux_);
           add_int(a, maxv);
-          if (!launch("av1g_k_intra", total, a)) return fail(error, "av1g_k_intra failed");
+          if (!launch("av1g_k_intra", n, a)) return fail(error, "av1g_k_intra failed");
           ++launches;
         }
       }
@@ -289,7 +276,6 @@ class CudaBackend final : public Backend {
           add_int(a, rows);
           add_mem(a, coef_);
           add_mem(a, tmp_);
-          add_mem(a, basis_);
           if (!launch("av1g_k_itx_rows", rows, a))
             return fail(error, "av1g_k_itx_rows failed");
           ++launches;
@@ -302,7 +288,6 @@ class CudaBackend final : public Backend {
           add_int(a, cols);
           add_mem(a, tmp_);
           add_mem(a, frame_);
-          add_mem(a, basis_);
           add_int(a, maxv);
           if (!launch("av1g_k_itx_cols", cols, a))
             return fail(error, "av1g_k_itx_cols failed");
@@ -524,12 +509,12 @@ class CudaBackend final : public Backend {
       /* no cuModuleUnload in the minimal set: the context teardown frees it */
     }
     CUdeviceptr buffers[] = {frame_,    scratch_, coef_,     tmp_,   residual_,
-                             basis_,    filters_, ref_pool_, aux_,   grain_,
+                             filters_,  ref_pool_, grain_,
                              lut_,      rgb_,     job_,      pref_};
     for (CUdeviceptr b : buffers)
       if (b && driver_.MemFree) driver_.MemFree(b);
     frame_ = scratch_ = coef_ = tmp_ = residual_ = 0;
-    basis_ = filters_ = ref_pool_ = aux_ = grain_ = 0;
+    filters_ = ref_pool_ = grain_ = 0;
     lut_ = rgb_ = job_ = pref_ = pref_b_ = 0;
     if (context_ && driver_.CtxDestroy) driver_.CtxDestroy(context_);
     context_ = nullptr;
@@ -595,10 +580,7 @@ class CudaBackend final : public Backend {
   }
 
   void upload_tables() {
-    const std::vector<int>& basis = tables::basis();
     const std::vector<int>& filters = tables::filters();
-    if (ensure(&basis_, &basis_cap_, basis.size() * sizeof(int)))
-      driver_.MemcpyHtoD(basis_, basis.data(), basis.size() * sizeof(int));
     if (ensure(&filters_, &filters_cap_, filters.size() * sizeof(int)))
       driver_.MemcpyHtoD(filters_, filters.data(), filters.size() * sizeof(int));
   }
@@ -696,11 +678,11 @@ class CudaBackend final : public Backend {
   PlanLayout layout_;
   bool tables_uploaded_ = false;
   CUdeviceptr frame_ = 0, scratch_ = 0, coef_ = 0, tmp_ = 0, residual_ = 0;
-  CUdeviceptr basis_ = 0, filters_ = 0, ref_pool_ = 0, aux_ = 0, grain_ = 0;
+  CUdeviceptr filters_ = 0, ref_pool_ = 0, grain_ = 0;
   CUdeviceptr lut_ = 0, rgb_ = 0, job_ = 0, pref_ = 0, pref_b_ = 0;
   size_t frame_cap_ = 0, scratch_cap_ = 0, coef_cap_ = 0, tmp_cap_ = 0;
-  size_t residual_cap_ = 0, basis_cap_ = 0, filters_cap_ = 0, ref_cap_ = 0;
-  size_t aux_cap_ = 0, grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0;
+  size_t residual_cap_ = 0, filters_cap_ = 0, ref_cap_ = 0;
+  size_t grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0;
   size_t job_cap_ = 0, pref_cap_ = 0, pref_b_cap_ = 0;
   std::vector<uint16_t> staging_;
   bool slots_[kReferenceSlots] = {false, false, false, false, false, false};

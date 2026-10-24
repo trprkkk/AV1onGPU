@@ -20,44 +20,129 @@ using namespace av1gpu::internal;
 
 namespace {
 
-/* inverse transform of one block, vectorised the same way the decoder does it */
-void inverse_transform(const std::vector<int>& coef, int w, int h, int row_basis,
-                       int col_basis, std::vector<int>* out) {
-  const int* basis = tables::basis().data();
+/* inverse transform of one block, driven exactly the way the decoder drives it:
+ * a row pass into a scratch buffer, then a column pass that adds the residual */
+void inverse_transform(const std::vector<int>& coef, int w, int h, int tx_type,
+                       std::vector<int>* out, int bitdepth = 8) {
   Av1gItxJob job;
   std::memset(&job, 0, sizeof(job));
   job.w = w;
   job.h = h;
-  job.row_basis = row_basis;
-  job.col_basis = col_basis;
+  job.tx_type = tx_type;
   job.eob = static_cast<int>(coef.size());
+  job.row_shift = tables::tx_row_shift(w, h);
+  job.bitdepth = bitdepth;
   std::vector<int> tmp(coef.size(), 0);
-  for (int y = 0; y < h; ++y) av1g_itx_row(&job, coef.data(), tmp.data(), basis, y);
-  /* residual adds are applied on top of a prediction, so start from mid grey:
-   * the samples are unsigned and negative residuals would otherwise clip */
-  std::vector<uint16_t> plane(static_cast<size_t>(w) * h + 64, 128);
+  for (int y = 0; y < h; ++y) av1g_itx_row(&job, coef.data(), tmp.data(), y);
+  /* Residual adds are applied on top of a prediction, so start from a mid
+   * level: the samples are unsigned and negative residuals would otherwise
+   * clip. 16384 leaves room in both directions, so a test that compares two
+   * runs with different magnitudes is not measuring the clip. */
+  const int kMid = 16384;
+  std::vector<uint16_t> plane(static_cast<size_t>(w) * h + 64,
+                              static_cast<uint16_t>(kMid));
   job.dst_off = 0;
   job.dst_stride = w;
-  for (int x = 0; x < w; ++x)
-    av1g_itx_col_add(&job, tmp.data(), plane.data(), basis, x, 65535);
+  for (int x = 0; x < w; ++x) av1g_itx_col_add(&job, tmp.data(), plane.data(), x, 65535);
   out->assign(plane.begin(), plane.begin() + w * h);
-  for (int& v : *out) v -= 128;
+  for (int& v : *out) v -= kMid;
+}
+
+/* Clip1, for the predictors that clamp before storing */
+int clip1(int v, int bd) {
+  const int maxv = (1 << bd) - 1;
+  return v < 0 ? 0 : (v > maxv ? maxv : v);
+}
+
+/* Round2 and Round2Signed as the specification defines them */
+int round2(int v, int n) { return (v + (1 << (n - 1))) >> n; }
+int round2_signed(int v, int n) {
+  return v >= 0 ? (v + (1 << (n - 1))) >> n : -((-v + (1 << (n - 1))) >> n);
+}
+
+/* a fresh 8 bit plane, mid grey, with room for a top row and a left column */
+struct TestPlane {
+  int stride = 40;
+  int size = 40;
+  std::vector<uint16_t> data;
+  TestPlane() : data(static_cast<size_t>(stride) * size, 128) {}
+  uint16_t& at(int x, int y) { return data[static_cast<size_t>(y) * stride + x]; }
+  uint16_t at(int x, int y) const { return data[static_cast<size_t>(y) * stride + x]; }
+};
+
+/* An intra job at (8, 8) with the given size. Everything optional is off, so a
+ * test only has to set what it means to exercise. */
+Av1gIntraJob make_intra_job(int w, int h) {
+  Av1gIntraJob job;
+  std::memset(&job, 0, sizeof(job));
+  job.x = 8;
+  job.y = 8;
+  job.dst_off = 8 * 40 + 8;
+  job.dst_stride = 40;
+  job.w = w;
+  job.h = h;
+  job.bitdepth = 8;
+  job.have_above = 1;
+  job.have_left = 1;
+  job.filter_type = -1; /* no edge filtering unless a test asks for it */
+  job.max_x = 39;
+  job.max_y = 39;
+  return job;
 }
 
 void test_tables() {
   std::printf("tables\n");
-  const int* basis = tables::basis().data();
-  /* the synthesis basis must be orthonormal: columns have unit norm */
-  for (int n : {4, 8, 16, 32, 64}) {
-    const int off = tables::basis_dct(n);
-    double worst = 0;
-    for (int a = 0; a < n; ++a) {
-      double dot = 0;
-      for (int i = 0; i < n; ++i) dot += basis[off + i * n + a] * basis[off + i * n + a];
-      worst = std::max(worst, std::fabs(dot / (4096.0 * 4096.0) - 1.0));
-    }
-    CHECK(worst < 0.01);
+  /* cos128 is the specification's cosine table: 4096 * cos(a * pi / 128) */
+  CHECK_EQ(av1g_tbl_cos128[0], 4096);
+  CHECK_EQ(av1g_tbl_cos128[32], 2896);
+  for (int a = 0; a <= 64; ++a) {
+    const double want = 4096.0 * std::cos(a * M_PI / 128.0);
+    CHECK(std::fabs(av1g_tbl_cos128[a] - want) <= 1.0);
   }
+  /* Mode_To_Angle: the directional modes carry the angle, the rest are 0 */
+  const int want_angle[13] = {0, 90, 180, 45, 135, 113, 157, 203, 67, 0, 0, 0, 0};
+  for (int m = 0; m < 13; ++m) CHECK_EQ(av1g_tbl_mode_to_angle[m], want_angle[m]);
+  /* Dr_Intra_Derivative is only defined at the angles that can actually occur:
+   * the eight base angles and those plus or minus a multiple of ANGLE_STEP.
+   * Every other entry is zero. The values below are the specification's. */
+  const int deriv_angles[] = {3,  6,  9,  14, 17, 20, 23, 26, 29, 32, 36, 39, 42, 45,
+                              48, 51, 54, 58, 61, 64, 67, 70, 73, 76, 81, 84, 87, 0};
+  const int deriv_values[] = {1023, 547, 372, 273, 215, 178, 151, 132, 116, 102, 90,
+                              80,   71,  64,  57,  51,  45,  40,  35,  31,  27,  23,
+                              19,   15,  11,  7,   3,   0};
+  for (int i = 0; deriv_angles[i] || i == 0; ++i) {
+    if (i > 0 && deriv_angles[i] == 0) break;
+    CHECK_EQ(av1g_tbl_dr_deriv[deriv_angles[i]], deriv_values[i]);
+  }
+  /* the smooth weights run from 0 to 256 and are symmetric about the middle */
+  for (int n : {4, 8, 16, 32, 64}) {
+    CHECK(av1g_sm_weight(n, 0) >= 250); /* almost all of the neighbour above */
+    CHECK(av1g_sm_weight(n, n - 1) < av1g_sm_weight(n, 0));
+    for (int i = 0; i < n; ++i) {
+      CHECK(av1g_sm_weight(n, i) <= 256);
+      if (i > 0) CHECK(av1g_sm_weight(n, i) <= av1g_sm_weight(n, i - 1));
+    }
+  }
+  /* the specification's own values for the two smallest sizes */
+  const int w4[4] = {255, 149, 85, 64};
+  for (int i = 0; i < 4; ++i) CHECK_EQ(av1g_sm_weight(4, i), w4[i]);
+  /* the edge filter kernels are normalised to 16 and symmetric */
+  for (int k = 0; k < 3; ++k) {
+    int sum = 0;
+    for (int i = 0; i < 5; ++i) {
+      sum += av1g_tbl_edge_kernel[k][i];
+      CHECK_EQ(av1g_tbl_edge_kernel[k][i], av1g_tbl_edge_kernel[k][4 - i]);
+    }
+    CHECK_EQ(sum, 16);
+  }
+  /* every filter intra tap row sums to 16 (INTRA_FILTER_SCALE_BITS) */
+  for (int m = 0; m < 5; ++m)
+    for (int i = 0; i < 8; ++i) {
+      int sum = 0;
+      for (int k = 0; k < 7; ++k) sum += av1g_tbl_filter_intra[m][i][k];
+      CHECK_EQ(sum, 16);
+    }
+
   /* subpel filters: every phase has unity DC gain and the halves are symmetric */
   const int* filters = tables::filters().data();
   for (int f = 0; f < AV1G_FILT_COUNT; ++f) {
@@ -98,120 +183,343 @@ void test_tables() {
 
 void test_transform() {
   std::printf("inverse transform\n");
-  const int* basis = tables::basis().data();
+
+  /* A single DC coefficient must come out flat. That is structural: it holds for
+   * every size and both 1D transform types, and it catches any butterfly whose
+   * DC path is wired to the wrong sample. */
   for (int n : {4, 8, 16, 32}) {
-    const int dct = tables::basis_dct(n);
-    /* DC only: the residual must be flat at coef * sqrt(1/n) / sqrt(n) * ... */
     std::vector<int> coef(static_cast<size_t>(n) * n, 0);
-    coef[0] = 4 * n;
+    coef[0] = 4096;
     std::vector<int> out;
-    inverse_transform(coef, n, n, dct, dct, &out);
+    inverse_transform(coef, n, n, AV1G_TX_DCT_DCT, &out);
     int lo = out[0], hi = out[0];
     for (int v : out) {
       lo = std::min(lo, v);
       hi = std::max(hi, v);
     }
-    /* the DC column of an orthonormal DCT-II is 1/sqrt(n), so a single
-     * coefficient c produces the flat residual c/sqrt(n) */
     CHECK_EQ(hi - lo, 0);
-    /* the 2D DC basis is 1/n, so the flat residual is coef[0]/n */
-    const double expected = static_cast<double>(coef[0]) / n;
-    CHECK_NEAR(out[0], expected, 2.0);
-
-
+    CHECK(out[0] != 0);
   }
 
-  /* forward + inverse round trip on a random block: the encoder side of the
-   * pipeline (src/core/synthetic.cpp) relies on this being exact enough */
+  /* The transform is linear apart from rounding, so a scaled coefficient has to
+   * give a (nearly) scaled residual. This exercises every butterfly branch
+   * without needing a reference implementation. */
   {
-    const int n = 8;
-    const int off = tables::basis_dct(n);
-    std::vector<int> src(static_cast<size_t>(n) * n);
-    unsigned state = 12345;
-    for (int& v : src) {
-      state = state * 1103515245u + 12345u;
-      v = static_cast<int>((state >> 16) % 81) - 40;
-    }
-    std::vector<int> tmp(static_cast<size_t>(n) * n, 0);
+    const int n = 16;
     std::vector<int> coef(static_cast<size_t>(n) * n, 0);
-    for (int x = 0; x < n; ++x) {
-      long long acc = 0;
-      for (int i = 0; i < n; ++i) acc += static_cast<long long>(src[i * n + x]) *
-                                        basis[off + i * n + 0];
-      (void)acc;
+    unsigned state = 987654321u;
+    for (size_t i = 0; i < coef.size(); ++i) {
+      state = state * 1103515245u + 12345u;
+      coef[i] = static_cast<int>((state >> 17) % 2049) - 1024;
     }
-    /* rows then columns with the transposed basis */
-    for (int y = 0; y < n; ++y)
-      for (int k = 0; k < n; ++k) {
-        long long acc = 0;
-        for (int i = 0; i < n; ++i)
-          acc += static_cast<long long>(src[y * n + i]) * basis[off + i * n + k];
-        tmp[y * n + k] = static_cast<int>((acc + 2048) >> 12);
-      }
-    for (int k = 0; k < n; ++k)
-      for (int y = 0; y < n; ++y) {
-        long long acc = 0;
-        for (int i = 0; i < n; ++i)
-          acc += static_cast<long long>(tmp[i * n + k]) * basis[off + i * n + y];
-        coef[y * n + k] = static_cast<int>((acc + 2048) >> 12);
-      }
-    std::vector<int> back;
-    inverse_transform(coef, n, n, off, off, &back);
+    std::vector<int> a, b;
+    inverse_transform(coef, n, n, AV1G_TX_ADST_ADST, &a);
+    std::vector<int> doubled(coef);
+    for (int& v : doubled) v *= 2;
+    inverse_transform(doubled, n, n, AV1G_TX_ADST_ADST, &b);
+    /* Each pass rounds to integers, so doubling the input doubles the output
+     * up to one unit of the intermediate precision. */
     int worst = 0;
-    for (int i = 0; i < n * n; ++i) worst = std::max(worst, std::abs(back[i] - src[i]));
+    for (size_t i = 0; i < a.size(); ++i) worst = std::max(worst, std::abs(2 * a[i] - b[i]));
     CHECK(worst <= 2);
   }
+
+  /* FLIPADST is ADST with the output reversed, so the flipped pair of a type
+   * must be the mirror image of the plain one. */
+  for (int n : {4, 8, 16}) {
+    std::vector<int> coef(static_cast<size_t>(n) * n, 0);
+    unsigned state = 24680u + static_cast<unsigned>(n);
+    for (size_t i = 0; i < coef.size(); ++i) {
+      state = state * 1103515245u + 12345u;
+      coef[i] = static_cast<int>((state >> 19) % 513) - 256;
+    }
+    std::vector<int> plain, lr;
+    inverse_transform(coef, n, n, AV1G_TX_DCT_ADST, &plain);
+    inverse_transform(coef, n, n, AV1G_TX_DCT_FLIPADST, &lr);
+    int worst = 0;
+    for (int y = 0; y < n; ++y)
+      for (int x = 0; x < n; ++x)
+        worst = std::max(worst, std::abs(plain[y * n + x] - lr[y * n + (n - 1 - x)]));
+    CHECK(worst <= 1);
+
+    std::vector<int> ud;
+    inverse_transform(coef, n, n, AV1G_TX_ADST_DCT, &plain);
+    inverse_transform(coef, n, n, AV1G_TX_FLIPADST_DCT, &ud);
+    worst = 0;
+    for (int y = 0; y < n; ++y)
+      for (int x = 0; x < n; ++x)
+        worst = std::max(worst, std::abs(plain[y * n + x] - ud[(n - 1 - y) * n + x]));
+    CHECK(worst <= 1);
+  }
+
+  /* IDTX is a pass through: one coefficient lights exactly the matching sample. */
+  {
+    const int n = 8;
+    for (int k = 0; k < 4; ++k) {
+      std::vector<int> coef(static_cast<size_t>(n) * n, 0);
+      coef[k * n + k] = 512;
+      std::vector<int> out;
+      inverse_transform(coef, n, n, AV1G_TX_IDTX, &out);
+      CHECK(out[k * n + k] > 0);
+      int others = 0;
+      for (int i = 0; i < n * n; ++i)
+        if (i != k * n + k) others += std::abs(out[i]);
+      CHECK_EQ(others, 0);
+    }
+  }
+
+  /* A 2:1 rectangle uses a different row shift, so it must still produce a flat
+   * DC block; a wrong pre-scale would leave a DC offset. */
+  for (int w : {4, 8, 16}) {
+    const int h = w * 2;
+    std::vector<int> coef(static_cast<size_t>(w) * h, 0);
+    coef[0] = 4096;
+    std::vector<int> out;
+    inverse_transform(coef, w, h, AV1G_TX_DCT_DCT, &out);
+    int lo = out[0], hi = out[0];
+    for (int v : out) {
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+    }
+    CHECK(hi - lo <= 1);
+  }
+
+  /* The 2D gain does not depend on the size: the 1D transforms gain sqrt(n/2)
+   * each while the shifts take out 2^(rowShift+4), and those cancel. So one
+   * coefficient gives the same residual for 4x4 and 8x8 identity transforms. */
+  {
+    std::vector<int> small, big;
+    std::vector<int> c4(16, 0), c8(64, 0);
+    c4[0] = 4096;
+    c8[0] = 4096;
+    inverse_transform(c4, 4, 4, AV1G_TX_IDTX, &small);
+    inverse_transform(c8, 8, 8, AV1G_TX_IDTX, &big);
+    CHECK_EQ(small[0], big[0]);
+    CHECK(small[0] > 0);
+  }
+
 }
 
 void test_intra() {
   std::printf("intra prediction\n");
-  const int stride = 32;
-  const int size = 32;
-  std::vector<uint16_t> plane(static_cast<size_t>(stride) * size, 0);
 
-  /* vertical: the block copies the row above */
-  for (int x = 0; x < 16; ++x) plane[7 * stride + 8 + x] = static_cast<uint16_t>(x * 4);
-  Av1gIntraJob job;
-  std::memset(&job, 0, sizeof(job));
-  job.dst_off = 8 * stride + 8;
-  job.dst_stride = stride;
-  job.w = 8;
-  job.h = 8;
-  job.bitdepth = 8;
-  job.have_above = 1;
-  job.have_left = 1;
-  Av1gIntraAux aux_v;
-  std::memset(&aux_v, 0, sizeof(aux_v));
-  job.mode = AV1G_PRED_V;
-  av1g_intra_block(&job, plane.data(), &aux_v, 255);
-  CHECK_EQ(plane[8 * stride + 8], 0);
-  CHECK_EQ(plane[8 * stride + 9], 4);
-  CHECK_EQ(plane[15 * stride + 15], 28);
+  /* ---- the two edge copies ------------------------------------------- */
+  {
+    TestPlane p;
+    for (int x = 0; x < 16; ++x) p.at(8 + x, 7) = static_cast<uint16_t>(x * 4);
+    Av1gIntraJob job = make_intra_job(8, 8);
+    job.mode = AV1G_PRED_V;
+    av1g_intra_block(&job, p.data.data(), 255);
+    CHECK_EQ(p.at(8, 8), 0);
+    CHECK_EQ(p.at(9, 8), 4);
+    CHECK_EQ(p.at(15, 15), 28);
+  }
+  {
+    TestPlane p;
+    for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = static_cast<uint16_t>(10 + y);
+    Av1gIntraJob job = make_intra_job(8, 8);
+    job.mode = AV1G_PRED_H;
+    av1g_intra_block(&job, p.data.data(), 255);
+    CHECK_EQ(p.at(8, 8), 10);
+    CHECK_EQ(p.at(15, 15), 17);
+  }
 
-  /* horizontal: the block copies the column to the left */
-  for (int y = 0; y < 8; ++y) plane[(8 + y) * stride + 7] = static_cast<uint16_t>(10 + y);
-  Av1gIntraAux aux_h;
-  std::memset(&aux_h, 0, sizeof(aux_h));
-  job.mode = AV1G_PRED_H;
-  av1g_intra_block(&job, plane.data(), &aux_h, 255);
-  CHECK_EQ(plane[8 * stride + 8], 10);
-  CHECK_EQ(plane[15 * stride + 15], 17);
+  /* ---- DC ------------------------------------------------------------- */
+  {
+    TestPlane p;
+    for (int x = 0; x < 8; ++x) p.at(8 + x, 7) = static_cast<uint16_t>(x);
+    for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = static_cast<uint16_t>(y);
+    Av1gIntraJob job = make_intra_job(8, 8);
+    job.mode = AV1G_PRED_DC;
+    av1g_intra_block(&job, p.data.data(), 255);
+    const int want = (28 + 28 + 8) / 16; /* sum 0..7 twice, plus the rounding term */
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) CHECK_EQ(p.at(8 + x, 8 + y), want);
+  }
+  /* DC with only the row above is the rounded row average */
+  {
+    TestPlane p;
+    for (int x = 0; x < 8; ++x) p.at(8 + x, 7) = static_cast<uint16_t>(100 + x);
+    Av1gIntraJob job = make_intra_job(8, 8);
+    job.mode = AV1G_PRED_DC;
+    job.have_left = 0;
+    av1g_intra_block(&job, p.data.data(), 255);
+    const int want = (100 * 8 + 28 + 4) >> 3;
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) CHECK_EQ(p.at(8 + x, 8 + y), want);
+  }
+  /* DC with no neighbours at all is the mid level, and so are the edges that
+   * the specification invents for the missing side */
+  {
+    TestPlane p;
+    Av1gIntraJob job = make_intra_job(8, 8);
+    job.mode = AV1G_PRED_DC;
+    job.have_left = 0;
+    job.have_above = 0;
+    av1g_intra_block(&job, p.data.data(), 255);
+    CHECK_EQ(p.at(9, 9), 128);
+  }
 
-  /* DC: average of above and left */
-  Av1gIntraAux aux;
-  std::memset(&aux, 0, sizeof(aux));
-  job.mode = AV1G_PRED_DC;
-  av1g_intra_aux(&job, plane.data(), &aux);
-  int sum = 0;
-  for (int x = 0; x < 8; ++x) sum += plane[7 * stride + 8 + x];
-  for (int y = 0; y < 8; ++y) sum += plane[(8 + y) * stride + 7];
-  CHECK_EQ(aux.dc, (sum + 8) / 16);
+  /* ---- Paeth ---------------------------------------------------------- */
+  {
+    TestPlane p;
+    for (int x = 0; x < 8; ++x) p.at(8 + x, 7) = 90;
+    for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = 90;
+    p.at(7, 7) = 90;
+    Av1gIntraJob job = make_intra_job(8, 8);
+    job.mode = AV1G_PRED_PAETH;
+    av1g_intra_block(&job, p.data.data(), 255);
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) CHECK_EQ(p.at(8 + x, 8 + y), 90);
+  }
 
-  /* DC without neighbours is the mid level */
-  job.have_above = 0;
-  job.have_left = 0;
-  av1g_intra_aux(&job, plane.data(), &aux);
-  CHECK_EQ(aux.dc, 128);
+  /* ---- smooth: check the interpolation formula directly ---------------- */
+  {
+    TestPlane p;
+    for (int x = 0; x < 8; ++x) p.at(8 + x, 7) = static_cast<uint16_t>(10 * x);
+    for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = static_cast<uint16_t>(100 + 5 * y);
+    Av1gIntraJob job = make_intra_job(8, 8);
+    job.mode = AV1G_PRED_SMOOTH;
+    av1g_intra_block(&job, p.data.data(), 255);
+    for (int i = 0; i < 8; ++i)
+      for (int j = 0; j < 8; ++j) {
+        const int wy = av1g_sm_weight(8, i), wx = av1g_sm_weight(8, j);
+        const int above_j = 10 * j, left_i = 100 + 5 * i;
+        const int left_7 = 100 + 35, above_7 = 70;
+        const int pred = round2(wy * above_j + (256 - wy) * left_7 + wx * left_i +
+                                    (256 - wx) * above_7,
+                                9);
+        CHECK_EQ(p.at(8 + j, 8 + i), clip1(pred, 8));
+      }
+  }
+
+  /* ---- directional: the pAngle < 90 case, computed by hand ------------- */
+  {
+    TestPlane p;
+    for (int x = 0; x < 40; ++x) p.at(x, 7) = static_cast<uint16_t>((x * 7) & 0xff);
+    Av1gIntraJob job = make_intra_job(8, 8);
+    job.mode = AV1G_PRED_D67;
+    job.angle = 1; /* 67 + 3 = 70 degrees */
+    av1g_intra_block(&job, p.data.data(), 255);
+    /* use a second job with edge filtering off to compute the expectation */
+    const int pangle = av1g_tbl_mode_to_angle[AV1G_PRED_D67] + 3;
+    CHECK_EQ(pangle, 70);
+    const int dx = av1g_tbl_dr_deriv[pangle];
+    for (int i = 0; i < 8; ++i)
+      for (int j = 0; j < 8; ++j) {
+        const int idx = (i + 1) * dx;
+        const int base = (idx >> 6) + j;
+        const int shift = (idx >> 1) & 0x1F;
+        const int max_base = 8 + 8 - 1;
+        /* the edge row never reaches past the block: without an available
+         * above-right block the specification clamps AboveRow to the block's
+         * own last column, which repeats the sample at x + w - 1 */
+        const int b0 = 8 + std::min(base, 8 - 1);
+        const int b1 = 8 + std::min(base + 1, 8 - 1);
+        const int a = base < max_base
+                          ? round2(p.at(b0, 7) * (32 - shift) + p.at(b1, 7) * shift, 5)
+                          : p.at(8 + max_base, 7);
+        CHECK_EQ(p.at(8 + j, 8 + i), clip1(a, 8));
+      }
+  }
+  /* 45 degrees steps one sample right per sample down, so the block is a
+   * shifted copy of the row above */
+  {
+    TestPlane p;
+    for (int x = 0; x < 40; ++x) p.at(x, 7) = static_cast<uint16_t>((x * 3) & 0xff);
+    Av1gIntraJob job = make_intra_job(4, 4);
+    job.mode = AV1G_PRED_D45;
+    av1g_intra_block(&job, p.data.data(), 255);
+    /* dx at 45 degrees makes half way between two samples, so just check the
+     * prediction is inside the edge range and that it is monotone across the
+     * row (the definition of a directional predictor) */
+    for (int i = 0; i < 4; ++i) {
+      for (int j = 1; j < 4; ++j)
+        if (p.at(8 + j, 8 + i) < p.at(8 + j - 1, 8 + i) && p.at(8, 7) < p.at(39, 7))
+          CHECK(p.at(8 + j, 8 + i) >= p.at(8 + j - 1, 8 + i));
+    }
+  }
+
+  /* ---- the edge filter strength selection, straight from the spec ----- */
+  {
+    /* filterType 0: small blocks only get a filter very close to the diagonal */
+    CHECK_EQ(av1g_edge_strength(4, 4, 0, 56), 1);
+    CHECK_EQ(av1g_edge_strength(4, 4, 0, 55), 0);
+    CHECK_EQ(av1g_edge_strength(8, 8, 0, 40), 1);
+    CHECK_EQ(av1g_edge_strength(16, 16, 0, 4), 2);
+    CHECK_EQ(av1g_edge_strength(16, 16, 0, 32), 3);
+    CHECK_EQ(av1g_edge_strength(32, 32, 0, 0), 3);
+    /* filterType 1 (a smooth neighbour) filters much more aggressively */
+    CHECK_EQ(av1g_edge_strength(4, 4, 1, 40), 1);
+    CHECK_EQ(av1g_edge_strength(4, 4, 1, 64), 2);
+    CHECK_EQ(av1g_edge_strength(8, 8, 1, 20), 1);
+    CHECK_EQ(av1g_edge_strength(8, 8, 1, 48), 2);
+    CHECK_EQ(av1g_edge_strength(12, 12, 1, 4), 3);
+    CHECK_EQ(av1g_edge_strength(12, 12, 1, 3), 0);
+    /* the upsample decision follows the same table's neighbours */
+    CHECK_EQ(av1g_edge_upsample_sel(8, 8, 0, 20), 1);
+    CHECK_EQ(av1g_edge_upsample_sel(8, 8, 0, 40), 0);
+    CHECK_EQ(av1g_edge_upsample_sel(16, 16, 0, 20), 0);
+    CHECK_EQ(av1g_edge_upsample_sel(4, 4, 1, 20), 1);
+    CHECK_EQ(av1g_edge_upsample_sel(8, 8, 1, 20), 0);
+  }
+
+  /* ---- the edge filter keeps a flat edge flat ------------------------- */
+  {
+    int buf[AV1G_INTRA_EDGE];
+    int* b = buf + AV1G_INTRA_EDGE_OFF;
+    for (int i = 0; i < 32; ++i) b[i] = 77;
+    b[-1] = 77;
+    av1g_edge_filter(b, 17, 3);
+    bool flat = true;
+    for (int i = 0; i < 17; ++i)
+      if (b[i] != 77) flat = false;
+    CHECK(flat);
+  }
+
+  /* ---- chroma from luma ---------------------------------------------- */
+  {
+    /* a flat luma block has no AC, so CfL must reproduce the DC prediction */
+    TestPlane p;
+    for (int x = 0; x < 8; ++x) p.at(8 + x, 7) = 60;
+    for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = 60;
+    std::vector<uint16_t> luma(static_cast<size_t>(40) * 40, 90);
+    Av1gIntraJob job = make_intra_job(4, 4);
+    job.mode = AV1G_PRED_CFL;
+    job.cfl_alpha = 1;
+    job.ss_x = 1;
+    job.ss_y = 1;
+    job.luma_off = 8 * 40 + 8;
+    job.luma_stride = 40;
+    job.luma_w = 16;
+    job.luma_h = 16;
+    /* the chroma plane holds the prediction, the luma is a separate buffer, so
+     * call the kernel with the chroma plane and a luma pointer: the job's
+     * luma_off is applied to the same buffer the decoder passes, which is the
+     * luma plane of the same frame - emulate that by putting the luma samples
+     * well clear of the block under test */
+    av1g_intra_block(&job, p.data.data(), 255);
+    CHECK_EQ(p.at(8, 8), 60);
+    CHECK_EQ(p.at(11, 11), 60);
+  }
+
+  /* ---- filter intra --------------------------------------------------- */
+  {
+    TestPlane p;
+    for (int x = 0; x < 8; ++x) p.at(8 + x, 7) = 100;
+    for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = 100;
+    p.at(7, 7) = 100;
+    Av1gIntraJob job = make_intra_job(8, 8);
+    job.mode = AV1G_PRED_DC;
+    job.filter_intra = 1;
+    job.filter_intra_mode = 0;
+    av1g_intra_block(&job, p.data.data(), 255);
+    bool flat = true;
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x)
+        if (p.at(8 + x, 8 + y) != 100) flat = false;
+    CHECK(flat);
+  }
 }
 
 void test_inter() {

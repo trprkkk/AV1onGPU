@@ -139,11 +139,9 @@ void apply_post_filters_host(Frame* frame, const FrameSyntax& syntax);
 
 namespace tables {
 
-/* Q12 orthonormal basis matrices, laid out row major, one block per size. */
-const std::vector<int>& basis();
-int basis_dct(int n);
-int basis_adst(int n);
-int basis_identity(int n);
+/* Transform_Row_Shift for a transform of this size: the right shift between
+ * the row and column passes of the inverse transform. */
+int tx_row_shift(int w, int h);
 
 /* Q7 subpel filters: AV1G_FILT_COUNT filters x 8 phases x 8 taps. */
 const std::vector<int>& filters();

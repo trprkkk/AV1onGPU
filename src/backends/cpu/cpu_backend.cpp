@@ -128,7 +128,6 @@ class CpuBackend final : public Backend {
     const PlanLayout& g = plan.layout;
     const int maxv = plan.maxv;
     const int* filters = tables::filters().data();
-    const int* basis = tables::basis().data();
     uint16_t* frame = frame_.data();
 
     /* ---- prediction, transform, residual --------------------------------- */
@@ -152,11 +151,8 @@ class CpuBackend final : public Backend {
 #if defined(AV1GPU_HAVE_OPENMP)
 #pragma omp parallel for schedule(dynamic, 4)
 #endif
-      for (int i = 0; i < nintra; ++i) {
-        Av1gIntraAux aux;
-        std::memset(&aux, 0, sizeof(aux));
-        av1g_intra_block(&wave.intra[static_cast<size_t>(i)], frame, &aux, maxv);
-      }
+      for (int i = 0; i < nintra; ++i)
+        av1g_intra_block(&wave.intra[static_cast<size_t>(i)], frame, maxv);
       const int nitx = static_cast<int>(wave.itx.size());
 #if defined(AV1GPU_HAVE_OPENMP)
 #pragma omp parallel for schedule(dynamic, 4)
@@ -164,9 +160,9 @@ class CpuBackend final : public Backend {
       for (int i = 0; i < nitx; ++i) {
         const Av1gItxJob& job = wave.itx[static_cast<size_t>(i)];
         for (int y = 0; y < job.h; ++y)
-          av1g_itx_row(&job, plan.coefficients.data(), tmp.data(), basis, y);
+          av1g_itx_row(&job, plan.coefficients.data(), tmp.data(), y);
         for (int x = 0; x < job.w; ++x)
-          av1g_itx_col_add(&job, tmp.data(), frame, basis, x, maxv);
+          av1g_itx_col_add(&job, tmp.data(), frame, x, maxv);
       }
       const int nres = static_cast<int>(wave.residual.size());
 #if defined(AV1GPU_HAVE_OPENMP)

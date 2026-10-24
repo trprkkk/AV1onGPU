@@ -1,17 +1,12 @@
 /*
  * AV1onGPU - shared tables
  *
- * The transform bases are generated here, on the host, from the exact
- * definitions, and then uploaded once per device. Doing it this way (instead of
- * a hard coded table) keeps the numbers identical on every backend regardless
- * of the maths library the device compiler ships, and makes the orientation
- * obvious: B is the *synthesis* matrix.
- *
- *       inverse:  out[i] = ( sum_k in[k] * B[i][k] + 2048 ) >> 12
- *       forward:  out[k] = ( sum_i in[i] * B[i][k] + 2048 ) >> 12
- *
- * B is orthonormal for the DCT-II (with the sqrt(1/n) / sqrt(2/n) scaling) and
- * for the DST-IV, so the forward transform is exactly the transpose.
+ * What lives here is the host side data the backends share: the subpel filter
+ * weights, the film grain generator, and the colour transforms. The transform
+ * and prediction tables are not here: they are normative, so they are generated
+ * from the specification (tools/gen_kernel_tables.py) and compiled into the
+ * kernel header, which every backend includes. Keeping one copy means the CPU
+ * reference path and the GPU kernels cannot drift apart.
  */
 #include "core/backend.hpp"
 
@@ -23,53 +18,6 @@ namespace av1gpu {
 namespace internal {
 namespace tables {
 namespace {
-
-const int kDctSizes[] = {4, 8, 16, 32, 64};
-const int kDstSizes[] = {4, 8, 16};
-
-struct BasisTable {
-  std::vector<int> data;
-  int dct[65];
-  int adst[65];
-  int idtx[65];
-
-  BasisTable() {
-    std::memset(dct, 0, sizeof(dct));
-    std::memset(adst, 0, sizeof(adst));
-    std::memset(idtx, 0, sizeof(idtx));
-
-    for (int n : kDctSizes) {
-      dct[n] = static_cast<int>(data.size());
-      for (int i = 0; i < n; ++i) {
-        for (int k = 0; k < n; ++k) {
-          const double scale = (k == 0) ? std::sqrt(1.0 / n) : std::sqrt(2.0 / n);
-          const double v = scale * std::cos(M_PI * (2.0 * i + 1.0) * k / (2.0 * n));
-          data.push_back(quantise(v));
-        }
-      }
-    }
-    for (int n : kDstSizes) {
-      adst[n] = static_cast<int>(data.size());
-      for (int i = 0; i < n; ++i) {
-        for (int k = 0; k < n; ++k) {
-          const double v = std::sqrt(2.0 / n) *
-                           std::sin(M_PI * (2.0 * i + 1.0) * (2.0 * k + 1.0) / (4.0 * n));
-          data.push_back(quantise(v));
-        }
-      }
-    }
-    for (int n : kDctSizes) {
-      idtx[n] = static_cast<int>(data.size());
-      for (int i = 0; i < n; ++i)
-        for (int k = 0; k < n; ++k) data.push_back(i == k ? 4096 : 0);
-    }
-  }
-
-  static int quantise(double v) {
-    const double x = v * 4096.0;
-    return static_cast<int>(std::floor(x + 0.5));
-  }
-};
 
 /* ---- subpel filters ---------------------------------------------------- */
 
@@ -136,24 +84,21 @@ struct FilterTable {
 
 } /* namespace */
 
-const std::vector<int>& basis() {
-  static const BasisTable table;
-  return table.data;
-}
-
-int basis_dct(int n) {
-  static const BasisTable table;
-  return n < 65 ? table.dct[n] : -1;
-}
-
-int basis_adst(int n) {
-  static const BasisTable table;
-  return n < 65 ? table.adst[n] : -1;
-}
-
-int basis_identity(int n) {
-  static const BasisTable table;
-  return n < 65 ? table.idtx[n] : -1;
+/* Transform_Row_Shift, keyed by the transform size. The specification indexes
+ * it by txSz; the sizes map to indices in a fixed order, and this is that
+ * order written out as (width, height) pairs. */
+int tx_row_shift(int w, int h) {
+  static const struct {
+    int w, h, shift;
+  } kTable[] = {
+      {4, 4, 0},  {8, 8, 1},   {16, 16, 2}, {32, 32, 3}, {64, 64, 4}, {4, 8, 0},
+      {8, 4, 0},  {8, 16, 1},  {16, 8, 1},  {16, 32, 1}, {32, 16, 1}, {32, 64, 2},
+      {64, 32, 2}, {4, 16, 1}, {16, 4, 1},  {8, 32, 1},  {32, 8, 1},  {16, 64, 2},
+      {64, 16, 2},
+  };
+  for (const auto& e : kTable)
+    if (e.w == w && e.h == h) return e.shift;
+  return 0;
 }
 
 const std::vector<int>& filters() {

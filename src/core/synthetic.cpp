@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <vector>
 
 #include "core/backend.hpp"
@@ -59,29 +60,82 @@ void render_plane(uint16_t* data, int stride, int w, int h, int bd, int frame_in
   }
 }
 
-/* ---- forward transform (transpose of the synthesis basis) ---------------- */
+/* ---- forward transform -------------------------------------------------- */
+/* The synthetic encoder needs a forward transform to make coefficients, but the
+ * decoder's inverse transform is the specification's butterfly network, not a
+ * matrix product. Rather than reusing a generic orthonormal basis (which would
+ * make the encoder and the decoder disagree by a scale factor), the basis here
+ * is the same orthonormal DCT-II *scaled the way AV1 scales it*: the 1D inverse
+ * transform is s(n) * B with s(n) = sqrt(n/2), so the forward pass multiplies by
+ * 1/s(n) = sqrt(2/n), which is exactly 4096/2896 for n = 4 and so on. The row
+ * and column shifts of the inverse are undone by scaling the residual up by
+ * 2^(rowShift + colShift) before the analysis.
+ *
+ * Everything below is derived from that one identity:
+ *
+ *     residual = ( A_w (x) A_h ) / 2^(rowShift + colShift)  applied to coef
+ *     coef     = ( A_w (x) A_h )^-1 * 2^(rowShift + colShift) applied to residual
+ */
 
-void forward_transform(const int* src, int stride, int w, int h, const int* basis_w,
-                       const int* basis_h, int* out) {
-  std::vector<int> tmp(static_cast<size_t>(w) * h, 0);
+/* round-half-away-from-zero division by 2^n, matching Round2 */
+long long round_shift(long long v, int n) {
+  if (n <= 0) return v;
+  const long long half = 1LL << (n - 1);
+  return (v + half) >> n;
+}
+
+const std::vector<int>& dct_basis(int n) {
+  static std::map<int, std::vector<int>> cache;
+  auto it = cache.find(n);
+  if (it != cache.end()) return it->second;
+  std::vector<int> b(static_cast<size_t>(n) * n);
+  for (int i = 0; i < n; ++i) {
+    for (int k = 0; k < n; ++k) {
+      const double scale = (k == 0) ? std::sqrt(1.0 / n) : std::sqrt(2.0 / n);
+      const double v = scale * std::cos(M_PI * (2.0 * i + 1.0) * k / (2.0 * n));
+      b[static_cast<size_t>(i) * n + k] = static_cast<int>(std::floor(v * 4096.0 + 0.5));
+    }
+  }
+  return cache.emplace(n, std::move(b)).first->second;
+}
+
+/* 4096 / sqrt(n / 2), the reciprocal of the factor AV1's 1D transform carries */
+int forward_scale(int n) {
+  switch (n) {
+    case 4: return 2896;
+    case 8: return 2048;
+    case 16: return 1448;
+    case 32: return 1024;
+    default: return 724; /* 64 */
+  }
+}
+
+/* Forward transform of a residual block, producing coefficients scaled the way
+ * the inverse transform expects them. */
+void forward_transform(const int* src, int stride, int w, int h, int* out) {
+  const std::vector<int>& bw = dct_basis(w);
+  const std::vector<int>& bh = dct_basis(h);
+  const int sb = forward_scale(w), sa = forward_scale(h);
+  const int up = 4 + internal::tables::tx_row_shift(w, h);
+  std::vector<long long> tmp(static_cast<size_t>(w) * h, 0);
   /* vertical analysis */
-  for (int x = 0; x < w; ++x) {
+  for (int x = 0; x < w; ++x)
     for (int k = 0; k < h; ++k) {
       long long acc = 0;
-      for (int i = 0; i < h; ++i) acc += static_cast<long long>(src[i * stride + x]) *
-                                        basis_h[i * h + k];
-      tmp[static_cast<size_t>(k) * w + x] = static_cast<int>((acc + 2048) >> 12);
+      for (int i = 0; i < h; ++i) {
+        const long long s = static_cast<long long>(src[static_cast<size_t>(i) * stride + x]) << up;
+        acc += s * bh[static_cast<size_t>(i) * h + k];
+      }
+      tmp[static_cast<size_t>(k) * w + x] = round_shift(acc * sa, 24);
     }
-  }
   /* horizontal analysis */
-  for (int k = 0; k < h; ++k) {
+  for (int k = 0; k < h; ++k)
     for (int j = 0; j < w; ++j) {
       long long acc = 0;
-      for (int i = 0; i < w; ++i) acc += static_cast<long long>(tmp[static_cast<size_t>(k) * w + i]) *
-                                        basis_w[i * w + j];
-      out[k * w + j] = static_cast<int>((acc + 2048) >> 12);
+      for (int i = 0; i < w; ++i)
+        acc += tmp[static_cast<size_t>(k) * w + i] * bw[static_cast<size_t>(i) * w + j];
+      out[k * w + j] = static_cast<int>(round_shift(acc * sb, 24));
     }
-  }
 }
 
 int sad_region(const uint16_t* a, int a_stride, const uint16_t* b, int b_stride, int w,
@@ -132,7 +186,6 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
   const int bs = std::max(4, cfg.block_size);
   const int ts = std::max(4, cfg.transform_size);
   const int maxv = kMaxValue(cfg.bit_depth);
-  const int* basis = internal::tables::basis().data();
   const int* filters = internal::tables::filters().data();
 
   const int blocks_x = (cfg.width + bs - 1) / bs;
@@ -176,13 +229,17 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
           job.dst_stride = stride;
           job.w = w;
           job.h = h;
+          job.x = x;
+          job.y = y;
           job.mode = AV1G_PRED_DC;
           job.bitdepth = cfg.bit_depth;
           job.have_left = block.have_left;
           job.have_above = block.have_above;
-          Av1gIntraAux aux;
-          std::memset(&aux, 0, sizeof(aux));
-          av1g_intra_block(&job, recon.plane(plane), &aux, maxv);
+          job.have_above_right = block.have_left && block.have_above;
+          job.filter_type = -1; /* the encoder writes the edge as it is */
+          job.max_x = recon.plane_width(plane) - 1;
+          job.max_y = recon.plane_height(plane) - 1;
+          av1g_intra_block(&job, recon.plane(plane), maxv);
           for (int yy = 0; yy < h; ++yy)
             std::memcpy(pred.data() + static_cast<size_t>(yy) * w,
                         recon.plane(plane) + off + static_cast<size_t>(yy) * stride,
@@ -272,8 +329,7 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
                 block_res[static_cast<size_t>(yy) * tw + xx] =
                     residual[static_cast<size_t>(ty * th + yy) * w + tx * tw + xx];
             std::vector<int> coef(static_cast<size_t>(tw) * th, 0);
-            forward_transform(block_res.data(), tw, tw, th, basis + internal::tables::basis_dct(tw),
-                              basis + internal::tables::basis_dct(th), coef.data());
+            forward_transform(block_res.data(), tw, tw, th, coef.data());
 
             TransformBlock tblock;
             tblock.x = tx * tw;
@@ -307,14 +363,15 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
             job.dst_stride = stride;
             job.w = tblock.w;
             job.h = tblock.h;
-            job.row_basis = internal::tables::basis_dct(tblock.w);
-            job.col_basis = internal::tables::basis_dct(tblock.h);
+            job.tx_type = static_cast<int>(tblock.tx_type);
             job.eob = tblock.eob;
+            job.row_shift = internal::tables::tx_row_shift(tblock.w, tblock.h);
+            job.bitdepth = cfg.bit_depth;
             std::vector<int> tmp(static_cast<size_t>(tblock.w) * tblock.h, 0);
             for (int yy = 0; yy < tblock.h; ++yy)
-              av1g_itx_row(&job, syntax.coefficients.data(), tmp.data(), basis, yy);
+              av1g_itx_row(&job, syntax.coefficients.data(), tmp.data(), yy);
             for (int xx = 0; xx < tblock.w; ++xx)
-              av1g_itx_col_add(&job, tmp.data(), recon.plane(plane), basis, xx, maxv);
+              av1g_itx_col_add(&job, tmp.data(), recon.plane(plane), xx, maxv);
           }
         }
       }
