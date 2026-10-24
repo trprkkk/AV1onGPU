@@ -56,7 +56,15 @@ void usage() {
       "  --compare F       compare against a planar 8 bit YUV file\n"
       "  --backend B       auto (default), cpu, opencl or cuda\n"
       "  --frames N        stop after N temporal units\n"
-      "  -v, --verbose     print every OBU and every frame\n");
+      "  -v, --verbose     print every OBU and every frame\n"
+      "\n"
+      "debugging, when a frame does not match the reference decoder:\n"
+      "  AV1GPU_DUMP_BLOCKS=N  print the first N planned blocks (plane, position,\n"
+      "                        mode, neighbours, EOB, transform type, coefficients)\n"
+      "  AV1GPU_DUMP_COEF=N    print the dequantised coefficients of block N in\n"
+      "                        raster order, to compare with a reference decoder\n"
+      "  AV1GPU_NO_RESIDUAL=1  decode without any residual, to look at the\n"
+      "                        predictions alone\n");
 }
 
 bool read_file(const std::string& path, std::vector<uint8_t>* data) {
