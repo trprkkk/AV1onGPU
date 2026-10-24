@@ -19,6 +19,8 @@
 
 #include <cstdint>
 
+#include "frontend/block_size.hpp"
+
 namespace av1gpu {
 namespace frontend {
 
@@ -69,16 +71,64 @@ inline int max_tx_depth(TxSize max_tx) {
   return longer < 4 ? longer : 4;
 }
 
-/* The transform used for a chroma plane of a block whose luma transform is
- * `luma`: chroma is subsampled, so the chroma transform is at most the luma
- * one and at most 32x32 (the largest chroma transform AV1 defines). */
-inline TxSize chroma_tx_size(TxSize luma, bool ss_x, bool ss_y) {
-  TxSize out{luma.lw - (ss_x ? 1 : 0), luma.lh - (ss_y ? 1 : 0)};
-  if (out.lw < 0) out.lw = 0;
-  if (out.lh < 0) out.lh = 0;
-  if (out.lw > 3) out.lw = 3;
-  if (out.lh > 3) out.lh = 3;
-  return out;
+/* Subsampled_Size: the size of a chroma plane's residual for a block, indexed
+ * by the block size, the horizontal and the vertical subsampling; entries are
+ * BlockSize numbers and `kBlockSizeCount` marks the combinations the table
+ * declares invalid; the specification never
+ * looks those up, so they are a bug if they are ever reached. The values are the
+ * specification's table, not a formula: a subsampled 8x32 block has a 4x16
+ * chroma residual, not a 4x32 one, because the table caps the aspect ratio. */
+constexpr uint8_t kSubsampledSize[kBlockSizeCount][2][2] = {
+    {{0, 0}, {0, 0}},   /* 4x4 */
+    {{1, 0}, {kBlockSizeCount, 0}},   /* 4x8 */
+    {{2, kBlockSizeCount}, {0, 0}},   /* 8x4 */
+    {{3, 2}, {1, 0}},   /* 8x8 */
+    {{4, 3}, {kBlockSizeCount, 1}},   /* 8x16 */
+    {{5, kBlockSizeCount}, {3, 2}},   /* 16x8 */
+    {{6, 5}, {4, 3}},   /* 16x16 */
+    {{7, 6}, {kBlockSizeCount, 4}},   /* 16x32 */
+    {{8, kBlockSizeCount}, {6, 5}},   /* 32x16 */
+    {{9, 8}, {7, 6}},   /* 32x32 */
+    {{10, 9}, {kBlockSizeCount, 7}},  /* 32x64 */
+    {{11, kBlockSizeCount}, {9, 8}},  /* 64x32 */
+    {{12, 11}, {10, 9}},              /* 64x64 */
+    {{13, 12}, {kBlockSizeCount, 10}}, /* 64x128 */
+    {{14, kBlockSizeCount}, {12, 11}}, /* 128x64 */
+    {{15, 14}, {13, 12}},             /* 128x128 */
+    {{16, 1}, {kBlockSizeCount, 1}},  /* 4x16 */
+    {{17, kBlockSizeCount}, {2, 2}},  /* 16x4 */
+    {{18, 4}, {kBlockSizeCount, 16}}, /* 8x32 */
+    {{19, kBlockSizeCount}, {5, 17}}, /* 32x8 */
+    {{20, 7}, {kBlockSizeCount, 18}}, /* 16x64 */
+    {{21, kBlockSizeCount}, {8, 19}}, /* 64x16 */
+};
+
+/* The block size the residual of `plane` is coded in, or kBlockSizeCount when
+ * the specification's table has no entry for this combination. */
+inline BlockSize plane_residual_size(BlockSize size, int plane, bool ss_x, bool ss_y) {
+  if (size >= kBlockSizeCount) return kBlockSizeCount;
+  const int sub_x = plane > 0 && ss_x ? 1 : 0;
+  const int sub_y = plane > 0 && ss_y ? 1 : 0;
+  return static_cast<BlockSize>(kSubsampledSize[size][sub_x][sub_y]);
+}
+
+/* Get_TX_Size: the transform one plane of a block uses. Luma uses the transform
+ * size the block coded; chroma derives its own from the *block* size (not from
+ * the luma transform), because a chroma plane of a subsampled block covers a
+ * different area, and it is capped at 32x32 - the largest transform AV1 codes
+ * for chroma. A 64 wide or high residual therefore becomes 32x32, 16x32 or
+ * 32x16 depending on which side was long. */
+inline TxSize plane_tx_size(BlockSize size, int plane, TxSize luma_tx, bool ss_x, bool ss_y) {
+  if (plane == 0) return luma_tx;
+  const BlockSize residual = plane_residual_size(size, plane, ss_x, ss_y);
+  if (residual >= kBlockSizeCount) return TxSize{-1, -1}; /* not a valid size */
+  TxSize uv = max_tx_size(block_width4(residual), block_height4(residual));
+  if (uv.lw == 4 || uv.lh == 4) {
+    if (uv.lw == 2) return TxSize{2, 3}; /* 16x32 */
+    if (uv.lh == 2) return TxSize{3, 2}; /* 32x16 */
+    return TxSize{3, 3};                 /* 32x32 */
+  }
+  return uv;
 }
 
 } /* namespace frontend */

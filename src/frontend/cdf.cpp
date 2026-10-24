@@ -17,9 +17,12 @@ void copy_table(A& dst, const B& src) {
 
 } /* namespace */
 
-void init_default_cdf(CdfContext* cdf) {
+void init_default_cdf(CdfContext* cdf, int base_q_idx) {
   if (!cdf) return;
   namespace t = cdf_tables;
+
+  /* the coefficient tables come in four quantiser classes */
+  const int qcat = (base_q_idx > 20) + (base_q_idx > 60) + (base_q_idx > 120);
 
   copy_table(cdf->partition.table, t::partition);
   copy_table(cdf->skip.table, t::skip);
@@ -46,19 +49,19 @@ void init_default_cdf(CdfContext* cdf) {
   copy_table(cdf->mode.txsz, t::txsz);
   copy_table(cdf->mode.txpart, t::txpart);
 
-  copy_table(cdf->coef.eob_bin_16, t::eob_bin_16);
-  copy_table(cdf->coef.eob_bin_32, t::eob_bin_32);
-  copy_table(cdf->coef.eob_bin_64, t::eob_bin_64);
-  copy_table(cdf->coef.eob_bin_128, t::eob_bin_128);
-  copy_table(cdf->coef.eob_bin_256, t::eob_bin_256);
-  copy_table(cdf->coef.eob_bin_512, t::eob_bin_512);
-  copy_table(cdf->coef.eob_bin_1024, t::eob_bin_1024);
-  copy_table(cdf->coef.eob_base_tok, t::eob_base_tok);
-  copy_table(cdf->coef.base_tok, t::base_tok);
-  copy_table(cdf->coef.br_tok, t::br_tok);
-  copy_table(cdf->coef.eob_hi_bit, t::eob_hi_bit);
-  copy_table(cdf->coef.skip, t::coef_skip);
-  copy_table(cdf->coef.dc_sign, t::dc_sign);
+  copy_table(cdf->coef.eob_bin_16, t::eob_bin_16[qcat]);
+  copy_table(cdf->coef.eob_bin_32, t::eob_bin_32[qcat]);
+  copy_table(cdf->coef.eob_bin_64, t::eob_bin_64[qcat]);
+  copy_table(cdf->coef.eob_bin_128, t::eob_bin_128[qcat]);
+  copy_table(cdf->coef.eob_bin_256, t::eob_bin_256[qcat]);
+  copy_table(cdf->coef.eob_bin_512, t::eob_bin_512[qcat]);
+  copy_table(cdf->coef.eob_bin_1024, t::eob_bin_1024[qcat]);
+  copy_table(cdf->coef.eob_base_tok, t::eob_base_tok[qcat]);
+  copy_table(cdf->coef.base_tok, t::base_tok[qcat]);
+  copy_table(cdf->coef.br_tok, t::br_tok[qcat]);
+  copy_table(cdf->coef.eob_hi_bit, t::eob_hi_bit[qcat]);
+  copy_table(cdf->coef.skip, t::coef_skip[qcat]);
+  copy_table(cdf->coef.dc_sign, t::dc_sign[qcat]);
 }
 
 } /* namespace frontend */

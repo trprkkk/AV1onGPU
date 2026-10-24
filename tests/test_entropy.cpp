@@ -339,7 +339,7 @@ void test_real_tile_trace() {
          * out of our own default table rather than the recorded one */
         using namespace av1gpu::frontend;
         CdfContext defaults;
-        init_default_cdf(&defaults);
+        init_default_cdf(&defaults, 0); /* partition rows do not depend on the quantiser */
         const unsigned first =
             decoder.read_symbol(defaults.partition.row(kBlockLevel64x64, 0), 9);
         CHECK_EQ(first, tile_trace::kValue[0]);
@@ -378,7 +378,7 @@ void test_real_tile_trace() {
 void test_default_cdf() {
   using namespace av1gpu::frontend;
   CdfContext cdf;
-  init_default_cdf(&cdf);
+  init_default_cdf(&cdf, 51);
 
   /* the 64x64 partition row dav1d used for the first symbol of the tile */
   const uint16_t* row = cdf.partition.row(kBlockLevel64x64, 0);

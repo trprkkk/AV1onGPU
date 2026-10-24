@@ -152,8 +152,14 @@ struct CdfContext {
   CoefCdf coef;
 };
 
-/* Copies the specification's defaults into `cdf`. */
-void init_default_cdf(CdfContext* cdf);
+/* Copies the specification's defaults into `cdf`.
+ *
+ * `base_q_idx` selects the coefficient table set: AV1 ships four, split at
+ * quantisers 20, 60 and 120, because the shape of a coefficient block changes
+ * a lot with the quantiser (at 20 almost everything is coded, at 120 almost
+ * nothing is). The other tables - partition, modes, motion - have a single
+ * default set. */
+void init_default_cdf(CdfContext* cdf, int base_q_idx);
 
 } /* namespace frontend */
 } /* namespace av1gpu */

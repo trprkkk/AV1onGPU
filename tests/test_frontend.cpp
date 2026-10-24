@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "frontend/bitreader.hpp"
+#include "frontend/coef_tables.hpp"
 #include "frontend/headers.hpp"
 #include "frontend/ivf.hpp"
 #include "frontend/obu.hpp"
@@ -943,8 +944,14 @@ void test_block_geometry() {
   CHECK_EQ(tx_square_class(TxSize{2, 3}), 3);
   CHECK_EQ(tx_min_class(TxSize{2, 3}), 2);
   /* 4:2:0 chroma halves both sides, and never exceeds 32x32 */
-  CHECK(chroma_tx_size(TxSize{4, 4}, true, true) == (TxSize{3, 3}));
-  CHECK(chroma_tx_size(TxSize{0, 0}, true, true) == (TxSize{0, 0}));
+  /* a chroma plane's transform comes from the block size, not the luma one */
+  CHECK(plane_tx_size(kBlock64x64, 1, TxSize{4, 4}, true, true) == (TxSize{3, 3}));
+  CHECK(plane_tx_size(kBlock64x64, 1, TxSize{4, 1}, true, true) == (TxSize{3, 3}));
+  CHECK(plane_tx_size(kBlock4x4, 1, TxSize{0, 0}, true, true) == (TxSize{0, 0}));
+  CHECK(plane_tx_size(kBlock16x16, 1, TxSize{0, 0}, true, true) == (TxSize{1, 1}));
+  /* 4:2:0 turns 4x16 into a 4x8 chroma residual, 16x4 into 8x4 */
+  CHECK(plane_tx_size(kBlock4x16, 1, TxSize{0, 0}, true, true) == (TxSize{0, 1}));
+  CHECK(plane_tx_size(kBlock16x4, 1, TxSize{0, 0}, true, false) == (TxSize{1, 0}));
 }
 
 /* The first block of a real key frame, symbol for symbol. dav1d's trace of this
@@ -1012,13 +1019,11 @@ void test_tile_decoder() {
 
   TileDecodeResult result;
   const ParseStatus status = decode_intra_tile(seq, header, tile, tile_size, &result, &error);
-  /* the block tree and the mode info are read; the residuals are not yet */
-  CHECK(status == ParseStatus::Unsupported);
-  CHECK(!result.complete);
-  CHECK_EQ(result.blocks_needing_residuals, 1);
-  CHECK(result.stop_reason.find("coefficient") != std::string::npos);
-  CHECK_EQ(result.blocks.size(), 1u);
-  if (result.blocks.size() == 1) {
+  CHECK(status == ParseStatus::Ok);
+  CHECK(result.complete);
+  CHECK(result.stop_reason.empty());
+  CHECK(result.blocks.size() > 1u);
+  if (!result.blocks.empty()) {
     const TileBlock& block = result.blocks[0];
     CHECK_EQ(block.mi_row, 0);
     CHECK_EQ(block.mi_col, 0);
@@ -1032,11 +1037,33 @@ void test_tile_decoder() {
     CHECK_EQ(block.qindex, 53);
     CHECK(block.tx_size == (TxSize{3, 3}));
     CHECK(block.has_chroma);
+
+    /* One transform block per plane, and the coefficients dav1d read for
+     * them: a 32x32 luma block with 1014 coded coefficients and two 16x16
+     * chroma blocks with 3 each. */
+    CHECK_EQ(block.transforms.size(), 3u);
+    if (block.transforms.size() == 3) {
+      const TileTransform& y = block.transforms[0];
+      CHECK_EQ(y.plane, 0);
+      CHECK(y.size == (TxSize{3, 3}));
+      CHECK_EQ(y.eob, 1014);
+      CHECK_EQ(y.tx_type, coef_tables::kDctDct);
+      CHECK_EQ(y.level_offset, 0u);
+      for (int plane = 1; plane < 3; ++plane) {
+        const TileTransform& uv = block.transforms[plane];
+        CHECK_EQ(uv.plane, plane);
+        CHECK(uv.size == (TxSize{2, 2}));
+        CHECK_EQ(uv.eob, 3);
+        CHECK_EQ(uv.tx_type, coef_tables::kAdstDct);
+      }
+    }
   }
   /* the split that produced that block was read before it, so the parser had
    * to place the 32x32 block on the grid, not just read symbols in a row */
   CHECK(result.bytes_used > 0);
-  CHECK(result.bytes_used < tile_size);
+  CHECK(result.bytes_used <= tile_size);
+  CHECK(result.transform_blocks > 3);
+  CHECK(result.levels.size() > 1000u);
 
   /* inter frames are refused rather than misparsed */
   TileDecodeResult other;

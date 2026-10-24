@@ -21,11 +21,9 @@
  * consumes the result.
  *
  * Status: key frames (and intra-only frames, which use the same syntax) are
- * parsed. Inter frames need reference frames, motion vectors and the compound
- * syntax, which is a separate body of work; they are reported as unsupported
- * rather than guessed at. Coefficient blocks are not read yet either: parsing
- * stops at the first block that carries residuals and says so, at the exact
- * block and byte, which is what the next layer starts from.
+ * parsed, residuals included. Inter frames need reference frames, motion
+ * vectors and the compound syntax, which is a separate body of work; they are
+ * reported as unsupported rather than guessed at.
  */
 #ifndef AV1GPU_FRONTEND_TILE_DECODER_HPP
 #define AV1GPU_FRONTEND_TILE_DECODER_HPP
@@ -64,6 +62,28 @@ enum IntraMode {
   kModeChromaCount,
 };
 
+/* One transform block: a rectangle of coefficients as the bitstream coded it.
+ *
+ * The parser produces levels, not pixels: the coefficient values in scan order,
+ * dequantised later, plus enough description (plane, position, size, transform
+ * type) for the inverse transform to place and shape them. `level_offset` is
+ * where this block's levels start in TileDecodeResult::levels, so the residual
+ * stage can walk them without re-parsing.
+ *
+ * `eob` is the number of coefficients coded, which for a sparse block is far
+ * smaller than the transform area: everything else is zero and costs nothing.
+ */
+struct TileTransform {
+  int plane = 0;        /* 0 = luma, 1 = Cb, 2 = Cr */
+  TxSize size;          /* 4x4 unless the block says otherwise */
+  int x = 0;            /* top left corner, in pixels */
+  int y = 0;
+  int qindex = 0;       /* the block's quantiser, which sets the dequant step */
+  int tx_type = 0;      /* 2D transform combination, see coef_tables */
+  int eob = 0;
+  size_t level_offset = 0;  /* index of this block's first level in `levels` */
+};
+
 /* One decoded block: the syntax, not the pixels. Coordinates and sizes are in
  * 4x4 units on the frame's mi grid, which is the grid every other stage of the
  * decoder uses. */
@@ -81,6 +101,7 @@ struct TileBlock {
   int uv_angle = 0;
   int cfl_alpha[2] = {0, 0};
   bool filter_intra = false;
+  int filter_intra_mode = 0;
   int palette_size[2] = {0, 0};
   int segment_id = 0;
 
@@ -92,6 +113,10 @@ struct TileBlock {
    * per-plane sizes) comes with the residual layer. */
   TxSize tx_size;
   int qindex = 0;
+
+  /* The residual: one entry per transform block this block carries, in coding
+   * order, and the transform tree they describe. */
+  std::vector<TileTransform> transforms;
 };
 
 /* What one tile produced. */
@@ -103,7 +128,15 @@ struct TileDecodeResult {
   std::string stop_reason;
   bool complete = false;
 
-  /* Blocks that were parsed but carry residuals the parser cannot read yet. */
+  /* The residuals of the whole tile, flattened: each transform block's levels,
+   * in scan order, signed, at their coded magnitude. The engine dequantises. */
+  std::vector<int16_t> levels;
+
+  /* Counters for the tile as a whole. */
+  int transform_blocks = 0;
+  size_t coefficients = 0;
+
+  /* Blocks that were parsed but carry residuals the parser could not read. */
   int blocks_needing_residuals = 0;
 
   /* Range decoder position at the end, for error reporting. */
