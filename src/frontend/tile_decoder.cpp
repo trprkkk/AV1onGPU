@@ -29,6 +29,22 @@ bool trace_enabled() {
 }
 
 void trace_block(const TileBlock& block) {
+  if (block.is_inter) {
+    std::fprintf(stderr,
+                 "B %d %d %d %d cs=%d bs=%d bp=%d intra=0 skip=%d skipmode=%d seg=%d "
+                 "refs=%d,%d mvs=%d,%d,%d,%d mode=%d mm=%d ct=%d drl=%d f=%d,%d "
+                 "wedge=%d sign=%d iitype=%d iimode=%d ytx=%d q=%d\n",
+                 block.mi_col, block.mi_row, block_width4(block.size),
+                 block_height4(block.size), static_cast<int>(block.size),
+                 static_cast<int>(block.size), static_cast<int>(block.partition),
+                 block.skip ? 1 : 0, block.skip_mode ? 1 : 0, block.segment_id,
+                 block.ref_frame[0], block.ref_frame[1], block.mv[0][0], block.mv[0][1],
+                 block.mv[1][0], block.mv[1][1], block.inter_mode, block.motion_mode,
+                 block.compound_type, block.drl_index, block.interp_filter,
+                 block.interp_filter, 0, 0, block.interintra ? 1 : 0, block.interintra_mode,
+                 tx_size_index(block.tx_size), block.qindex);
+    return;
+  }
   std::fprintf(stderr, "B %d %d %d %d cs=%d bs=%d bp=%d intra=1 skip=%d seg=%d y=%d uv=%d "
                "ya=%d uva=%d cfl=%d,%d fi=%d fim=%d pal=%d,%d tx=%d q=%d\n",
                block.mi_col, block.mi_row, block_width4(block.size),
@@ -984,26 +1000,29 @@ class TileParser {
 
     /* read_ref_frames: the reference of a single reference block, as a binary
      * tree over the seven reference types */
+    /* The table's first index is the context and the second the step of the
+     * tree, which is not the order the steps are coded in: the three
+     * second-level tests live in different rows. */
     const int ctx1 = ref_context(row, col, 0);
-    if (decoder_.read_symbol(cdf_.inter.single_ref[0][ctx1], 1)) {
+    if (decoder_.read_symbol(cdf_.inter.single_ref[ctx1][0], 1)) {
       const int ctx2 = ref_context(row, col, 4);
-      if (decoder_.read_symbol(cdf_.inter.single_ref[1][ctx2], 1)) {
+      if (decoder_.read_symbol(cdf_.inter.single_ref[ctx2][1], 1)) {
         block->ref_frame[0] = kRefAltref;
       } else {
         const int ctx3 = ref_context(row, col, 5);
         block->ref_frame[0] =
-            decoder_.read_symbol(cdf_.inter.single_ref[5][ctx3], 1) ? kRefBwdref : kRefAltref2;
+            decoder_.read_symbol(cdf_.inter.single_ref[ctx3][5], 1) ? kRefBwdref : kRefAltref2;
       }
     } else {
       const int ctx2 = ref_context(row, col, 1);
-      if (decoder_.read_symbol(cdf_.inter.single_ref[2][ctx2], 1)) {
+      if (decoder_.read_symbol(cdf_.inter.single_ref[ctx2][2], 1)) {
         const int ctx3 = ref_context(row, col, 3);
-        block->ref_frame[0] = decoder_.read_symbol(cdf_.inter.single_ref[4][ctx3], 1) ? kRefLast3
+        block->ref_frame[0] = decoder_.read_symbol(cdf_.inter.single_ref[ctx3][4], 1) ? kRefLast3
                                                                                       : kRefLast2;
       } else {
         const int ctx3 = ref_context(row, col, 2);
         block->ref_frame[0] =
-            decoder_.read_symbol(cdf_.inter.single_ref[3][ctx3], 1) ? kRefLast2 : kRefLast;
+            decoder_.read_symbol(cdf_.inter.single_ref[ctx3][3], 1) ? kRefLast2 : kRefLast;
       }
     }
     block->ref_frame[1] = kRefIntra;
@@ -1169,6 +1188,12 @@ class TileParser {
       const int nsymbols = kPartitionSymbols[level];
       partition = static_cast<PartitionType>(
           decoder_.read_symbol(cdf_.partition.row(level, ctx), nsymbols));
+      if (trace_enabled()) {
+        const RangeDecoder::State state = decoder_.state();
+        std::fprintf(stderr, "P %d %d bl=%d ctx=%d bp=%d %llu %u %d\n", col, row, level, ctx,
+                     static_cast<int>(partition),
+                     static_cast<unsigned long long>(state.window), state.range, state.count);
+      }
       if (static_cast<int>(partition) > nsymbols) return corrupt("partition");
     } else if (have_cols) {
       const int ctx = partition_context(row, col, level);
@@ -1386,14 +1411,14 @@ class TileParser {
 
     /* palette_mode_info: only for frames that allow screen content tools */
     trace_point(row, col, "uv");
-    if (frame_.allow_screen_content_tools && size >= kBlock8x8 &&
+    if (!block.is_inter && frame_.allow_screen_content_tools && size >= kBlock8x8 &&
         block_width4(size) * 4 <= 64 && block_height4(size) * 4 <= 64) {
       return stop_at_residual(block, "tile: palette mode syntax is not implemented");
     }
 
     /* filter_intra_mode_info */
     trace_point(row, col, "pal");
-    if (block.y_mode == kModeDc && block.palette_size[0] == 0 &&
+    if (!block.is_inter && block.y_mode == kModeDc && block.palette_size[0] == 0 &&
         std::max(log2_w, log2_h) <= 3 && seq_.enable_filter_intra) {
       block.filter_intra = decoder_.read_symbol(cdf_.mode.use_filter_intra[size], 1) != 0;
       if (block.filter_intra) {
@@ -1408,14 +1433,26 @@ class TileParser {
     TxSize tx = max_tx_size(bw4, bh4);
     /* the tx_depth context, for the trace only: -1 when no symbol is coded */
     int tx_size_row = -1, tx_depth_context = -1;
-    if (!frame_.coded_lossless && size > kBlock4x4 && frame_.tx_mode_select) {
-      const int cls = tx_square_class(tx);
-      const int depth_ctx = (above_tx_lw_[col] >= tx.lw ? 1 : 0) + (left_tx_lh_[row] >= tx.lh ? 1 : 0);
-      tx_size_row = cls;
-      tx_depth_context = depth_ctx;
-      const int depth = static_cast<int>(
-          decoder_.read_symbol(cdf_.mode.txsz[cls - 1][depth_ctx], std::min(cls, 2)));
-      for (int i = 0; i < depth; ++i) tx = split_tx_size(tx);
+    if (!block.is_inter) {
+      if (!frame_.coded_lossless && size > kBlock4x4 && frame_.tx_mode_select) {
+        const int cls = tx_square_class(tx);
+        const int depth_ctx =
+            (above_tx_lw_[col] >= tx.lw ? 1 : 0) + (left_tx_lh_[row] >= tx.lh ? 1 : 0);
+        tx_size_row = cls;
+        tx_depth_context = depth_ctx;
+        const int depth = static_cast<int>(
+            decoder_.read_symbol(cdf_.mode.txsz[cls - 1][depth_ctx], std::min(cls, 2)));
+        for (int i = 0; i < depth; ++i) tx = split_tx_size(tx);
+      }
+    } else if (block.skip || !frame_.tx_mode_select || frame_.coded_lossless) {
+      /* A skipped inter block carries no residual, and a frame that does not
+       * switch transform sizes codes none: the block keeps its largest. */
+      if (!block.skip && frame_.coded_lossless) tx = TxSize{0, 0};
+    } else if (tx.lw > 0 || tx.lh > 0) {
+      /* Variable transform size: an inter block of 8x8 or more splits its
+       * transform into a tree of up to four quadrants, each of which may split
+       * again, so the block no longer has a single transform size. */
+      return stop_at_residual(block, "tile: inter variable transform size is not implemented");
     }
     block.tx_size = tx;
     {
@@ -1981,14 +2018,29 @@ ParseStatus decode_tile(const SequenceHeader& seq, const FrameHeader& frame,
   if (!data || size == 0) return fail(error, "tile: no tile data");
   const bool intra_frame = frame.type == FrameType::Key || frame.type == FrameType::IntraOnly;
   if (!intra_frame) {
-    if (frame.use_ref_frame_mvs) {
-      /* the temporal candidates need the reference frames' motion vectors */
-      if (error) *error = "tile: reference frame motion vectors are not implemented";
-      return ParseStatus::Unsupported;
-    }
     if (!refs) {
       if (error) *error = "tile: an inter frame needs its reference frames";
       return ParseStatus::Unsupported;
+    }
+    /* Temporal motion vector candidates come from the motion vectors the
+     * reference frames stored. An intra reference frame has none - every cell
+     * of its projected map is a no-op - so a frame whose references are all
+     * intra can be decoded without implementing the projection. */
+    if (frame.use_ref_frame_mvs) {
+      bool have_inter_reference = false;
+      for (int i = 0; i < 7; ++i) {
+        const int slot = frame.ref_frame_idx[i];
+        if (slot < 0 || slot > 7) continue;
+        const RefSlot& reference = refs->slots[slot];
+        if (reference.valid && reference.type != FrameType::Key &&
+            reference.type != FrameType::IntraOnly) {
+          have_inter_reference = true;
+        }
+      }
+      if (have_inter_reference) {
+        if (error) *error = "tile: projected motion vectors are not implemented";
+        return ParseStatus::Unsupported;
+      }
     }
   }
   if (frame.tiles.cols != 1 || frame.tiles.rows != 1) {

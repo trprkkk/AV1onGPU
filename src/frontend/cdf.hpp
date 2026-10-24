@@ -66,6 +66,12 @@ constexpr int kPartitionCdfSize = 16;
 constexpr int kIntraModes = 13;
 constexpr int kUvIntraModes = 14;
 
+/* The partition table's first index is the *level*, and level 0 is the largest
+ * block: row 0 is the 128x128 table of the annex, row 4 the 8x8 one, which is
+ * the opposite order to the annex's own listing (it prints the 8x8 table
+ * first). Rows are read with `kPartitionSymbols[level]` symbols, fewer at the
+ * larger levels because 128x128 blocks cannot use the 4:1 splits and 8x8
+ * blocks only have the four legacy types. */
 struct PartitionCdf {
   uint16_t table[kBlockLevelCount][kPartitionContexts][kPartitionCdfSize];
 
@@ -96,7 +102,15 @@ struct CoefCdf {
   uint16_t eob_bin_256[2][2][16];
   uint16_t eob_bin_512[2][16];
   uint16_t eob_bin_1024[2][16];
-  /* the token of the last coefficient, then of the ones before it */
+  /* The token of the last coefficient, then of the ones before it.
+   *
+   * The specification sizes the base token table at 42 contexts but the syntax
+   * never reaches the last one (the largest context any coefficient can select
+   * is 40), and the reference decoders therefore carry 41 rows; the 42nd row of
+   * the annex is a value no stream can read. The same holds for the extended
+   * levels: the annex has a slice for each of the five transform classes, but
+   * the largest class codes its levels with the Golomb escape alone, so only
+   * four slices are ever read. */
   uint16_t eob_base_tok[5][2][4][4];
   uint16_t base_tok[5][2][41][4];
   uint16_t br_tok[4][2][21][4];
@@ -175,7 +189,12 @@ struct InterCdf {
   uint16_t compound_mode[8][8];
   uint16_t compound_idx[6][2];
   uint16_t comp_group_idx[6][2];
-  /* blend of two predictors: [block size][distance weighted or wedge] */
+  /* Blend of two predictors: [block size][distance weighted or wedge].
+   *
+   * Two symbols, not four: whether a compound block averages, blends by
+   * distance, wedges or uses a difference mask is coded as three decisions
+   * (average against the rest, then wedge against difference), and this is the
+   * last of them. */
   uint16_t compound_type[kBlockSizeCount][2];
   uint16_t wedge_index[kBlockSizeCount][16];
   /* inter/intra: [size group][2], then the intra mode of the pair */

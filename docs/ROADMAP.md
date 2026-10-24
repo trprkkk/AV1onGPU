@@ -61,11 +61,55 @@ the first symbol of the fixture's key frame.
 
 **Next, in order:**
 
-1. *Inter frames.* Reference handling (the eight slots, the actual sample
-   buffers, `show_existing_frame` output), motion vectors, the compound syntax,
-   and then the engine's inter path: the subpel filters, OBMC and mask compound
-   from the sections below. Frames 1-5 of the fixture are inter frames, so this
-   is what turns a still picture into a video.
+1. *Inter frames.* Frames 1-5 of the fixture are inter frames, so this is what
+   turns a still picture into a video. The syntax side is partly in:
+   `decode_tile` reads an inter frame's blocks, and `TileBlock` carries the
+   reference types, motion vector, inter mode, motion mode and subpel filter.
+   What is in place:
+
+   * the inter frame preamble: skip mode (read, then refused), skip, `cdef`,
+     the per superblock deltas, and either an intra block (whose y and uv modes
+     use the inter frame's own tables) or `is_inter`, the reference tree,
+     the dynamic reference list, the motion vector residual, inter/intra, the
+     motion mode and the subpel filter;
+   * the candidate scan `find_ref_mvs`, ported from the specification: the
+     above and left neighbours with their weights, the top/right and top/left
+     corners, the secondary rows and columns, the global motion filler and the
+     sorting the mode contexts depend on. The per 4x4 motion reference map it
+     reads is filled by `mark_inter`, so the scan walks the same state the
+     specification describes;
+   * a reference store (`RefPool`) that resolves `ref_frame_idx` and knows
+     whether a reference is an intra frame, which is what decides if temporal
+     candidates exist at all.
+
+   What is left, in the order the gateways appear when decoding the fixture:
+
+   * *Variable transform size.* An inter block of 8x8 or more codes a tree of
+     transform splits (up to four quadrants, each splittable again) instead of
+     the single depth symbol an intra block uses. The residual layer assumes one
+     transform size per block, so this needs the tree to produce the list of
+     luma rectangles the coefficient reader walks - and the same for its chroma
+     size.
+   * *Skip mode.* A skipped block takes both references and both motion vectors
+     from the pair of reference frames the frame header names; its context is
+     already tracked (`skip_mode_map_`).
+   * *Compound prediction.* The syntax (reference pair, `comp_group_idx`,
+     `compound_idx`, wedge index and sign) plus the engine's masked blend; the
+     kernels already implement the average and distance blends.
+   * *OBMC and local warped motion*, both of which need neighbour motion
+     vectors from the map that `mark_inter` already fills.
+   * *Projected motion vectors.* `use_ref_frame_mvs` projects the reference
+     frames' stored motion vectors; a stream that sets it currently stops at
+     the tile.
+   * *Reference sample buffers*, the reference refresh in the decoder loop and
+     `show_existing_frame` output.
+
+   Two bugs the block level trace found on the way, worth recording because
+   both are the kind that decodes plausibly and then desynchronises: the single
+   reference tree's table is indexed `[context][step]` (the steps are not in
+   coding order, so three second-level tests live in rows 2, 4 and 5), and
+   filter intra, palette and the transform depth symbol are intra only - an
+   inter block that reads them consumes symbols that belong to the next block.
 2. *A second intra frame to check against.* One reference picture proves a lot
    but it cannot cover filter intra, every transform shape or a 128x128
    superblock; a stream per feature class is cheap insurance and needs an

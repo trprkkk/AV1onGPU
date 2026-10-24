@@ -187,6 +187,9 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
       /* The counter entry is not a probability: a valid one is at most 32, so
        * it contributes no range and always terminates the loop above. Getting
        * here means the table is not an AV1 CDF, and no symbol can be trusted. */
+      if (std::getenv("AV1GPU_TRACE"))
+        std::fprintf(stderr, "CDF-FAIL nsymbols=%d first=%u cdf=%p counter=%u\n", nsymbols,
+                     cdf[0], static_cast<const void*>(cdf), cdf[nsymbols]);
       failed_ = true;
       return 0;
     }

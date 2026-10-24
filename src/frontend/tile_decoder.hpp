@@ -20,10 +20,15 @@
  * into prediction and residuals is the next layer, and the engine below
  * consumes the result.
  *
- * Status: key frames (and intra-only frames, which use the same syntax) are
- * parsed, residuals included. Inter frames need reference frames, motion
- * vectors and the compound syntax, which is a separate body of work; they are
- * reported as unsupported rather than guessed at.
+ * Status: intra frames - key frames and intra-only frames, which share the
+ * syntax - are parsed and decoded completely. An inter frame is parsed far
+ * enough to be compared against the reference decoder block by block: the skip
+ * flags, the intra/inter decision, the reference tree, the motion vector
+ * candidates and residual, the motion mode and the subpel filter. The parts
+ * still missing (variable transform size, skip mode, compound prediction,
+ * overlap and warp, projected motion vectors) stop the tile with a reason
+ * instead of guessing, because a guess consumes the wrong number of symbols and
+ * desynchronises the range decoder.
  */
 #ifndef AV1GPU_FRONTEND_TILE_DECODER_HPP
 #define AV1GPU_FRONTEND_TILE_DECODER_HPP
