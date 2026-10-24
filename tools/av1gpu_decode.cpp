@@ -438,6 +438,27 @@ int main(int argc, char** argv) {
           for (TransformBlock& tx : b.transforms) tx.eob = 0;
       }
 
+      /* Free the slots this frame refreshes but does not predict from before
+       * it is decoded. A frame is allowed to refresh a slot it reads, so the
+       * picture being decoded needs a buffer of its own in that case; letting
+       * the other refresh targets go early keeps the pool from filling up on a
+       * stream that refreshes every slot it can. */
+      for (int i = 0; i < 8; ++i) {
+        if (!(frame.refresh_frame_flags & (1 << i))) continue;
+        bool referenced = false;
+        for (int j = 0; j < 7; ++j) {
+          if (frame.ref_frame_idx[j] == i) {
+            referenced = true;
+            break;
+          }
+        }
+        if (referenced) continue;
+        const int freed = pool_slot[i];
+        pool_slot[i] = -1;
+        pool_picture_valid[i] = false;
+        release_if_unused(freed);
+      }
+
       Frame picture;
       const int slot = decoder->decode_reference(syntax, &picture, &error);
       if (slot < 0) {

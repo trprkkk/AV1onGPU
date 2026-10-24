@@ -30,9 +30,12 @@ double now_ms() {
   return std::chrono::duration<double, std::milli>(clock::now() - start).count();
 }
 
-/* AV1 has eight reference slots, and a stream may keep a different picture
- * in every one of them, so the pool has to be that large. */
-constexpr int kReferenceSlots = 8;
+/* AV1 has eight reference slots, and a stream may keep a different picture in
+ * every one of them. The ninth buffer is the picture being decoded: it cannot
+ * be written into a buffer whose samples the prediction still has to read, and
+ * a frame is allowed to refresh a slot it also predicts from, so the output
+ * always needs a buffer of its own. */
+constexpr int kReferenceSlots = 9;
 
 struct RefFrame {
   bool used = false;

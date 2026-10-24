@@ -151,18 +151,24 @@ the first symbol of the fixture's key frame.
 3. *Restoration.* `loop_restoration` is currently rejected at the frame header;
    the fixture signals it off, so nothing below it has been exercised.
 
-## 2. Subpel filters from the specification
+## 2. Subpel filters from the specification — done
 
-Currently Lanczos-windowed sinc at 1/8 pel. Real streams need the spec's four
-16-phase filter sets, and 1/16 pel motion vector precision. This is a contained
-change in `src/core/tables.cpp` (`FilterTable`) plus the MV scaling in the
-engine; the kernels already read the taps from a table.
+`Subpel_Filters` (six rows: 8 tap regular/smooth/sharp, bilinear, and the 4 tap
+variants), 1/16 pel precision, the two stage rounding of the specification and
+the 1/8 pel motion vectors it is driven with. Inter prediction with a single
+reference and with compound averaging is bit exact against dav1d.
 
 ## 3. Overlapped block motion compensation and masked compound
 
 Wedge/difference masks and OBMC are the two inter tools missing from
 `av1gpu_inter_px`. Both are per-sample blend weights, so they fit the existing
 "one work item per output sample" model without new synchronisation.
+
+Measured on a plain libaom encode (mandelbrot 320x240, every inter tool left at
+its default), the order in which a decoder runs into them is: OBMC (first at
+around frame 31 of 60), then masked compound, then warped motion, plus
+inter/intra compound. Intrabc and palette are the remaining intra tools, and
+they only appear on screen content streams.
 
 ## 4. Spec-conformant film grain
 
