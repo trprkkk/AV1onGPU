@@ -50,18 +50,30 @@ void apply_post_filters_host(Frame* frame, const FrameSyntax& syntax) {
       Av1gCdefJob job;
       std::memset(&job, 0, sizeof(job));
       const int plane = c.plane;
+      const bool chroma = plane > 0;
+      job.x = c.x;
+      job.y = c.y;
       job.src_off = at(plane, c.x, c.y);
       job.src_stride = frame->stride[plane];
       job.dst_off = job.src_off;
       job.dst_stride = job.src_stride;
+      job.luma_off = at(0, chroma ? c.x << syntax.ss_x : c.x,
+                        chroma ? c.y << syntax.ss_y : c.y);
+      job.luma_stride = frame->stride[0];
       job.pri_strength = c.pri_strength;
       job.sec_strength = c.sec_strength;
       job.damping = c.damping;
       job.dir = c.dir;
+      job.uv = chroma ? 1 : 0;
+      job.ss_x = syntax.ss_x;
+      job.ss_y = syntax.ss_y;
       job.bitdepth = frame->bit_depth;
       job.plane_w = frame->plane_width(plane);
       job.plane_h = frame->plane_height(plane);
-      av1g_cdef_block(&job, scratch.plane(plane), frame->plane(plane), maxv);
+      /* the direction is read from the luma of the same snapshot the taps come
+       * from, at the job's luma offset */
+      av1g_cdef_block(&job, scratch.plane(plane), frame->plane(plane),
+                      scratch.plane(0), maxv);
     }
   }
 

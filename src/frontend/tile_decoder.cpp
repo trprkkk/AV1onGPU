@@ -189,6 +189,7 @@ class TileParser {
   size_t bytes_used() const { return decoder_.bytes_used(); }
   bool overrun() const { return decoder_.overrun(); }
   bool failed() const { return decoder_.failed(); }
+  const std::vector<int8_t>& cdef_index() const { return cdef_idx_; }
 
  private:
   int mi_cols() const { return (frame_.frame_width + 3) >> 2; }
@@ -379,12 +380,33 @@ class TileParser {
     const int sctx = skip_context(row, col);
     block.skip = decoder_.read_symbol(cdf_.skip.row(sctx), 1) != 0;
 
-    /* read_cdef: one index per 64x64 (or per 32x32 quadrant with 128x128
-     * superblocks) when the frame codes them at all */
-    if (!block.skip && frame_.cdef.bits > 0) {
-      const int cdef_unit = 16; /* 64x64 */
-      if ((row % cdef_unit) == 0 && (col % cdef_unit) == 0) {
-        decoder_.read_literal(frame_.cdef.bits);
+    /* read_cdef: the first block of a 64x64 that is not skipped carries the
+     * index the whole 64x64 filters with; a 64x64 that only holds skipped
+     * blocks keeps -1 and is not filtered at all. */
+    if (!block.skip && seq_.enable_cdef && !frame_.coded_lossless &&
+        !frame_.allow_intrabc) {
+      const int cdef_unit = 16; /* 64x64 in 4x4 units */
+      const int cr = row / cdef_unit;
+      const int cc = col / cdef_unit;
+      const int cdef_cols = (mi_cols() + cdef_unit - 1) / cdef_unit;
+      const int cdef_rows = (mi_rows() + cdef_unit - 1) / cdef_unit;
+      if (cr < cdef_rows && cc < cdef_cols &&
+          cdef_idx_[static_cast<size_t>(cr) * cdef_cols + cc] < 0) {
+        const int idx = static_cast<int>(decoder_.read_literal(frame_.cdef.bits));
+        const int w4 = block_width4(size), h4 = block_height4(size);
+        /* a 128x128 superblock covers four 64x64 cells; every cell it reaches
+         * takes the same index */
+        const int row_start = cr * cdef_unit;
+        const int col_start = cc * cdef_unit;
+        for (int i = row_start; i < row_start + h4; i += cdef_unit) {
+          for (int j = col_start; j < col_start + w4; j += cdef_unit) {
+            const int cell_r = i / cdef_unit;
+            const int cell_c = j / cdef_unit;
+            if (cell_r < cdef_rows && cell_c < cdef_cols)
+              cdef_idx_[static_cast<size_t>(cell_r) * cdef_cols + cell_c] =
+                  static_cast<int8_t>(idx);
+          }
+        }
       }
     }
 
@@ -966,6 +988,8 @@ class TileParser {
 
   std::vector<uint8_t> mi_size_;
   std::vector<uint8_t> skip_map_;
+  /* cdef_idx per 64x64, -1 until a block that is not skipped reads it */
+  std::vector<int8_t> cdef_idx_;
   std::vector<uint8_t> y_mode_map_;
   std::vector<int8_t> above_tx_lw_;
   std::vector<int8_t> left_tx_lh_;
@@ -985,6 +1009,11 @@ class TileParser {
     above_tx_lw_.assign(static_cast<size_t>(cols), 0);
     left_tx_lh_.assign(static_cast<size_t>(rows), 0);
     tx_type_map_.assign(static_cast<size_t>(cols) * rows, coef_tables::kDctDct);
+    const int cdef_cols = (cols + 15) >> 4;
+    const int cdef_rows = (rows + 15) >> 4;
+    cdef_idx_.assign(static_cast<size_t>(cdef_cols) * cdef_rows, -1);
+    out_->cdef_cols = cdef_cols;
+    out_->cdef_rows = cdef_rows;
     for (int plane = 0; plane < 3; ++plane) {
       const size_t plane_cols = static_cast<size_t>(plane_cols4(plane));
       const size_t plane_rows = static_cast<size_t>(plane_rows4(plane));
@@ -1021,6 +1050,9 @@ ParseStatus decode_intra_tile(const SequenceHeader& seq, const FrameHeader& fram
   TileParser parser(seq, frame, data, size, out, error);
   parser.init_state();
   const ParseStatus status = parser.run();
+  /* the index grid is only read once the tile is done: it is per 64x64, not per
+   * block, and a tile that failed half way through has no plans to feed */
+  out->cdef_idx = parser.cdef_index();
   out->bytes_used = parser.bytes_used();
   out->overrun = parser.overrun();
   if (status == ParseStatus::Ok && parser.failed()) {

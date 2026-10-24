@@ -341,7 +341,7 @@ class CudaBackend final : public Backend {
       int total = 0;
       CUdeviceptr job_mem = 0, pref_mem = 0;
       if (!upload_jobs(plan.cdef, &job_mem, &pref_mem, &total,
-                       [](const Av1gCdefJob&) { return AV1G_CDEF_DIM * AV1G_CDEF_DIM; }))
+                       [](const Av1gCdefJob&) { return 1; }))
         return fail(error, "CDEF job upload failed");
       Launcher a;
       add_mem(a, job_mem);

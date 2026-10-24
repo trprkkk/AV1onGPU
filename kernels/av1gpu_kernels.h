@@ -19,6 +19,8 @@
  *   av1g_xxx_px()   - one sample / one work item  (used by the GPU backends)
  *   av1g_xxx_block()- whole block loop           (used by the CPU backend and
  *                                                  by the unit tests)
+ * CDEF is the exception: it is one work item per block, because its direction
+ * and its strength are properties of the block, not of a sample.
  * Both call the same scalar code, so results are identical by construction.
  *
  * Copyright (c) 2026 AV1onGPU contributors. BSD-3-Clause.
@@ -158,22 +160,29 @@ typedef struct {
   int bitdepth;
 } Av1gDeblockJob;
 
-/* one 8x8 CDEF block */
+/* One CDEF block: eight luma samples square, or the co-located chroma block
+ * (four by four at 4:2:0). The strengths are the frame header's, before the
+ * bit depth shift and before the variance makes them stronger, so that the
+ * kernel can apply the whole of the specification's block process. */
 typedef struct {
-  int src_off;
+  int x, y;         /* the block's origin in its plane, in samples        */
+  int src_off;      /* the samples to filter: the deblocked picture       */
   int src_stride;
-  int dst_off;
+  int dst_off;      /* where the filtered block goes (same picture)       */
   int dst_stride;
-  int pri_strength; /* 0 => copy src to dst                              */
-  int sec_strength;
-  int damping;
-  int dir;          /* 0..7                                              */
+  int luma_off;     /* the co-located luma block, for the direction, in   */
+  int luma_stride;  /* the `luma` buffer the block process is given       */
+  int pri_strength; /* cdef_y_pri_strength / cdef_uv_pri_strength: 4 bits */
+  int sec_strength; /* the secondary strength: 0, 1, 2 or 4               */
+  int damping;      /* CdefDamping                                        */
+  int dir;          /* -1: detect it from the luma, as a decoder does;
+                     * otherwise the direction to filter with (an encoder
+                     * that already knows)                               */
+  int uv;           /* the plane is chroma                                */
+  int ss_x, ss_y;
   int bitdepth;
-  int plane_w, plane_h; /* visible frame size, used to clamp the halo     */
+  int plane_w, plane_h; /* visible plane size, which bounds the halo      */
 } Av1gCdefJob;
-
-/* CDEF works on 8x8 blocks */
-#define AV1G_CDEF_DIM 8
 
 /*
  * Film grain over a rectangular region.  `grain` is a signed pseudo-random
@@ -1421,79 +1430,195 @@ AV1G_HOST_FN void av1g_deblock_job(const Av1gDeblockJob *job, av1g_px *plane, in
 /* CDEF                                                               */
 /* ------------------------------------------------------------------ */
 
-AV1G_FN void av1g_cdef_px(const Av1gCdefJob *job, AV1G_GLOBAL const av1g_px *src,
-                          AV1G_GLOBAL av1g_px *dst, int x, int y, int maxv) {
-  /* direction vectors (dx, dy) for the 8 CDEF directions */
-  const int dirx[8] = {1, 1, 1, -1, -1, -1, 0, 0};
-  const int diry[8] = {1, 0, -1, -1, 0, 1, 1, -1};
-  const int pri_taps[2] = {4, 2};
-  const int sec_taps[2] = {2, 1};
-  const int px = job->dst_off % job->dst_stride + x; /* frame coordinates */
-  const int py = job->dst_off / job->dst_stride + y;
-  const int src_base = job->src_off - job->dst_off; /* same frame, shifted */
-  const int center = (int)src[job->src_off + y * job->src_stride + x];
-  int sum = 0, count = 0, lo = center, hi = center;
-  int k, s, d2;
+AV1G_FN int av1g_floor_log2(int v) {
+  int n = 0;
+  while (v > 1) {
+    v >>= 1;
+    ++n;
+  }
+  return n;
+}
 
-  if (job->pri_strength > 0) {
-    for (k = 0; k < 2; ++k) {
-      for (s = -1; s <= 1; s += 2) {
-        const int xx = px + dirx[job->dir] * (k + 1) * s;
-        const int yy = py + diry[job->dir] * (k + 1) * s;
-        int v;
-        if (xx < 0 || xx >= job->plane_w || yy < 0 || yy >= job->plane_h) continue;
-        v = (int)src[src_base + yy * job->src_stride + xx];
-        /* the second tap is twice as far away: the spec halves its threshold */
-        {
-          const int strength = k ? (job->pri_strength >> 1) : job->pri_strength;
-          sum += pri_taps[k] * av1g_clip(center - v, -strength, strength);
-        }
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-        ++count;
-      }
+/*
+ * The CDEF direction process (7.15.2): which of the eight directions the luma
+ * of this block runs along, and how strongly the samples agree with it. The
+ * eight partial sums are the block projected onto each direction; the cost is
+ * how much energy each projection carries, normalised by the number of samples
+ * it summed so that the longer diagonals are not favoured.
+ */
+AV1G_FN void av1g_cdef_direction(AV1G_GLOBAL const av1g_px *luma, int off,
+                                 int stride, int bitdepth, int *out_dir,
+                                 int *out_var) {
+  const int div_table[9] = {0, 840, 420, 280, 210, 168, 140, 120, 105};
+  int partial[8][15];
+  int cost[8];
+  int i, j, best_cost = 0, dir = 0;
+  const int shift = bitdepth - 8;
+
+  for (i = 0; i < 8; ++i) {
+    cost[i] = 0;
+    for (j = 0; j < 15; ++j) partial[i][j] = 0;
+  }
+  for (i = 0; i < 8; ++i) {
+    for (j = 0; j < 8; ++j) {
+      const int x = (int)(luma[off + i * stride + j] >> shift) - 128;
+      partial[0][i + j] += x;
+      partial[1][i + j / 2] += x;
+      partial[2][i] += x;
+      partial[3][3 + i - j / 2] += x;
+      partial[4][7 + i - j] += x;
+      partial[5][3 - i / 2 + j] += x;
+      partial[6][j] += x;
+      partial[7][i / 2 + j] += x;
     }
-    if (job->sec_strength > 0) {
-      for (d2 = 0; d2 < 2; ++d2) {
-        const int nd = (job->dir + (d2 ? 6 : 2)) & 7;
-        for (k = 0; k < 2; ++k) {
-          for (s = -1; s <= 1; s += 2) {
-            const int xx = px + dirx[nd] * (k + 1) * s;
-            const int yy = py + diry[nd] * (k + 1) * s;
-            int v;
-            if (xx < 0 || xx >= job->plane_w || yy < 0 || yy >= job->plane_h) continue;
-            v = (int)src[src_base + yy * job->src_stride + xx];
-            {
-              const int strength = k ? (job->sec_strength >> 1) : job->sec_strength;
-              sum += sec_taps[k] * av1g_clip(center - v, -strength, strength);
+  }
+  for (i = 0; i < 8; ++i) {
+    cost[2] += partial[2][i] * partial[2][i];
+    cost[6] += partial[6][i] * partial[6][i];
+  }
+  cost[2] *= div_table[8];
+  cost[6] *= div_table[8];
+  for (i = 0; i < 7; ++i) {
+    cost[0] += (partial[0][i] * partial[0][i] + partial[0][14 - i] * partial[0][14 - i]) *
+               div_table[i + 1];
+    cost[4] += (partial[4][i] * partial[4][i] + partial[4][14 - i] * partial[4][14 - i]) *
+               div_table[i + 1];
+  }
+  cost[0] += partial[0][7] * partial[0][7] * div_table[8];
+  cost[4] += partial[4][7] * partial[4][7] * div_table[8];
+  for (i = 1; i < 8; i += 2) {
+    for (j = 0; j < 5; ++j) cost[i] += partial[i][3 + j] * partial[i][3 + j];
+    cost[i] *= div_table[8];
+    for (j = 0; j < 3; ++j)
+      cost[i] += (partial[i][j] * partial[i][j] + partial[i][10 - j] * partial[i][10 - j]) *
+                 div_table[2 * j + 2];
+  }
+  for (i = 0; i < 8; ++i) {
+    if (cost[i] > best_cost) {
+      best_cost = cost[i];
+      dir = i;
+    }
+  }
+  *out_dir = dir;
+  *out_var = (best_cost - cost[(dir + 4) & 7]) >> 10;
+}
+
+/*
+ * The specification's constrain (7.15.3): a tap only pulls a sample towards
+ * itself by up to `threshold`, and less than that the further apart they are,
+ * with `damping` deciding how quickly the pull falls off.
+ */
+AV1G_FN int av1g_cdef_constrain(int diff, int threshold, int damping) {
+  int adj, magnitude;
+  if (!threshold) return 0;
+  adj = damping - av1g_floor_log2(threshold);
+  if (adj < 0) adj = 0;
+  magnitude = diff < 0 ? -diff : diff;
+  magnitude = av1g_clip(threshold - (magnitude >> adj), 0, magnitude);
+  return diff < 0 ? -magnitude : magnitude;
+}
+
+/*
+ * One CDEF block (7.15.1 and 7.15.3): pick the direction and the strength the
+ * block earns, then filter eight samples square (four for chroma at 4:2:0)
+ * from `src` into `dst`.
+ *
+ * The taps come from Cdef_Directions: two primary taps along the detected
+ * direction and four secondary ones at 45 degrees to it, each at one and at two
+ * samples out. Every tap only participates if it lies inside the plane, and the
+ * result is held between the smallest and largest tap it used, which is what
+ * stops CDEF from turning an edge into a ramp.
+ */
+AV1G_FN void av1g_cdef_block(const Av1gCdefJob *job, AV1G_GLOBAL const av1g_px *src,
+                             AV1G_GLOBAL av1g_px *dst,
+                             AV1G_GLOBAL const av1g_px *luma, int maxv) {
+  const int directions[8][2][2] = {
+      {{-1, 1}, {-2, 2}}, {{0, 1}, {-1, 2}}, {{0, 1}, {0, 2}}, {{0, 1}, {1, 2}},
+      {{1, 1}, {2, 2}},   {{1, 0}, {2, 1}},  {{1, 0}, {2, 0}}, {{1, 0}, {2, -1}},
+  };
+  /* a chroma block shares the direction the luma found, remapped for the
+   * subsampling it went through */
+  const int uv_dir[2][2][8] = {
+      {{0, 1, 2, 3, 4, 5, 6, 7}, {1, 2, 2, 2, 3, 4, 6, 0}},
+      {{7, 0, 2, 4, 5, 6, 6, 6}, {0, 1, 2, 3, 4, 5, 6, 7}},
+  };
+  const int pri_taps[2][2] = {{4, 2}, {3, 3}};
+  const int sec_taps[2][2] = {{2, 1}, {2, 1}};
+  const int coeff_shift = job->bitdepth - 8;
+  const int w = job->uv ? (8 >> job->ss_x) : 8;
+  const int h = job->uv ? (8 >> job->ss_y) : 8;
+  const int x0 = job->x; /* frame coordinates, which bound the halo */
+  const int y0 = job->y;
+  int pri_str = job->pri_strength << coeff_shift;
+  int sec_str = job->sec_strength << coeff_shift;
+  int damping = job->damping + coeff_shift - (job->uv ? 1 : 0);
+  int dir = job->dir;
+  int tap_set, i, j, k, sign, doff;
+
+  if (dir < 0) {
+    int y_dir = 0, var = 0;
+    av1g_cdef_direction(luma, job->luma_off, job->luma_stride, job->bitdepth, &y_dir,
+                        &var);
+    if (job->uv) {
+      dir = pri_str == 0 ? 0 : uv_dir[job->ss_x][job->ss_y][y_dir];
+    } else {
+      const int var_str = (var >> 6) ? av1g_min(av1g_floor_log2(var >> 6), 12) : 0;
+      pri_str = var ? ((pri_str * (4 + var_str) + 8) >> 4) : 0;
+      dir = pri_str == 0 ? 0 : y_dir;
+    }
+  }
+  if (pri_str == 0 && sec_str == 0) {
+    /* nothing to filter: the deringed block is the deblocked block */
+    for (i = 0; i < h && y0 + i < job->plane_h; ++i)
+      for (j = 0; j < w && x0 + j < job->plane_w; ++j)
+        dst[job->dst_off + i * job->dst_stride + j] = src[job->src_off + i * job->src_stride + j];
+    return;
+  }
+
+  /* an odd primary strength gets the taps that weight the second sample out
+   * more heavily, which is how the strengths were designed to be paired */
+  tap_set = (pri_str >> coeff_shift) & 1;
+
+  for (i = 0; i < h; ++i) {
+    for (j = 0; j < w; ++j) {
+      const int base = job->src_off + i * job->src_stride + j;
+      const int x = (int)src[base];
+      int sum = 0, lo = x, hi = x;
+      for (k = 0; k < 2; ++k) {
+        for (sign = -1; sign <= 1; sign += 2) {
+          int dy = sign * directions[dir][k][0];
+          int dx = sign * directions[dir][k][1];
+          int px = x0 + j + dx, py = y0 + i + dy;
+          if (px >= 0 && px < job->plane_w && py >= 0 && py < job->plane_h) {
+            const int p = (int)src[base + dy * job->src_stride + dx];
+            sum += pri_taps[tap_set][k] * av1g_cdef_constrain(p - x, pri_str, damping);
+            lo = av1g_min(lo, p);
+            hi = av1g_max(hi, p);
+          }
+          for (doff = -2; doff <= 2; doff += 4) {
+            const int sdir = (dir + doff) & 7;
+            dy = sign * directions[sdir][k][0];
+            dx = sign * directions[sdir][k][1];
+            px = x0 + j + dx;
+            py = y0 + i + dy;
+            if (px >= 0 && px < job->plane_w && py >= 0 && py < job->plane_h) {
+              const int s = (int)src[base + dy * job->src_stride + dx];
+              sum += sec_taps[tap_set][k] * av1g_cdef_constrain(s - x, sec_str, damping);
+              lo = av1g_min(lo, s);
+              hi = av1g_max(hi, s);
             }
-            if (v < lo) lo = v;
-            if (v > hi) hi = v;
-            ++count;
           }
         }
       }
+      /* a frame that is not a whole number of blocks wide has a partial block
+       * at its edge: filter the samples that exist, leave the rest alone */
+      if (x0 + j >= job->plane_w || y0 + i >= job->plane_h) continue;
+      dst[job->dst_off + i * job->dst_stride + j] =
+          (av1g_px)av1g_clip_px(av1g_clip(x + ((8 + sum - (sum < 0)) >> 4), lo, hi), maxv);
     }
   }
-
-  {
-    int out = center;
-    if (count > 0) out = av1g_clip_px(av1g_clip(center + av1g_rshift_rnd((long long)sum, 4),
-                                                lo, hi), maxv);
-    dst[job->dst_off + y * job->dst_stride + x] = (av1g_px)out;
-  }
 }
 
-#if !defined(AV1G_DEVICE)
-AV1G_HOST_FN void av1g_cdef_block(const Av1gCdefJob *job, const av1g_px *src,
-                             av1g_px *dst, int maxv) {
-  int x, y;
-  for (y = 0; y < 8; ++y)
-    for (x = 0; x < 8; ++x)
-      av1g_cdef_px(job, src, dst, x, y, maxv);
-}
-
-#endif
 /* ------------------------------------------------------------------ */
 /* film grain                                                         */
 /* ------------------------------------------------------------------ */

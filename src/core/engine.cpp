@@ -404,14 +404,25 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
       Av1gCdefJob job;
       std::memset(&job, 0, sizeof(job));
       const int plane = c.plane;
+      const bool chroma = plane > 0;
+      job.x = c.x;
+      job.y = c.y;
       job.src_off = at(plane, c.x, c.y);
       job.src_stride = g.stride[plane];
       job.dst_off = job.src_off;
       job.dst_stride = g.stride[plane];
+      /* the direction always comes from the luma, so a chroma block carries the
+       * luma block it is co-located with */
+      job.luma_off = at(0, chroma ? c.x << geom.ss_x : c.x,
+                        chroma ? c.y << geom.ss_y : c.y);
+      job.luma_stride = g.stride[0];
       job.pri_strength = c.pri_strength;
       job.sec_strength = c.sec_strength;
       job.damping = c.damping;
       job.dir = c.dir;
+      job.uv = chroma ? 1 : 0;
+      job.ss_x = geom.ss_x;
+      job.ss_y = geom.ss_y;
       job.bitdepth = geom.bit_depth;
       job.plane_w = g.plane_w[plane];
       job.plane_h = g.plane_h[plane];

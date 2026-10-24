@@ -418,22 +418,33 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
 
   /* ---- CDEF ------------------------------------------------------------- */
   if (cfg.cdef) {
-    const int strength = std::max(1, cfg.qstep / 2);
-    for (int p = 0; p < (cfg.chroma_420 ? 3 : 1); ++p) {
-      const int shift = p ? ss : 0;
-      const int pw = recon.plane_width(p);
-      const int ph = recon.plane_height(p);
-      for (int y = 0; y + 8 <= ph; y += 8) {
-        for (int x = 0; x + 8 <= pw; x += 8) {
-          CdefBlock c;
-          c.plane = p;
-          c.x = x;
-          c.y = y;
-          c.pri_strength = std::max(0, strength - shift * 2);
-          c.sec_strength = std::max(0, strength / 2 - shift);
-          c.damping = 3 + shift;
-          c.dir = ((x * 3 + y * 5) >> 6) & 7;
-          syntax.cdef.push_back(c);
+    /* The strengths are the frame header's: four bits of primary and two of
+     * secondary strength, where 3 means 4. CDEF works on 8x8 luma blocks and
+     * on the chroma block each of them is co-located with, and it finds the
+     * direction itself, so no direction is set here. */
+    int pri = std::max(1, cfg.qstep / 2);
+    if (pri > 15) pri = 15;
+    int sec = (std::max(1, cfg.qstep) / 2) & 3;
+    if (sec == 3) sec = 4;
+    const int planes = cfg.chroma_420 ? 3 : 1;
+    for (int y = 0; y + 8 <= cfg.height; y += 8) {
+      for (int x = 0; x + 8 <= cfg.width; x += 8) {
+        CdefBlock c;
+        c.plane = 0;
+        c.x = x;
+        c.y = y;
+        c.pri_strength = pri;
+        c.sec_strength = sec;
+        c.damping = 3;
+        c.dir = -1; /* find it, like a decoder */
+        syntax.cdef.push_back(c);
+        if (planes < 3) continue;
+        for (int p = 1; p < 3; ++p) {
+          CdefBlock u = c;
+          u.plane = p;
+          u.x = x >> ss;
+          u.y = y >> ss;
+          syntax.cdef.push_back(u);
         }
       }
     }

@@ -706,17 +706,21 @@ void test_filters() {
     std::vector<uint16_t> dst(src.size(), 0);
     Av1gCdefJob job;
     std::memset(&job, 0, sizeof(job));
+    job.x = 8;
+    job.y = 8;
     job.src_off = 8 * stride + 8;
     job.src_stride = stride;
     job.dst_off = 8 * stride + 8;
     job.dst_stride = stride;
+    job.luma_off = job.src_off;
+    job.luma_stride = stride;
     job.pri_strength = 4;
     job.sec_strength = 2;
     job.dir = 1;
     job.bitdepth = 8;
     job.plane_w = size;
     job.plane_h = size;
-    av1g_cdef_block(&job, src.data(), dst.data(), 255);
+    av1g_cdef_block(&job, src.data(), dst.data(), src.data(), 255);
     bool flat = true;
     for (int y = 0; y < 8; ++y)
       for (int x = 0; x < 8; ++x)

@@ -46,6 +46,7 @@
 
 #include "av1gpu/av1gpu.hpp"
 #include "frontend/block_size.hpp"
+#include "frontend/cdef.hpp"
 #include "frontend/coef_model.hpp"
 #include "frontend/deblock.hpp"
 #include "frontend/dequant.hpp"
@@ -375,6 +376,11 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
    * blocks: whether an edge is filtered depends on the transform sizes on both
    * sides of it and on the block that owns it. */
   if (!plan_deblock(seq, frame, tile, out, error)) return false;
+
+  /* CDEF works on the deblocked picture and on nothing the bitstream says about
+   * the direction, so all this stage decides is which blocks filter and with
+   * which of the header's parameter sets. */
+  if (!plan_cdef(seq, frame, tile, out, error)) return false;
 
   return true;
 }

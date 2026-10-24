@@ -51,25 +51,15 @@ __kernel void av1g_k_itx_cols(__global const Av1gItxJob *jobs,
 }
 
 /* --------------------------------------------------------------- prediction */
-__kernel void av1g_k_intra_aux(__global const Av1gIntraJob *jobs, int njobs,
-                               __global const av1g_px *plane,
-                               __global Av1gIntraAux *aux) {
-  const int j = (int)get_global_id(0);
-  if (j >= njobs) return;
-  Av1gIntraJob job = jobs[j];
-  av1g_intra_aux(&job, plane, aux + j);
-}
-
-/* One work item per block: intra prediction is a whole-block operation now,
+/* One work item per block: intra prediction is a whole-block operation,
  * because the edge filtering and the recursive predictor look at more than one
  * sample around the position being predicted. */
 __kernel void av1g_k_intra(__global const Av1gIntraJob *jobs, int njobs,
-                           __global av1g_px *plane,
-                           __global const Av1gIntraAux *aux, int maxv) {
+                           __global av1g_px *plane, int maxv) {
   const int j = (int)get_global_id(0);
   if (j >= njobs) return;
   Av1gIntraJob job = jobs[j];
-  av1g_intra_block(&job, plane, aux + j, maxv);
+  av1g_intra_block(&job, plane, maxv);
 }
 
 __kernel void av1g_k_inter(__global const Av1gInterJob *jobs,
@@ -109,8 +99,11 @@ __kernel void av1g_k_cdef(__global const Av1gCdefJob *jobs,
                           int maxv) {
   AV1G_JOB_LOOKUP(job_idx, elem);
   Av1gCdefJob job = jobs[job_idx];
-  av1g_cdef_px(&job, src, dst, elem & (AV1G_CDEF_DIM - 1),
-               elem / AV1G_CDEF_DIM, maxv);
+  /* one work item per block: the direction, the strength it earns and the
+   * copy for a block with no strength are all per block, not per sample */
+  /* src and dst are the picture; the luma of the same snapshot is where the
+   * direction is read from, at the job's luma_off */
+  av1g_cdef_block(&job, src, dst, src, maxv);
 }
 
 __kernel void av1g_k_grain(__global const Av1gGrainJob *jobs,

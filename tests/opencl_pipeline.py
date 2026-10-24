@@ -175,7 +175,7 @@ class Replay:
         global_size = ((elements + local - 1) // local) * local
         self.cl.enqueue_nd_range_kernel(self.queue, kernel, (global_size,), (local,))
 
-    def decode(self, plan, aux_bytes, basis_buf, filter_buf, ref_pool):
+    def decode(self, plan, filter_buf, ref_pool):
         """Decodes one frame; returns a device buffer holding the result."""
         cl, np, mf = self.cl, self.np, self.cl.mem_flags
         maxv = plan["maxv"]
@@ -189,7 +189,6 @@ class Replay:
         tmp_buf = self.buffer(np.zeros(max(len(coef), len(residual)), dtype=np.int32),
                               readonly=False)
         frame = self.buffer(np.zeros(size, dtype=np.uint16), readonly=False)
-        aux = cl.Buffer(self.context, mf.READ_WRITE, aux_bytes)
 
         for wave in plan["waves"]:
             # ---- inter prediction (reads the reference pool) --------------
@@ -207,15 +206,12 @@ class Replay:
                             (job_buf, pref, np.int32(len(jobs)), np.int32(total),
                              ref_pool, ref_pool, frame, filter_buf, np.int32(maxv)))
 
-            # ---- intra prediction (aux pass first, then the blocks) --------
+            # ---- intra prediction: one work item per block -----------------
             if wave["intra"]:
                 jobs = wave["intra"]
-                job_buf, pref, total = self.jobs(jobs, [j.w * j.h for j in jobs])
-                self.launch("av1g_k_intra_aux", len(jobs),
-                            (job_buf, np.int32(len(jobs)), frame, aux))
-                self.launch("av1g_k_intra", total,
-                            (job_buf, pref, np.int32(len(jobs)), np.int32(total), frame,
-                             aux, np.int32(maxv)))
+                job_buf, pref, total = self.jobs(jobs, [1] * len(jobs))
+                self.launch("av1g_k_intra", len(jobs),
+                            (job_buf, np.int32(len(jobs)), frame, np.int32(maxv)))
 
             # ---- inverse transform: rows then columns ----------------------
             if wave["itx"]:
@@ -224,10 +220,10 @@ class Replay:
                 col_pref, cols = self.prefix([j.w for j in jobs])
                 self.launch("av1g_k_itx_rows", rows,
                             (job_buf, row_pref, np.int32(len(jobs)), np.int32(rows),
-                             coef_buf, tmp_buf, basis_buf))
+                             coef_buf, tmp_buf))
                 self.launch("av1g_k_itx_cols", cols,
                             (job_buf, col_pref, np.int32(len(jobs)), np.int32(cols),
-                             tmp_buf, frame, basis_buf, np.int32(maxv)))
+                             tmp_buf, frame, np.int32(maxv)))
 
             # ---- raw residual ----------------------------------------------
             if wave["residual"]:
@@ -250,8 +246,9 @@ class Replay:
         # ---- CDEF works from a snapshot and writes the frame ---------------
         if plan["cdef"]:
             jobs = plan["cdef"]
-            job_buf, pref, total = self.jobs(
-                jobs, [CDEF_DIM * CDEF_DIM] * len(jobs))
+            # one work item per block: the direction, the strength it earns and
+            # the copy for a block with no strength are all per block
+            job_buf, pref, total = self.jobs(jobs, [1] * len(jobs))
             snapshot = self.buffer(np.zeros(size, dtype=np.uint16), readonly=False)
             cl.enqueue_copy(self.queue, snapshot, frame)
             self.launch("av1g_k_cdef", total,
@@ -359,11 +356,10 @@ def main():
     queue = cl.CommandQueue(context)
     program = cl.Program(context, selftest.build_source()).build(["-cl-std=CL2.0"])
 
-    layouts, _basis_offsets, tables = selftest.run_probe()
+    layouts, tables = selftest.run_probe()
     replay = Replay(cl, np, context, queue, program)
     mf = cl.mem_flags
 
-    basis_buf = replay.buffer(np.array(tables["basis"], dtype=np.int32))
     filter_buf = replay.buffer(np.array(tables["filters"], dtype=np.int32))
 
     frames = args.frames
@@ -386,11 +382,6 @@ def main():
         plans = [read_plan(os.path.join(work, "frame_%d.plan" % f), layouts)
                  for f in range(frames)]
         manifest = read_manifest(os.path.join(work, "manifest.txt"))
-        # one aux slot per intra job, plus the padding the backend adds
-        aux_bytes = 64 + max(
-            [ctypes.sizeof(layouts["Av1gIntraAux"]) * len(wave["intra"])
-             for plan in plans for wave in plan["waves"]] + [64])
-
         # one flat pool, `REFERENCE_SLOTS` frames deep, exactly like the backend
         size = plans[0]["buffer_size"]
         if any(plan["buffer_size"] != size for plan in plans):
@@ -412,7 +403,7 @@ def main():
                                 (index, missing))
                 break
 
-            decoded_buf = replay.decode(plan, aux_bytes, basis_buf, filter_buf, ref_pool)
+            decoded_buf = replay.decode(plan, filter_buf, ref_pool)
             decoded = replay.read(decoded_buf, size)
             expected = np.fromfile(os.path.join(work, "frame_%d.yuv16" % index),
                                    dtype=np.uint16)

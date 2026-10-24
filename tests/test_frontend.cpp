@@ -15,6 +15,7 @@
 
 #include "av1gpu/av1gpu.hpp"
 #include "frontend/bitreader.hpp"
+#include "frontend/cdef.hpp"
 #include "frontend/coef_tables.hpp"
 #include "frontend/dequant.hpp"
 #include "frontend/headers.hpp"
@@ -1180,14 +1181,47 @@ void test_tile_decoder() {
                 static_cast<int>(syntax.deblock.size()), deblock_planes[0],
                 deblock_planes[1], deblock_planes[2]);
 
+    /* ---- the CDEF plan ----------------------------------------------------- */
+    /* Frame 0 signals luma strength 0 and chroma strength 60, so every entry in
+     * the plan is chroma: one per eight by eight luma block, which at 4:2:0 is a
+     * four by four block of each chroma plane, that is not entirely skipped. A plane whose strength is zero has nothing to filter,
+     * which is why the luma plane contributes nothing here, and a block whose
+     * four 4x4 cells are all skipped is dropped, so the plan is not simply the
+     * whole grid. The strengths stay at their base value: the variance that
+     * scales them and the direction the kernel needs both come from the
+     * deblocked samples, which only the device has. */
+    CHECK(!syntax.cdef.empty());
+    int cdef_planes[3] = {0, 0, 0};
+    const int chroma_w = (w + 1) >> 1, chroma_h = (h + 1) >> 1;
+    for (const av1gpu::CdefBlock& c : syntax.cdef) {
+      CHECK(c.plane == 1 || c.plane == 2);
+      CHECK_EQ(c.x % 4, 0);
+      CHECK_EQ(c.y % 4, 0);
+      CHECK_EQ(c.pri_strength, av1gpu::frontend::cdef_primary_strength(60));
+      CHECK_EQ(c.sec_strength, av1gpu::frontend::cdef_secondary_strength(60));
+      CHECK_EQ(c.damping, 3);
+      CHECK_EQ(c.dir, -1); /* the kernel detects the direction */
+      /* the block may be cut short by an odd frame size, so only its origin has
+       * to be inside the plane; both sizes here happen to be multiples of four */
+      CHECK(c.x >= 0 && c.x < chroma_w);
+      CHECK(c.y >= 0 && c.y < chroma_h);
+      ++cdef_planes[c.plane];
+    }
+    CHECK(cdef_planes[1] > 0 && cdef_planes[2] > 0);
+    /* chroma blocks are planned in pairs, so the two planes always agree */
+    CHECK_EQ(cdef_planes[1], cdef_planes[2]);
+    std::printf("  %d cdef block(s), %d/%d/%d per plane\n",
+                static_cast<int>(syntax.cdef.size()), cdef_planes[0],
+                cdef_planes[1], cdef_planes[2]);
+
     /* ---- the reconstruction ------------------------------------------------ */
     /* The engine's own arithmetic, on the syntax of a real frame, compared with
-     * dav1d's reference picture for it. dav1d was run with the deblocking filter
-     * as its only in-loop filter, and the two pictures are bit identical; the
-     * hash below is that picture, so any change in parsing, prediction, chroma
-     * from luma, the inverse transforms or the filter that costs a single least
-     * significant bit fails here. (Without the filter the plane hash is
-     * 0x6112581932b92e2c.) */
+     * dav1d's reference picture for it. dav1d was run with every in-loop filter
+     * it has (this stream signals restoration off, so that is deblocking plus
+     * CDEF) and the two pictures are bit identical; the hash below is that
+     * picture, so any change in parsing, prediction, chroma from luma, the
+     * inverse transforms, the deblocking filter or CDEF that costs a single
+     * least significant bit fails here. */
     av1gpu::BackendOptions options;
     options.kind = av1gpu::BackendKind::Cpu;
     std::string decode_error;
@@ -1213,7 +1247,7 @@ void test_tile_decoder() {
                 static_cast<unsigned long long>(hash), cfl_blocks);
     /* dav1d's picture, plane by plane, 8 bits per sample, is this frame:
      * 320x240 luma then 160x120 of each chroma plane. */
-    CHECK_EQ(hash, 0x4fbc46962fc5e371ULL);
+    CHECK_EQ(hash, 0xc7affd541d516823ULL);
 
     /* ---- a much stronger filter, from the same tile data ------------------- */
     /* The levels are the only thing frame 0's levels of 2 and 1 leave out: at
@@ -1221,9 +1255,10 @@ void test_tile_decoder() {
      * are uncompressed header syntax, six bits each, so they can be patched in
      * place without shifting a single tile byte - and the tile decode above
      * stays valid, because nothing in the tile depends on them. Each variant's
-     * hash is dav1d's output for the patched file (deblocking filter enabled,
-     * the other in-loop filters off), so the wide filters, the flat masks and
-     * the per pass, per plane level selection are all compared sample for
+     * hash is dav1d's output for the patched file with all of its in-loop
+     * filters on (the CDEF parameters are untouched, so only the deblocking
+     * levels differ between the variants), so the wide filters, the flat masks
+     * and the per pass, per plane level selection are all compared sample for
      * sample against a reference decoder. */
     auto decode_with_levels = [&](const int levels[4], FrameSyntax* out_syntax,
                                   av1gpu::Frame* out_picture, uint64_t* out_hash) {
@@ -1289,7 +1324,7 @@ void test_tile_decoder() {
     if (strong_hash) {
       /* 15666 of the luma samples move here, up to 11 away from the unfiltered
        * picture, so this covers far more of the filter than level 2 does. */
-      CHECK_EQ(strong_hash, 0x5301b2a20f51ba8fULL);
+      CHECK_EQ(strong_hash, 0x1b7bc234e2ac9e1cULL);
       for (const av1gpu::DeblockEdge& e : strong_syntax.deblock) CHECK_EQ(e.level, 63);
     }
 
@@ -1301,7 +1336,7 @@ void test_tile_decoder() {
     uint64_t mixed_hash = 0;
     CHECK(decode_with_levels(mixed, &mixed_syntax, &mixed_picture, &mixed_hash));
     if (mixed_hash) {
-      CHECK_EQ(mixed_hash, 0xbecedc2b0af15ddaULL);
+      CHECK_EQ(mixed_hash, 0xc5f375c546ed4a6dULL);
       for (const av1gpu::DeblockEdge& e : mixed_syntax.deblock) {
         const int want = e.plane == 0 ? (e.vertical ? mixed[0] : mixed[1])
                                       : (e.plane == 1 ? mixed[2] : mixed[3]);

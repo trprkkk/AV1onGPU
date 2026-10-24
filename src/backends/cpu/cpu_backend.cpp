@@ -200,7 +200,8 @@ class CpuBackend final : public Backend {
 #pragma omp parallel for schedule(dynamic, 8)
 #endif
       for (int i = 0; i < n; ++i)
-        av1g_cdef_block(&plan.cdef[static_cast<size_t>(i)], scratch_.data(), frame, maxv);
+        av1g_cdef_block(&plan.cdef[static_cast<size_t>(i)], scratch_.data(), frame,
+                        scratch_.data(), maxv);
     }
     {
       const int n = static_cast<int>(plan.grain.size());

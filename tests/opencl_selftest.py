@@ -32,6 +32,7 @@ KERNELS = os.path.join(ROOT, "kernels")
 PROBE = r"""
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include "core/backend.hpp"
 #include "av1gpu_kernels.h"
@@ -40,6 +41,17 @@ static void emit(const std::vector<int>& v, const char* name) {
   std::printf("{\"table\":\"%s\",\"data\":[", name);
   for (size_t i = 0; i < v.size(); ++i)
     std::printf("%s%d", i ? "," : "", v[i]);
+  std::printf("]}\n");
+}
+/* the host build of the kernel that the device has to agree with, sample for
+ * sample: the whole point of this project is that both are the same code */
+static void emit_plane(const char* what, const uint16_t* plane, int stride, int x,
+                       int y, int w, int h) {
+  std::printf("{\"host\":\"%s\",\"data\":[", what);
+  for (int i = 0; i < h; ++i)
+    for (int j = 0; j < w; ++j)
+      std::printf("%s%d", i || j ? "," : "",
+                  (int)plane[(size_t)(y + i) * stride + x + j]);
   std::printf("]}\n");
 }
 #define F(T, f) std::printf("{\"struct\":\"%s\",\"field\":\"%s\",\"offset\":%zu}\n", #T, #f, offsetof(T, f))
@@ -51,28 +63,109 @@ static void emit(const std::vector<int>& v, const char* name) {
 
 int main() {
   using namespace av1gpu::internal;
-  for (int n = 4; n <= 64; n *= 2)
-    std::printf("{\"basis_dct\":%d,\"offset\":%d}\n", n, tables::basis_dct(n));
-  for (int n = 4; n <= 16; n *= 2)
-    std::printf("{\"basis_adst\":%d,\"offset\":%d}\n", n, tables::basis_adst(n));
-  for (int n = 4; n <= 64; n *= 2)
-    std::printf("{\"basis_idtx\":%d,\"offset\":%d}\n", n, tables::basis_identity(n));
-  emit(tables::basis(), "basis");
+
+  /* ------------------------------------------------------------- tables */
   emit(tables::filters(), "filters");
 
+  /* ------------------------------------------------- inverse transform */
+  /* one DC coefficient in an 8x8 DCT_DCT: the same job the test runs on the
+   * device, with the result the host build of the kernel produces */
+  {
+    const int stride = 32, size = 32;
+    std::vector<int> coef(8 * 8 + 8, 0);
+    coef[0] = 8 * 8;
+    std::vector<int> tmp(8 * 8 + 8, 0);
+    std::vector<uint16_t> plane((size_t)stride * size, 0);
+    Av1gItxJob job;
+    std::memset(&job, 0, sizeof(job));
+    job.dst_off = 8 * stride + 8;
+    job.dst_stride = stride;
+    job.w = 8;
+    job.h = 8;
+    job.tx_type = AV1G_TX_DCT_DCT;
+    job.eob = 8 * 8;
+    job.row_shift = tables::tx_row_shift(8, 8);
+    job.bitdepth = 8;
+    for (int r = 0; r < 8; ++r) av1g_itx_row(&job, coef.data(), tmp.data(), r);
+    for (int c = 0; c < 8; ++c)
+      av1g_itx_col_add(&job, tmp.data(), plane.data(), c, 255);
+    emit_plane("itx", plane.data(), stride, 8, 8, 8, 8);
+  }
+
+  /* ------------------------------------------------------ intra, DC only */
+  {
+    const int stride = 32, size = 32;
+    std::vector<uint16_t> plane((size_t)stride * size, 0);
+    for (int x = 0; x < 8; ++x) plane[7 * stride + 8 + x] = 100;
+    plane[7 * stride + 7] = 100;
+    for (int y = 0; y < 8; ++y) plane[(8 + y) * stride + 7] = 200;
+    Av1gIntraJob job;
+    std::memset(&job, 0, sizeof(job));
+    job.dst_off = 8 * stride + 8;
+    job.dst_stride = stride;
+    job.x = 8;
+    job.y = 8;
+    job.w = 8;
+    job.h = 8;
+    job.mode = AV1G_PRED_DC;
+    job.bitdepth = 8;
+    job.have_left = 1;
+    job.have_above = 1;
+    job.filter_type = -1;
+    job.max_x = stride - 1;
+    job.max_y = size - 1;
+    av1g_intra_block(&job, plane.data(), 255);
+    emit_plane("intra", plane.data(), stride, 8, 8, 8, 8);
+  }
+
+  /* ---------------------------------------------------------------- cdef */
+  /* a block of noise, filtered with the frame header's strengths: the kernel
+   * has to find the direction itself, exactly as a decoder does */
+  {
+    const int stride = 32, size = 32;
+    std::vector<uint16_t> src((size_t)stride * size, 0), dst;
+    for (int y = 0; y < size; ++y)
+      for (int x = 0; x < stride; ++x)
+        src[(size_t)y * stride + x] = (uint16_t)(128 + (((x * 5 + y * 11) * 7 + 3) % 17) - 8);
+    dst = src;
+    Av1gCdefJob job;
+    std::memset(&job, 0, sizeof(job));
+    job.x = 8;
+    job.y = 8;
+    job.src_off = 8 * stride + 8;
+    job.src_stride = stride;
+    job.dst_off = job.src_off;
+    job.dst_stride = stride;
+    job.luma_off = job.src_off;
+    job.luma_stride = stride;
+    job.pri_strength = 8;
+    job.sec_strength = 0;
+    job.damping = 3;
+    job.dir = -1;
+    job.bitdepth = 8;
+    job.plane_w = stride;
+    job.plane_h = size;
+    av1g_cdef_block(&job, src.data(), dst.data(), src.data(), 255);
+    emit_plane("cdef", dst.data(), stride, 8, 8, 8, 8);
+  }
+
+  /* ------------------------------------------------------------- layouts */
   S(Av1gItxJob);
   F(Av1gItxJob, coef_off); F(Av1gItxJob, tmp_off); F(Av1gItxJob, dst_off);
   F(Av1gItxJob, dst_stride); F(Av1gItxJob, w); F(Av1gItxJob, h);
-  F(Av1gItxJob, row_basis); F(Av1gItxJob, col_basis); F(Av1gItxJob, eob);
-  F(Av1gItxJob, shift);
-  S(Av1gIntraAux);
-  F(Av1gIntraAux, dc); F(Av1gIntraAux, ac_dc); F(Av1gIntraAux, avg);
+  F(Av1gItxJob, tx_type); F(Av1gItxJob, eob); F(Av1gItxJob, row_shift);
+  F(Av1gItxJob, lossless); F(Av1gItxJob, bitdepth);
   S(Av1gIntraJob);
-  F(Av1gIntraJob, dst_off); F(Av1gIntraJob, dst_stride); F(Av1gIntraJob, w);
-  F(Av1gIntraJob, h); F(Av1gIntraJob, mode); F(Av1gIntraJob, bitdepth);
-  F(Av1gIntraJob, have_left); F(Av1gIntraJob, have_above); F(Av1gIntraJob, cfl_alpha);
-  F(Av1gIntraJob, luma_off); F(Av1gIntraJob, luma_stride); F(Av1gIntraJob, ss_x);
-  F(Av1gIntraJob, ss_y);
+  F(Av1gIntraJob, dst_off); F(Av1gIntraJob, dst_stride); F(Av1gIntraJob, x);
+  F(Av1gIntraJob, y); F(Av1gIntraJob, w); F(Av1gIntraJob, h);
+  F(Av1gIntraJob, mode); F(Av1gIntraJob, angle); F(Av1gIntraJob, bitdepth);
+  F(Av1gIntraJob, have_left); F(Av1gIntraJob, have_above);
+  F(Av1gIntraJob, have_above_right); F(Av1gIntraJob, have_below_left);
+  F(Av1gIntraJob, filter_type); F(Av1gIntraJob, filter_intra);
+  F(Av1gIntraJob, filter_intra_mode); F(Av1gIntraJob, cfl_alpha);
+  F(Av1gIntraJob, luma_off); F(Av1gIntraJob, luma_stride);
+  F(Av1gIntraJob, luma_w); F(Av1gIntraJob, luma_h); F(Av1gIntraJob, ss_x);
+  F(Av1gIntraJob, ss_y); F(Av1gIntraJob, max_x); F(Av1gIntraJob, max_y);
   S(Av1gInterJob);
   F(Av1gInterJob, dst_off); F(Av1gInterJob, dst_stride); F(Av1gInterJob, w);
   F(Av1gInterJob, h); F(Av1gInterJob, ref0_off); F(Av1gInterJob, ref0_stride);
@@ -88,9 +181,12 @@ int main() {
   F(Av1gDeblockJob, filter_size); F(Av1gDeblockJob, is_chroma);
   F(Av1gDeblockJob, bitdepth);
   S(Av1gCdefJob);
+  F(Av1gCdefJob, x); F(Av1gCdefJob, y);
   F(Av1gCdefJob, src_off); F(Av1gCdefJob, src_stride); F(Av1gCdefJob, dst_off);
-  F(Av1gCdefJob, dst_stride); F(Av1gCdefJob, pri_strength); F(Av1gCdefJob, sec_strength);
-  F(Av1gCdefJob, damping); F(Av1gCdefJob, dir); F(Av1gCdefJob, bitdepth);
+  F(Av1gCdefJob, dst_stride); F(Av1gCdefJob, luma_off); F(Av1gCdefJob, luma_stride);
+  F(Av1gCdefJob, pri_strength); F(Av1gCdefJob, sec_strength);
+  F(Av1gCdefJob, damping); F(Av1gCdefJob, dir); F(Av1gCdefJob, uv);
+  F(Av1gCdefJob, ss_x); F(Av1gCdefJob, ss_y); F(Av1gCdefJob, bitdepth);
   F(Av1gCdefJob, plane_w); F(Av1gCdefJob, plane_h);
   S(Av1gGrainJob);
   F(Av1gGrainJob, dst_off); F(Av1gGrainJob, dst_stride); F(Av1gGrainJob, x);
@@ -123,7 +219,6 @@ def run_probe():
         out = subprocess.run([exe], check=True, capture_output=True, text=True).stdout
 
     tables = {}
-    offsets = {}
     sizes = {}
     fields = {}
     for line in out.splitlines():
@@ -132,12 +227,8 @@ def run_probe():
         entry = json.loads(line)
         if "table" in entry:
             tables[entry["table"]] = entry["data"]
-        elif "basis_dct" in entry:
-            offsets[("dct", entry["basis_dct"])] = entry["offset"]
-        elif "basis_adst" in entry:
-            offsets[("adst", entry["basis_adst"])] = entry["offset"]
-        elif "basis_idtx" in entry:
-            offsets[("idtx", entry["basis_idtx"])] = entry["offset"]
+        elif "host" in entry:
+            tables["host." + entry["host"]] = entry["data"]
         elif "size" in entry:
             sizes[entry["struct"]] = entry["size"]
         else:
@@ -154,15 +245,29 @@ def run_probe():
         for offset, field in entries:
             assert getattr(cls, field).offset == offset, (name, field)
         layouts[name] = cls
-    return layouts, offsets, tables
+    return layouts, tables
 
 
 def build_source():
+    """The device source, assembled exactly as cmake/embed.cmake does it.
+
+    The device compiler gets one translation unit, so the quoted includes next to
+    the header (the generated table header) are inlined rather than resolved by
+    an include path the library does not have either.
+    """
+    names = sorted(os.listdir(KERNELS))
     with open(os.path.join(KERNELS, "av1gpu_kernels.h"), "r", encoding="utf-8") as handle:
         header = handle.read()
+    inlined = ""
+    for name in names:
+        line = '#include "%s"' % name
+        if name.endswith(".h") and line in header:
+            with open(os.path.join(KERNELS, name), "r", encoding="utf-8") as handle:
+                inlined += handle.read() + "\n"
+            header = header.replace(line, "")
     with open(os.path.join(KERNELS, "av1_opencl.cl"), "r", encoding="utf-8") as handle:
         body = handle.read()
-    return header + "\n" + body.replace('#include "av1gpu_kernels.h"', "")
+    return inlined + header + "\n" + body.replace('#include "av1gpu_kernels.h"', "")
 
 
 def devices():
@@ -207,10 +312,9 @@ def main():
         return 1
     print("kernel source compiled (%d bytes)" % len(source))
 
-    layouts, basis_offsets, tables = run_probe()
+    layouts, tables = run_probe()
     ItxJob = layouts["Av1gItxJob"]
     IntraJob = layouts["Av1gIntraJob"]
-    IntraAux = layouts["Av1gIntraAux"]
     InterJob = layouts["Av1gInterJob"]
     DeblockJob = layouts["Av1gDeblockJob"]
     CdefJob = layouts["Av1gCdefJob"]
@@ -255,7 +359,6 @@ def main():
         table[len(counts) + 1] = total
         return np.array(table, dtype=np.int32), total
 
-    basis_buf = upload(np.array(tables["basis"], dtype=np.int32))
     filter_buf = upload(np.array(tables["filters"], dtype=np.int32))
 
     # ------------------------------------------------------------------ itx
@@ -269,9 +372,10 @@ def main():
     job.dst_stride = stride
     job.w = n
     job.h = n
-    job.row_basis = basis_offsets[("dct", n)]
-    job.col_basis = basis_offsets[("dct", n)]
+    job.tx_type = 0          # AV1G_TX_DCT_DCT
     job.eob = n * n
+    job.row_shift = 2        # Transform_Row_Shift for an 8x8 transform
+    job.bitdepth = 8
     row_pref, rows = prefix([n])      # one work item per transform row
     col_pref, cols = prefix([n])      # one work item per transform column
     job_buf = upload(np.frombuffer(job, dtype=np.uint8).copy())
@@ -283,15 +387,17 @@ def main():
                           hostbuf=plane)
     njobs = np.int32(1)
     launch(None, program.av1g_k_itx_rows, rows, job_buf, row_pref_buf, njobs,
-           np.int32(rows), coef_buf, tmp_buf, basis_buf)
+           np.int32(rows), coef_buf, tmp_buf)
     launch(None, program.av1g_k_itx_cols, cols, job_buf, col_pref_buf, njobs,
-           np.int32(cols), tmp_buf, plane_buf, basis_buf, np.int32(255))
+           np.int32(cols), tmp_buf, plane_buf, np.int32(255))
     queue.finish()
     out = download(plane_buf, plane.shape)
-    block = out.reshape(size, stride)[8:16, 8:16]
+    block = out.reshape(size, stride)[8:16, 8:16].astype(int)
+    # the host build of the same kernel is the reference: the device has to
+    # agree with it sample for sample, not just on average
+    want = np.array(tables["host.itx"], dtype=int).reshape(8, 8)
+    check("itx matches the host kernel", bool((block == want).all()), True)
     check("itx DC only is flat", int(block.max() - block.min()), 0)
-    # the 2D DC basis of an orthonormal DCT is 1/n
-    check("itx DC value", int(block[0, 0]), coef[0] // n)
 
     # ---------------------------------------------------------------- intra
     print("intra prediction")
@@ -303,27 +409,31 @@ def main():
     ij = IntraJob()
     ij.dst_off = 8 * stride + 8
     ij.dst_stride = stride
+    ij.x = 8
+    ij.y = 8
     ij.w = 8
     ij.h = 8
     ij.mode = 0  # AV1G_PRED_DC
     ij.bitdepth = 8
     ij.have_left = 1
     ij.have_above = 1
+    ij.filter_type = -1   # no edge filtering
     ij.luma_stride = stride
     ij.ss_x = 1
     ij.ss_y = 1
+    ij.max_x = stride - 1
+    ij.max_y = size - 1
     ijob_buf = upload(np.frombuffer(ij, dtype=np.uint8).copy())
-    aux_buf = cl.Buffer(context, mf.READ_WRITE, ctypes.sizeof(IntraAux) + 64)
     plane_buf = upload(plane)
-    program.av1g_k_intra_aux(queue, (64,), (64,), ijob_buf, np.int32(1),
-                             plane_buf, aux_buf)
-    ipref, itotal = prefix([64])
+    ipref, itotal = prefix([1])
     ipref_buf = upload(ipref)
-    launch(None, program.av1g_k_intra, itotal, ijob_buf, ipref_buf,
-           np.int32(1), np.int32(itotal), plane_buf, aux_buf, np.int32(255))
+    launch(None, program.av1g_k_intra, itotal, ijob_buf, np.int32(1), plane_buf,
+           np.int32(255))
     queue.finish()
     out = download(plane_buf, plane.shape)
-    region = out.reshape(size, stride)[8:16, 8:16]
+    region = out.reshape(size, stride)[8:16, 8:16].astype(int)
+    want = np.array(tables["host.intra"], dtype=int).reshape(8, 8)
+    check("intra matches the host kernel", bool((region == want).all()), True)
     check("intra DC is flat", int(region.max() - region.min()), 0)
     check("intra DC value", int(region[0, 0]), (100 * 8 + 200 * 8 + 8) // 16)
 
@@ -449,36 +559,54 @@ def main():
           bool((out[8:14, 7] == 43).all() and (out[14:16, 7] == 40).all() and
                (out[8:14, 8] == 45).all() and (out[14:16, 8] == 48).all()), True)
     untouched = (out[:, :6] == 24).all() and (out[:, 10:] == 24).all()
-    untouched = untouched and (out[:8, 6:10] == 24).all() and (out[16:, 6:10] == 24).all()
-    # only p0/q0 move with the narrow filter, and only on the rows of the edge
-    untouched = untouched and (out[8:16, 6] == 40).all() and (out[8:16, 9] == 48).all()
+    untouched = untouched and (out[:8, 6:10] == 24).all()
+    untouched = untouched and (out[16:, 6:10] == 24).all()
+    # rows 14 and 15 are past the end of the edge, so they keep the input values
+    untouched = untouched and (out[14:16, 6:10] == np.array([40, 40, 48, 48])).all()
+    # the filter reaches two samples either side of the edge, and only the rows
+    # inside the (short) edge move
+    untouched = untouched and (out[8:14, 6] == 42).all() and (out[8:14, 9] == 46).all()
     check("deblock leaves the rest of the picture alone", bool(untouched), True)
 
     cd = CdefJob()
+    cd.x = 8
+    cd.y = 8
     cd.src_off = 8 * stride + 8
     cd.src_stride = stride
-    cd.dst_off = 8 * stride + 8
+    cd.dst_off = cd.src_off
     cd.dst_stride = stride
-    cd.pri_strength = 4
-    cd.sec_strength = 2
-    cd.dir = 1
+    cd.luma_off = cd.src_off
+    cd.luma_stride = stride
+    cd.pri_strength = 8
+    cd.sec_strength = 0
+    cd.damping = 3
+    cd.dir = -1              # find the direction, as a decoder does
     cd.bitdepth = 8
-    cd.plane_w = size
+    cd.plane_w = stride
     cd.plane_h = size
     cbuf = upload(np.frombuffer(cd, dtype=np.uint8).copy())
-    cpref, ctotal = prefix([64])
+    cpref, ctotal = prefix([1])
     cpref_buf = upload(cpref)
-    src_buf = upload(flat)
-    # cdef only writes the 8x8 block, so start the destination from the same
-    # flat picture the source has
-    dst_buf = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR,
-                        hostbuf=flat)
+    # a noisy block: a single step through the block is symmetric, so the taps on
+    # either side of it cancel and CDEF leaves it exactly as it is (that is the
+    # point of the constraint); noise does move samples
+    edge = np.empty(stride * size, dtype=np.uint16)
+    for y in range(size):
+        for x in range(stride):
+            edge[y * stride + x] = 128 + (((x * 5 + y * 11) * 7 + 3) % 17) - 8
+    src_buf = upload(edge)
+    dst_buf = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=edge)
     launch(None, program.av1g_k_cdef, ctotal, cbuf, cpref_buf, np.int32(1),
            np.int32(ctotal), src_buf, dst_buf, np.int32(255))
     queue.finish()
-    out = download(dst_buf, flat.shape)
-    cdef_block = out.reshape(size, stride)[8:16, 8:16]
-    check("cdef leaves flat areas alone", bool((cdef_block == 90).all()), True)
+    out = download(dst_buf, edge.shape)
+    cdef_block = out.reshape(size, stride)[8:16, 8:16].astype(int)
+    want = np.array(tables["host.cdef"], dtype=int).reshape(8, 8)
+    check("cdef matches the host kernel", bool((cdef_block == want).all()), True)
+    # and the block really was filtered, so the check above is not vacuous
+    check("cdef moved samples next to the edge",
+          int(np.abs(cdef_block - edge.reshape(size, stride)[8:16, 8:16]).max()) > 0,
+          True)
 
     grain = np.full(64 * 64, 40, dtype=np.int8)
     g = GrainJob()

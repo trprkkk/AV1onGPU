@@ -51,24 +51,14 @@ extern "C" __global__ void av1g_k_itx_cols(const Av1gItxJob *jobs,
   av1g_itx_col_add(&job, tmp, dst, elem, maxv);
 }
 
-extern "C" __global__ void av1g_k_intra_aux(const Av1gIntraJob *jobs, int njobs,
-                                            const av1g_px *plane,
-                                            Av1gIntraAux *aux) {
-  const int j = AV1G_GID;
-  if (j >= njobs) return;
-  Av1gIntraJob job = jobs[j];
-  av1g_intra_aux(&job, plane, aux + j);
-}
-
-/* One thread per block: intra prediction is a whole-block operation now, since
- * the edge filtering and the recursive predictor read well past one sample. */
+/* One thread per block: intra prediction is a whole-block operation, since the
+ * edge filtering and the recursive predictor read well past one sample. */
 extern "C" __global__ void av1g_k_intra(const Av1gIntraJob *jobs, int njobs,
-                                        av1g_px *plane,
-                                        const Av1gIntraAux *aux, int maxv) {
+                                        av1g_px *plane, int maxv) {
   const int j = AV1G_GID;
   if (j >= njobs) return;
   Av1gIntraJob job = jobs[j];
-  av1g_intra_block(&job, plane, aux + j, maxv);
+  av1g_intra_block(&job, plane, maxv);
 }
 
 extern "C" __global__ void av1g_k_inter(const Av1gInterJob *jobs,
@@ -106,8 +96,11 @@ extern "C" __global__ void av1g_k_cdef(const Av1gCdefJob *jobs, const int *joff,
                                        int maxv) {
   AV1G_JOB_LOOKUP(job_idx, elem);
   Av1gCdefJob job = jobs[job_idx];
-  av1g_cdef_px(&job, src, dst, elem & (AV1G_CDEF_DIM - 1),
-               elem / AV1G_CDEF_DIM, maxv);
+  /* one work item per block: the direction, the strength it earns and the
+   * copy for a block with no strength are all per block, not per sample */
+  /* src and dst are the picture; the luma of the same snapshot is where the
+   * direction is read from, at the job's luma_off */
+  av1g_cdef_block(&job, src, dst, src, maxv);
 }
 
 extern "C" __global__ void av1g_k_grain(const Av1gGrainJob *jobs,
