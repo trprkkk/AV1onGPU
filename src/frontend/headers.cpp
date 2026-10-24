@@ -669,7 +669,10 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
     h.render_width = h.width;
     h.render_height = h.height;
   }
-  if (h.allow_screen_content_tools && !h.superres) {
+  /* allow_intrabc is only present on an intra frame: the specification reads
+   * it inside `if (FrameIsIntra)`, and UpscaledWidth == FrameWidth rules out
+   * superres. Reading it on an inter frame shifts every following field. */
+  if (key_or_intra && h.allow_screen_content_tools && !h.superres) {
     h.allow_intrabc = r.read_bit();
   }
   if (h.allow_intrabc) {
