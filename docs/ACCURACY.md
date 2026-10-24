@@ -101,10 +101,22 @@ three layers, all of them runnable on a machine with no GPU driver:
    compares whole frames against the CPU reference decode. Four frames, intra
    and inter, all filters on: **bit identical**.
 
-The front-end has its own cross-check, run once during development and not part
-of the test suite: `src/frontend/headers.cpp` was compared against dav1d's
-sequence header parser over 4000 random byte strings. Every header dav1d accepts
-parsed to the same field values at the same bit position. It found two real bugs:
+The front-end has its own cross-checks. Two of them are one-off development
+experiments, and one is part of the test suite:
+
+* `src/frontend/headers.cpp` was compared against dav1d's sequence header parser
+  over 4000 random byte strings. Every header dav1d accepts parsed to the same
+  field values at the same bit position.
+* A real stream (`tests/data/svt_av1_320x240.ivf`, six frames from SVT-AV1) has
+  all eight of its frame headers cross-checked against FFmpeg's `trace_headers`
+  bitstream filter, which prints every syntax element with its bit position.
+  Quantiser, deblock levels, CDEF strengths, reference slots, order hints,
+  refresh flags, skip mode and tile data offsets all agree, including the four
+  inter frames and both `show_existing_frame` OBUs.
+* `tests/test_frontend.cpp` parses that same stream end to end on every run, so
+  the fixture keeps the parser honest as it grows.
+
+The dav1d comparison found two real bugs:
 
 * profile 2 with 8/10 bit is 4:2:2 signalled implicitly; the parser defaulted
   `subsampling_y` to 1, read two chroma bits that were not there, and lost sync

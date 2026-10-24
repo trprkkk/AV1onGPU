@@ -541,27 +541,293 @@ void test_frame_header() {
   CHECK_EQ(header.loop_filter.mode_ref_delta_enabled, true);
   CHECK_EQ(header.cdef.damping, 3);
 
-  /* Segmentation is understood but refused, not silently accepted. */
+  /* A truncated frame header is invalid, not a short frame. */
   CHECK(parse_frame_header(seq, bytes.data(), 8, &header, &error) ==
         ParseStatus::Invalid);
+}
 
-  /* An inter frame is reported as unsupported, not misparsed. */
-  BitWriter inter;
-  inter.bit(false); /* show_existing_frame */
-  inter.bits(1, 2); /* INTER */
-  inter.bit(true);  /* show_frame */
-  inter.bit(false); /* error_resilient_mode */
-  inter.bit(false); /* disable_cdf_update */
-  inter.bit(false); /* allow_screen_content_tools */
-  inter.bit(false); /* frame_size_override */
-  inter.bits(0, 3); /* primary_ref_frame */
-  inter.align();
-  const std::vector<uint8_t> inter_bytes = inter.bytes();
-  const ParseStatus status =
-      parse_frame_header(seq, inter_bytes.data(), inter_bytes.size(), &header, &error);
-  CHECK(status == ParseStatus::Unsupported);
+/* One inter frame header referencing slot 0, following the specification order.
+ * Every field the parser expects is written here, so a reordering in the parser
+ * shows up as a mismatch rather than as silently shifted values. */
+std::vector<uint8_t> write_inter_frame_header(const SequenceSpec& spec, int order_hint,
+                                              int refresh_flags) {
+  BitWriter w;
+  w.bit(false);     /* show_existing_frame */
+  w.bits(1, 2);     /* INTER */
+  w.bit(true);      /* show_frame */
+  w.bit(false);     /* error_resilient_mode */
+  w.bit(false);     /* disable_cdf_update */
+  w.bit(false);     /* allow_screen_content_tools */
+  w.bit(false);     /* frame_size_override: inherit the reference size */
+  if (spec.order_hint) w.bits(static_cast<uint32_t>(order_hint), 3);
+  w.bits(0, 3);     /* primary_ref_frame: slot 0 */
+  w.bits(static_cast<uint32_t>(refresh_flags), 8);
+  w.bit(false);     /* frame_refs_short_signaling */
+  for (int i = 0; i < 7; ++i) w.bits(0, 3); /* ref_frame_idx: all slot 0 */
+  w.bit(false);     /* render_and_frame_size_different */
+  w.bit(false);     /* allow_high_precision_mv */
+  w.bit(true);      /* is_filter_switchable */
+  w.bit(false);     /* is_motion_mode_switchable */
+  w.bit(false);     /* disable_frame_end_update_cdf */
+  w.bit(true);      /* uniform_tile_spacing_flag */
+  w.bit(false);     /* stop: one tile column */
+  w.bit(false);     /* stop: one tile row */
+  w.bits(100, 8);   /* base_q_idx */
+  w.bit(false);     /* delta_q_y_dc */
+  w.bit(false);     /* delta_q_u_dc */
+  w.bit(false);     /* delta_q_u_ac */
+  w.bit(false);     /* using_qmatrix */
+  w.bit(false);     /* segmentation_enabled */
+  w.bit(false);     /* delta_q_present */
+  w.bits(0, 6);     /* loop_filter_level[0] */
+  w.bits(0, 6);     /* loop_filter_level[1] */
+  w.bits(0, 3);     /* loop_filter_sharpness */
+  w.bit(false);     /* loop_filter_delta_enabled */
+  w.bits(0, 2);     /* cdef_damping_minus_3 */
+  w.bits(0, 2);     /* cdef_bits */
+  w.bits(0, 6);     /* cdef y strength */
+  w.bits(0, 6);     /* cdef uv strength */
+  w.bit(false);     /* tx_mode_select */
+  w.bit(true);      /* reference_select */
+  w.bit(false);     /* reduced_tx_set */
+  for (int i = 1; i < 8; ++i) w.bit(false); /* is_global */
+  w.align();
+  return w.bytes();
+}
+
+void test_inter_frame() {
+  std::printf("inter frame header\n");
+  SequenceSpec spec;
+  const std::vector<uint8_t> seq_bytes = write_sequence_header(spec);
+  SequenceHeader seq;
+  std::string error;
+  CHECK(parse_sequence_header(seq_bytes.data(), seq_bytes.size(), &seq, &error) ==
+        ParseStatus::Ok);
+
+  /* A key frame first, so the reference pool has a valid slot to point at. */
+  const std::vector<uint8_t> key = write_key_frame_header(spec, KeyFrameSpec());
+  FrameHeader header;
+  RefPool pool;
+  CHECK(parse_frame_header(seq, key.data(), key.size(), &header, &error) ==
+        ParseStatus::Ok);
+  CHECK_EQ(header.refresh_frame_flags, 0xff);
+  refresh_ref_pool(header, &pool);
+  CHECK_EQ(pool.slots[0].valid, true);
+  CHECK_EQ(pool.slots[0].width, 640);
+
+  const std::vector<uint8_t> inter = write_inter_frame_header(spec, 0, 0x01);
+  const ParseStatus inter_status =
+      parse_frame_header(seq, inter.data(), inter.size(), &header, &error, &pool);
+  if (inter_status != ParseStatus::Ok) std::printf("  inter header: %s\n", error.c_str());
+  CHECK(inter_status == ParseStatus::Ok);
   CHECK(header.type == FrameType::Inter);
+  CHECK_EQ(header.show_frame, true);
+  CHECK_EQ(header.size_from_reference, true);
+  CHECK_EQ(header.width, 640);
+  CHECK_EQ(header.height, 360);
+  CHECK_EQ(header.refresh_frame_flags, 1);
+  CHECK_EQ(header.ref_frame_idx[0], 0);
+  CHECK_EQ(header.base_q_idx, 100);
+  CHECK_EQ(header.reference_select, true);
+  CHECK_EQ(header.skip_mode_allowed, false); /* order hints are off in this seq */
+  CHECK_EQ(header.tiles.cols, 1);
+  CHECK_EQ(header.tiles.rows, 1);
+  CHECK_EQ(header.tile_data_offset, inter.size());
+  refresh_ref_pool(header, &pool);
+
+  /* Inter frames need the pool: without it the parser says so instead of
+   * guessing a size. */
+  CHECK(parse_frame_header(seq, inter.data(), inter.size(), &header, &error) ==
+        ParseStatus::Unsupported);
   CHECK(!error.empty());
+
+  /* An inter frame pointing at an empty slot is invalid. */
+  RefPool empty;
+  CHECK(parse_frame_header(seq, inter.data(), inter.size(), &header, &error, &empty) ==
+        ParseStatus::Invalid);
+
+  /* show_existing_frame: index into the pool, no tile data. */
+  BitWriter e;
+  e.bit(true);  /* show_existing_frame */
+  e.bits(0, 3); /* existing_frame_idx */
+  e.align();
+  const std::vector<uint8_t> existing = e.bytes();
+  CHECK(parse_frame_header(seq, existing.data(), existing.size(), &header, &error,
+                           &pool) == ParseStatus::Ok);
+  CHECK_EQ(header.show_existing_frame, true);
+  CHECK_EQ(header.existing_frame_idx, 0);
+  CHECK_EQ(header.width, 640);
+  CHECK_EQ(header.height, 360);
+
+  /* The same header with an empty pool is invalid. */
+  CHECK(parse_frame_header(seq, existing.data(), existing.size(), &header, &error,
+                           &empty) == ParseStatus::Invalid);
+}
+
+/* Segmentation is part of the header, not a reason to stop: the flags and the
+ * per segment feature values have to come back so later stages can use them. */
+void test_segmentation() {
+  std::printf("segmentation\n");
+  SequenceSpec spec;
+  const std::vector<uint8_t> seq_bytes = write_sequence_header(spec);
+  SequenceHeader seq;
+  std::string error;
+  CHECK(parse_sequence_header(seq_bytes.data(), seq_bytes.size(), &seq, &error) ==
+        ParseStatus::Ok);
+
+  auto write_head = [](BitWriter* w) {
+    w->bit(false);     /* show_existing_frame */
+    w->bits(0, 2);     /* KEY */
+    w->bit(true);      /* show_frame */
+    w->bit(false);     /* disable_cdf_update */
+    w->bit(false);     /* allow_screen_content_tools */
+    w->bit(false);     /* frame_size_override */
+    w->bit(false);     /* render size */
+    w->bit(true);      /* refresh_frame_context */
+    w->bit(true);      /* uniform tiles */
+    w->bit(false);     /* stop: one column */
+    w->bit(false);     /* stop: one row */
+    w->bits(0, 8);     /* base_q_idx: lossless, so the filter bits disappear */
+    w->bit(false);     /* delta_q_y_dc */
+    w->bit(false);     /* delta_q_u_dc */
+    w->bit(false);     /* delta_q_u_ac */
+    w->bit(false);     /* using_qmatrix */
+  };
+
+  /* Segmentation on, map updated, no new feature data. */
+  BitWriter plain;
+  write_head(&plain);
+  plain.bit(true);  /* segmentation_enabled */
+  plain.bit(true);  /* update_map (primary_ref_frame is PRIMARY_REF_NONE) */
+  plain.bit(false); /* temporal_update */
+  plain.bit(false); /* update_data */
+  plain.bit(false); /* reduced_tx_set */
+  plain.align();
+  const std::vector<uint8_t> plain_bytes = plain.bytes();
+  FrameHeader header;
+  CHECK(parse_frame_header(seq, plain_bytes.data(), plain_bytes.size(), &header, &error) ==
+        ParseStatus::Ok);
+  CHECK_EQ(header.segmentation.enabled, true);
+  CHECK_EQ(header.segmentation.update_map, true);
+  CHECK_EQ(header.segmentation.update_data, false);
+  CHECK_EQ(header.all_lossless, true);
+
+  /* With feature data: segment 2 turns the quantiser down by 10. */
+  BitWriter data;
+  write_head(&data);
+  data.bit(true);  /* segmentation_enabled */
+  data.bit(true);  /* update_map */
+  data.bit(false); /* temporal_update */
+  data.bit(true);  /* update_data */
+  for (int i = 0; i < kMaxSegments; ++i) {
+    for (int j = 0; j < kSegFeatureCount; ++j) {
+      const bool enabled = i == 2 && j == 0;
+      data.bit(enabled);
+      if (enabled) data.signed_bits(-10, 8);
+    }
+  }
+  data.bit(false); /* reduced_tx_set */
+  data.align();
+  const std::vector<uint8_t> data_bytes = data.bytes();
+  CHECK(parse_frame_header(seq, data_bytes.data(), data_bytes.size(), &header, &error) ==
+        ParseStatus::Ok);
+  CHECK_EQ(header.segmentation.update_data, true);
+  CHECK_EQ(header.segmentation.feature_enabled[2][0], true);
+  CHECK_EQ(header.segmentation.feature_data[2][0], -10);
+  CHECK_EQ(header.segmentation.feature_enabled[1][0], false);
+  CHECK_EQ(header.segmentation.feature_enabled[2][1], false);
+}
+
+void test_real_stream() {
+  std::printf("real stream (SVT-AV1)\n");
+  const std::string path = std::string(AV1GPU_TEST_DATA_DIR) + "/svt_av1_320x240.ivf";
+  std::vector<uint8_t> data;
+  {
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    CHECK(file != nullptr);
+    if (!file) return;
+    uint8_t chunk[16384];
+    size_t got = 0;
+    while ((got = std::fread(chunk, 1, sizeof(chunk), file)) > 0)
+      data.insert(data.end(), chunk, chunk + got);
+    std::fclose(file);
+  }
+
+  IvfReader reader;
+  std::string error;
+  CHECK(reader.open(data, &error));
+  CHECK_EQ(reader.header().frame_count, 6u);
+  CHECK_EQ(reader.header().width, 320);
+
+  SequenceHeader seq;
+  RefPool pool;
+  bool have_seq = false;
+  struct Seen {
+    int frames = 0;
+    int keys = 0;
+    int inters = 0;
+    int existing = 0;
+    int ok = 0;
+  } seen;
+  int key_q = -1;
+  int key_deblock = -1;
+  size_t key_tile_offset = 0;
+  int order_hints[8] = {0};
+
+  IvfFrame frame;
+  while (reader.next(&frame, &error)) {
+    std::vector<Obu> obus;
+    CHECK(split_obus(frame.payload.data(), frame.payload.size(), &obus, &error));
+    for (const Obu& obu : obus) {
+      if (obu.type == ObuType::SequenceHeader) {
+        CHECK(parse_sequence_header(obu.data, obu.size, &seq, &error) == ParseStatus::Ok);
+        have_seq = true;
+      } else if (obu.type == ObuType::Frame || obu.type == ObuType::FrameHeader) {
+        CHECK(have_seq);
+        FrameHeader h;
+        CHECK(parse_frame_header(seq, obu.data, obu.size, &h, &error, &pool) ==
+              ParseStatus::Ok);
+        seen.ok++;
+        if (h.show_existing_frame) {
+          seen.existing++;
+          CHECK_EQ(h.width, 320);
+          CHECK_EQ(h.height, 240);
+          continue;
+        }
+        seen.frames++;
+        if (h.type == FrameType::Key) {
+          seen.keys++;
+          key_q = h.base_q_idx;
+          key_deblock = h.loop_filter.level_y[0];
+          key_tile_offset = h.tile_data_offset;
+          CHECK_EQ(h.width, 320);
+          CHECK_EQ(h.height, 240);
+        } else {
+          seen.inters++;
+          CHECK(h.size_from_reference);
+          order_hints[seen.inters] = h.order_hint;
+        }
+        CHECK(h.tiles.cols == 1 && h.tiles.rows == 1);
+        CHECK(h.tile_data_offset < obu.size);
+        refresh_ref_pool(h, &pool);
+      }
+    }
+  }
+
+  CHECK(reader.at_end());
+  CHECK_EQ(seen.frames, 6);
+  CHECK_EQ(seen.keys, 1);
+  CHECK_EQ(seen.inters, 5);
+  CHECK_EQ(seen.existing, 2);
+  CHECK_EQ(seen.ok, 8);
+  CHECK_EQ(key_q, 51);
+  CHECK_EQ(key_deblock, 2);
+  CHECK_EQ(key_tile_offset, 11u);
+  CHECK_EQ(order_hints[1], 4);
+  CHECK_EQ(order_hints[2], 2);
+  CHECK_EQ(order_hints[3], 1);
+  CHECK_EQ(order_hints[4], 3);
+  CHECK_EQ(order_hints[5], 5);
 }
 
 } /* namespace */
@@ -572,5 +838,8 @@ int main() {
   test_ivf();
   test_sequence_header();
   test_frame_header();
+  test_inter_frame();
+  test_segmentation();
+  test_real_stream();
   return testing::finish("test_frontend");
 }

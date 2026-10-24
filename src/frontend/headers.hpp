@@ -9,15 +9,18 @@
  *
  * Supported today
  *   - full sequence header, including operating points and timing info,
- *   - KEY and INTRA_ONLY frame headers, complete up to the tile data,
- *   - tile layout, quantiser, deblocking, CDEF, transform set and film grain
- *     presence.
+ *   - KEY, INTRA_ONLY, INTER and SWITCH frame headers, complete up to the tile
+ *     data, plus show_existing_frame,
+ *   - tile layout, quantiser, segmentation, delta Q / delta LF, deblocking,
+ *     CDEF, transform set, reference and skip mode, film grain presence.
+ *
+ * Reference frames: inter frame sizes and skip mode depend on the frames a
+ * stream has decoded before, so `parse_frame_header` takes the `RefPool` the
+ * caller maintains and `refresh_ref_pool()` applies each frame's refresh flags.
  *
  * Deliberately rejected with a clear message (never silently misparsed)
- *   - inter and switch frames (their reference management belongs with the
- *     tile decoder that is not written yet),
- *   - show_existing_frame, segmentation, delta Q / delta LF, superres,
- *     intra block copy, restoration filters and film grain *data*.
+ *   - superres, intra block copy, restoration filters, film grain *data*,
+ *     global motion parameters, short reference signalling and frame ids.
  *
  * The field order and the derived values follow the AV1 specification; where a
  * value is derived from a reference frame (loop filter deltas, segmentation
@@ -159,6 +162,37 @@ struct CdefParams {
   int uv_strength[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 };
 
+/* Segmentation feature list, in specification order, with the width of each
+ * coded value and whether it carries a sign bit. */
+constexpr int kSegFeatureCount = 8;
+constexpr int kMaxSegments = 8;
+
+struct SegmentationParams {
+  bool enabled = false;
+  bool update_map = false;
+  bool temporal_update = false;
+  bool update_data = false;
+  bool feature_enabled[kMaxSegments][kSegFeatureCount] = {};
+  int feature_data[kMaxSegments][kSegFeatureCount] = {};
+};
+
+/* One entry of the reference frame store: enough for the bitstream front-end to
+ * resolve inter frame sizes and skip-mode decisions. */
+struct RefSlot {
+  bool valid = false;
+  int width = 0;
+  int height = 0;
+  int order_hint = 0;
+  FrameType type = FrameType::Key;
+};
+
+/* The eight AV1 reference slots. `parse_frame_header` reads them to resolve
+ * inter frame sizes and skip-mode decisions; `refresh_ref_pool()` applies a
+ * parsed frame's refresh_frame_flags. */
+struct RefPool {
+  RefSlot slots[8];
+};
+
 struct FrameHeader {
   bool show_existing_frame = false;
   int existing_frame_idx = 0;
@@ -190,6 +224,24 @@ struct FrameHeader {
   bool refresh_frame_context = false;
   int frame_presentation_delay = 0;
 
+  /* Inter frame syntax. `ref_frame_idx` is resolved through the reference pool;
+   * `size_from_reference` is set when the frame inherits its size from
+   * reference frame 0 instead of coding width/height. */
+  bool size_from_reference = false;
+  int ref_frame_idx[7] = {0, 0, 0, 0, 0, 0, 0};
+  int ref_order_hint[7] = {0, 0, 0, 0, 0, 0, 0};
+  bool allow_high_precision_mv = false;
+  bool is_filter_switchable = false;
+  int interpolation_filter = 0;
+  bool is_motion_mode_switchable = false;
+  bool use_ref_frame_mvs = false;
+  bool reference_select = false;
+  bool allow_warped_motion = false;
+  bool skip_mode_allowed = false;
+  bool skip_mode_present = false;
+  int skip_mode_frame[2] = {0, 0};
+  bool is_global[8] = {false, false, false, false, false, false, false, false};
+
   TileInfo tiles;
 
   int base_q_idx = 0;
@@ -203,6 +255,7 @@ struct FrameHeader {
   int qm_u = 0;
   int qm_v = 0;
 
+  SegmentationParams segmentation;
   bool segmentation_enabled = false;
   bool delta_q_present = false;
   int delta_q_res = 0;
@@ -228,6 +281,9 @@ struct FrameHeader {
   size_t tile_data_offset = 0;
 };
 
+/* Applies `frame.refresh_frame_flags` to the reference pool. */
+void refresh_ref_pool(const FrameHeader& frame, RefPool* pool);
+
 enum class ParseStatus {
   Ok = 0,
   Unsupported = 1, /* the syntax was understood, the feature is not implemented */
@@ -244,7 +300,8 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
  * `seq` must be the sequence header in force. On success `out->tile_data_offset`
  * is the byte offset of the tile payload inside `data`. */
 ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, size_t size,
-                               FrameHeader* out, std::string* error);
+                               FrameHeader* out, std::string* error,
+                               const RefPool* refs = nullptr);
 
 } /* namespace frontend */
 } /* namespace av1gpu */

@@ -12,23 +12,31 @@ reference frame management) that emits `av1gpu::FrameSyntax`; it does *not*
 touch the GPU.
 
 **Done: containers and headers.** `src/frontend/` reads IVF files and raw OBU
-streams, parses the complete sequence header and KEY / INTRA_ONLY frame headers
-(tile grid, quantiser, deblock levels, CDEF strengths, transform set), and
-reports every feature it does not implement instead of misparsing it.
-`av1gpu_probe` shows what it found in a real file.
+streams and parses the complete sequence header and every frame header type -
+KEY, INTRA_ONLY, INTER, SWITCH and `show_existing_frame` - up to the byte where
+the tile data starts: tile grid, quantiser, segmentation, delta Q / delta LF,
+deblock levels, CDEF strengths, reference and skip mode decisions, transform set.
+Inter frames read a `RefPool` the caller keeps up to date, so reference sizes and
+skip mode are derived, not guessed. Features that are not implemented (superres,
+intra block copy, restoration, global motion, short reference signalling, frame
+ids, film grain data) are reported with a message instead of being misparsed.
+`av1gpu_probe` shows what it found in a real file, and
+`tests/data/svt_av1_320x240.ivf` keeps the parser honest against bytes from a
+real encoder.
 
 **Next, in order:**
 
 1. *Arithmetic decoder.* The tile payload is coded with the AV1 boolean range
    decoder over adaptive CDFs. Needs the CDF tables from the specification and
-   the symbol reader; testable against hand-built bitstreams like the header
-   parser is now.
+   the symbol reader; testable against payloads produced by a reference encoder,
+   the way the header parser is now tested against a real stream.
 2. *Tile and partition tree.* Superblock loop, partition symbols, block sizes,
    transform selection, and the coefficient syntax with its scan tables. This is
    the bulk of the work and the point where the front-end first emits a
    `FrameSyntax` the engine can decode.
-3. *Reference frame management.* The DPB, `show_existing_frame`, inter frame
-   headers (which are parsed far enough today to say "not yet" cleanly).
+3. *Reference frame management in the engine.* The front-end already tracks the
+   eight slots for header parsing; the decoder needs the actual sample buffers,
+   reference scaling and `show_existing_frame` output.
 4. *Optional:* a libaom / dav1d hook that emits syntax from an already
    conformance-tested parser. Useful for testing the engine against real
    streams long before our own parser is complete.

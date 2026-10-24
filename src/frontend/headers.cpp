@@ -45,7 +45,85 @@ ParseStatus check_trailing_bits(BitReader* reader, std::string* error) {
   return ParseStatus::Ok;
 }
 
+/* Width of each segmentation feature value, in specification order. */
+constexpr int kSegFeatureBits[kSegFeatureCount] = {8, 6, 6, 6, 6, 3, 1, 1};
+
+/* get_relative_dist(): sign extended distance between two order hints. */
+int get_relative_dist(const SequenceHeader& seq, int a, int b) {
+  if (!seq.enable_order_hint) return 0;
+  int diff = a - b;
+  const int m = 1 << (seq.order_hint_n_bits - 1);
+  return (diff & (m - 1)) - (diff & m);
+}
+
+/* skip_mode_params(): AV1 only allows skip mode when the reference list holds a
+ * frame that is both in the past and in the future of this one. */
+void compute_skip_mode(const SequenceHeader& seq, FrameHeader& h, BitReader* r) {
+  h.skip_mode_allowed = false;
+  h.skip_mode_present = false;
+  h.skip_mode_frame[0] = 0;
+  h.skip_mode_frame[1] = 0;
+  if (h.error_resilient_mode || !seq.enable_order_hint) return;
+
+  int forward_idx = -1;
+  int backward_idx = -1;
+  int forward_hint = 0;
+  int backward_hint = 0;
+  for (int i = 0; i < 7; ++i) {
+    const int ref_hint = h.ref_order_hint[i];
+    const int dist = get_relative_dist(seq, ref_hint, h.order_hint);
+    if (dist < 0) {
+      if (forward_idx < 0 || get_relative_dist(seq, ref_hint, forward_hint) > 0) {
+        forward_idx = i;
+        forward_hint = ref_hint;
+      }
+    } else if (dist > 0) {
+      if (backward_idx < 0 || get_relative_dist(seq, ref_hint, backward_hint) < 0) {
+        backward_idx = i;
+        backward_hint = ref_hint;
+      }
+    }
+  }
+
+  if (forward_idx >= 0 && backward_idx >= 0) {
+    h.skip_mode_allowed = true;
+    if (get_relative_dist(seq, forward_hint, backward_hint) < 0) {
+      h.skip_mode_frame[0] = forward_idx + 1;
+      h.skip_mode_frame[1] = backward_idx + 1;
+    } else {
+      h.skip_mode_frame[0] = backward_idx + 1;
+      h.skip_mode_frame[1] = forward_idx + 1;
+    }
+  } else if (forward_idx >= 0) {
+    if (forward_idx > 0) {
+      h.skip_mode_allowed = true;
+      h.skip_mode_frame[0] = h.skip_mode_frame[1] = forward_idx + 1;
+    }
+  } else if (backward_idx >= 0) {
+    if (backward_idx > 0) {
+      h.skip_mode_allowed = true;
+      h.skip_mode_frame[0] = h.skip_mode_frame[1] = backward_idx + 1;
+    }
+  }
+
+  if (h.skip_mode_allowed) h.skip_mode_present = r->read_bit();
+}
+
 } /* namespace */
+
+void refresh_ref_pool(const FrameHeader& frame, RefPool* pool) {
+  if (!pool || frame.show_existing_frame) return;
+  for (int i = 0; i < 8; ++i) {
+    if (frame.refresh_frame_flags & (1 << i)) {
+      RefSlot& slot = pool->slots[i];
+      slot.valid = true;
+      slot.width = frame.width;
+      slot.height = frame.height;
+      slot.order_hint = frame.order_hint;
+      slot.type = frame.type;
+    }
+  }
+}
 
 const char* frame_type_name(FrameType type) {
   switch (type) {
@@ -268,7 +346,8 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
 }
 
 ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, size_t size,
-                               FrameHeader* out, std::string* error) {
+                               FrameHeader* out, std::string* error,
+                               const RefPool* refs) {
   if (!data || size == 0) return invalid("empty frame header", error);
   const int sb128 = seq.use_128x128_superblock ? 1 : 0;
 
@@ -288,8 +367,29 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
       h.frame_id_present = true;
       h.frame_id = static_cast<int>(r.read(seq.frame_id_n_bits));
     }
+    if (!refs) {
+      *out = h;
+      return unsupported("show_existing_frame needs the reference frame pool", error);
+    }
+    const RefSlot& slot = refs->slots[h.existing_frame_idx];
+    if (!slot.valid) {
+      *out = h;
+      return invalid("show_existing_frame refers to an empty reference slot", error);
+    }
+    /* The frame is a repeat of a stored one: report its geometry so callers can
+     * display it without decoding anything. */
+    h.type = slot.type;
+    h.show_frame = true;
+    h.showable_frame = true;
+    h.width = slot.width;
+    h.height = slot.height;
+    h.frame_width = slot.width;
+    h.render_width = slot.width;
+    h.render_height = slot.height;
+    h.order_hint_present = seq.enable_order_hint;
+    h.order_hint = slot.order_hint;
     *out = h;
-    return unsupported("show_existing_frame needs the reference frame pool", error);
+    return ParseStatus::Ok;
   }
 
   if (seq.reduced_still_picture_header) {
@@ -357,13 +457,6 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
     }
   }
 
-  if (!key_or_intra) {
-    *out = h;
-    return unsupported("inter frames: reference management and tile decoding are not "
-                       "implemented yet",
-                       error);
-  }
-
   h.refresh_frame_flags = (h.type == FrameType::Key && h.show_frame)
                               ? 0xff
                               : static_cast<int>(r.read(8));
@@ -371,10 +464,40 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
     for (int i = 0; i < 8; ++i) r.read(seq.order_hint_n_bits);
   }
 
-  /* frame_size() without reference frames */
+  /* frame_refs(): which of the eight slots this frame predicts from. */
+  if (!key_or_intra) {
+    if (!refs) {
+      *out = h;
+      return unsupported("inter frames need the reference frame pool", error);
+    }
+    if (r.read_bit()) {
+      *out = h;
+      return unsupported("frame_refs_short_signaling is not implemented", error);
+    }
+    for (int i = 0; i < 7; ++i) h.ref_frame_idx[i] = static_cast<int>(r.read(3));
+    if (seq.frame_id_numbers_present) {
+      *out = h;
+      return unsupported("frame ids in inter frame references are not implemented", error);
+    }
+    for (int i = 0; i < 7; ++i) {
+      h.ref_order_hint[i] = refs->slots[h.ref_frame_idx[i]].order_hint;
+    }
+  }
+
+  /* frame_size(): inter frames with size override off inherit the size of the
+   * reference frame they were predicted from. */
   if (h.frame_size_override) {
     h.frame_width = static_cast<int>(r.read(seq.width_n_bits)) + 1;
     h.height = static_cast<int>(r.read(seq.height_n_bits)) + 1;
+  } else if (!key_or_intra) {
+    const RefSlot& slot = refs->slots[h.ref_frame_idx[0]];
+    if (!slot.valid) {
+      *out = h;
+      return invalid("inter frame refers to an empty reference slot", error);
+    }
+    h.size_from_reference = true;
+    h.frame_width = slot.width;
+    h.height = slot.height;
   } else {
     h.frame_width = seq.max_frame_width;
     h.height = seq.max_frame_height;
@@ -403,6 +526,24 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
   if (h.allow_intrabc) {
     *out = h;
     return unsupported("intra block copy (allow_intrabc) is not implemented", error);
+  }
+
+  if (!key_or_intra) {
+    h.allow_high_precision_mv = h.force_integer_mv ? false : r.read_bit();
+    if (!seq.enable_dual_filter) {
+      h.is_filter_switchable = r.read_bit();
+      if (h.is_filter_switchable) {
+        h.interpolation_filter = 3; /* SWITCHABLE */
+      } else {
+        h.interpolation_filter = static_cast<int>(r.read(2));
+      }
+    } else {
+      h.interpolation_filter = static_cast<int>(r.read(2));
+    }
+    h.is_motion_mode_switchable = r.read_bit();
+    if (!h.error_resilient_mode && seq.enable_ref_frame_mvs) {
+      h.use_ref_frame_mvs = r.read_bit();
+    }
   }
 
   if (!seq.reduced_still_picture_header && !h.disable_cdf_update) {
@@ -503,10 +644,33 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
   }
 
   /* ---- segmentation ------------------------------------------------------ */
-  h.segmentation_enabled = r.read_bit();
-  if (h.segmentation_enabled) {
-    *out = h;
-    return unsupported("segmentation is not implemented", error);
+  SegmentationParams& seg = h.segmentation;
+  seg.enabled = r.read_bit();
+  h.segmentation_enabled = seg.enabled;
+  if (seg.enabled) {
+    if (h.primary_ref_frame == kPrimaryRefNone) {
+      seg.update_map = r.read_bit();
+      if (seg.update_map) {
+        seg.temporal_update = r.read_bit();
+        seg.update_data = r.read_bit();
+      }
+    } else {
+      seg.update_data = r.read_bit();
+      if (seg.update_data) {
+        seg.update_map = r.read_bit();
+        if (seg.update_map) seg.temporal_update = r.read_bit();
+      }
+    }
+    if (seg.update_data) {
+      for (int i = 0; i < kMaxSegments; ++i) {
+        for (int j = 0; j < kSegFeatureCount; ++j) {
+          seg.feature_enabled[i][j] = r.read_bit();
+          if (seg.feature_enabled[i][j]) {
+            seg.feature_data[i][j] = r.read_signed(kSegFeatureBits[j]);
+          }
+        }
+      }
+    }
   }
 
   /* ---- delta q / delta lf ------------------------------------------------ */
@@ -522,11 +686,6 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
         }
       }
     }
-  }
-  if (h.delta_q_present || h.delta_lf_present) {
-    *out = h;
-    return unsupported("delta Q / delta LF (per superblock quantiser) is not implemented",
-                       error);
   }
 
   const bool delta_lossless = h.delta_q_y_dc == 0 && h.delta_q_u_dc == 0 &&
@@ -597,9 +756,37 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
     }
   }
 
-  /* ---- transform, reference and skip mode -------------------------------- */
+  /* ---- transform mode ---------------------------------------------------- */
   if (!h.all_lossless) h.tx_mode_select = r.read_bit();
+
+  /* ---- reference mode, skip mode and warped motion ----------------------- */
+  if (key_or_intra) {
+    h.reference_select = false;
+    h.skip_mode_allowed = false;
+    h.allow_warped_motion = false;
+  } else {
+    h.reference_select = r.read_bit();
+    compute_skip_mode(seq, h, &r);
+    if (h.error_resilient_mode || !seq.enable_warped_motion) {
+      h.allow_warped_motion = false;
+    } else {
+      h.allow_warped_motion = r.read_bit();
+    }
+  }
   h.reduced_tx_set = r.read_bit();
+
+  /* ---- global motion ----------------------------------------------------- */
+  if (!key_or_intra) {
+    bool any_global = false;
+    for (int i = 1; i < 8; ++i) {
+      h.is_global[i] = r.read_bit();
+      any_global = any_global || h.is_global[i];
+    }
+    if (any_global) {
+      *out = h;
+      return unsupported("global motion parameters are not implemented", error);
+    }
+  }
 
   /* ---- film grain -------------------------------------------------------- */
   if (seq.film_grain_params_present && (h.show_frame || h.showable_frame)) {

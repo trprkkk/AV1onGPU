@@ -125,28 +125,50 @@ tests/                        kernel unit tests, pipeline tests, OpenCL parity
 
 What parses today: the complete sequence header (profiles 0/1/2, 8/10/12 bit,
 4:2:0 / 4:2:2 / 4:4:4, operating points, timing info, all the feature flags) and
-KEY / INTRA_ONLY frame headers up to the tile data, including the tile grid, the
-quantiser, deblocking levels, CDEF strengths and the transform set.
+KEY, INTRA_ONLY, INTER and SWITCH frame headers up to the byte where the
+arithmetic coded tile data starts, plus `show_existing_frame`, segmentation,
+delta Q / delta LF, the tile grid, quantiser, deblocking levels, CDEF strengths,
+reference and skip mode decisions and the transform set.
 
-What is *refused with a message* instead of being misparsed: inter and switch
-frames, `show_existing_frame`, segmentation, delta Q / delta LF, superres, intra
-block copy, restoration filters and film grain data. The arithmetic coded tile
-payload is the next milestone (`docs/ROADMAP.md`).
+Inter frames need to know what came before them - a frame that inherits its size
+from a reference, or that is allowed to use skip mode, depends on the frames the
+decoder has already stored - so the parser takes the `RefPool` the caller
+maintains (`refresh_ref_pool()` applies a parsed frame's refresh flags).
+
+What is *refused with a message* instead of being misparsed: superres, intra
+block copy, restoration filters, film grain data, global motion parameters,
+short reference signalling and frame ids. The arithmetic coded tile payload is
+the next milestone (`docs/ROADMAP.md`).
+
+The parser is checked against a real stream (`tests/data/svt_av1_320x240.ivf`,
+encoded with SVT-AV1) whose fields were cross-checked with FFmpeg's
+`trace_headers` bitstream filter, and it was fuzz-compared against dav1d's
+sequence header parser; see `docs/ACCURACY.md`.
 
 ```sh
-$ build/bin/av1gpu_probe clip.ivf
-clip.ivf: IVF, 320x240, 1 frame(s), timebase 30/1
-temporal unit 0 (25 bytes)
+$ build/bin/av1gpu_probe tests/data/svt_av1_320x240.ivf
+tests/data/svt_av1_320x240.ivf: IVF, 320x240, 6 frame(s), timebase 30/1
+temporal unit 0 (15495 bytes)
   obu temporal_delimiter   0 bytes
-  obu sequence_header      10 bytes
+  obu sequence_header      11 bytes
 sequence header
   profile 0, 8 bit, 4:2:0, 320x240 max
   superblock 64, cdef yes, restoration no, superres no
+  order hint yes, warped motion yes, dual filter no, masked compound no
+  film grain parameters absent
+  obu frame                15477 bytes
+  key frame, 320x240, base_q_idx 51, 1 tile(s) (1x1)
+  deblock 2/2 luma, 1/1 chroma, sharpness 0; cdef damping 3, y strengths 0
+  delta Q per superblock (res 0)
+  tile data: 15466 bytes at offset 11; decoding is not implemented yet
+temporal unit 1 (491 bytes)
   ...
-  obu frame                9 bytes
-  key frame, 320x240, base_q_idx 60, 1 tile(s) (1x1)
-  deblock 24/24 luma, 12/12 chroma, sharpness 2; cdef damping 3, y strengths 4
-  no tile data in this OBU; decoding is not implemented yet
+  inter frame (not shown), 320x240 from reference, base_q_idx 138, 1 tile(s) (1x1)
+  references: last=slot 2 (hint 0) ... intra=slot 2 (hint 0)
+  refresh flags 0x01, primary ref 0, order hint 4, not error resilient
+  compound reference select, skip mode off, ref frame mvs
+  deblock 7/7 luma, 3/3 chroma, sharpness 0; cdef damping 5, y strengths 62
+  tile data: 147 bytes at offset 16; decoding is not implemented yet
 ```
 
 `tests/test_frontend.cpp` writes the same syntax with a small bit writer and
@@ -220,7 +242,7 @@ ctest --test-dir build -R opencl --output-on-failure
 
 There is no arithmetic (entropy) decoder and no partition tree in this tree yet:
 the front-end reads containers and headers, and the reconstruction engine starts
-at the block syntax. `av1gpu::synthetic_encode` is a small closed loop test
+at the block syntax, so a real `.ivf` can be inspected but not yet decoded. `av1gpu::synthetic_encode` is a small closed loop test
 encoder that produces valid syntax from a generated clip, and it is what the
 tools and tests decode. See `docs/ROADMAP.md` for the intended front-end work
 and `docs/ACCURACY.md` for exactly where this implementation approximates the

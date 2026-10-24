@@ -59,14 +59,47 @@ void print_sequence(const SequenceHeader& seq) {
               seq.film_grain_params_present ? "present" : "absent");
 }
 
-void print_frame(const FrameHeader& hdr, size_t payload_size) {
-  const size_t tile_bytes = payload_size > hdr.tile_data_offset
-                                ? payload_size - hdr.tile_data_offset
-                                : 0;
-  std::printf("  %s frame%s, %dx%d, base_q_idx %d, %d tile(s) (%dx%d)\n",
-              frame_type_name(hdr.type), hdr.show_frame ? "" : " (not shown)",
-              hdr.width, hdr.height, hdr.base_q_idx, hdr.tiles.cols * hdr.tiles.rows,
-              hdr.tiles.cols, hdr.tiles.rows);
+void print_frame(const FrameHeader& hdr, size_t payload_size, ParseStatus parsed) {
+  if (hdr.show_existing_frame) {
+    std::printf("  show_existing_frame: slot %d (%s frame, %dx%d)\n",
+                hdr.existing_frame_idx, frame_type_name(hdr.type), hdr.width, hdr.height);
+    return;
+  }
+  std::printf("  %s frame%s, ", frame_type_name(hdr.type),
+              hdr.show_frame ? "" : (hdr.showable_frame ? " (not shown)" : " (hidden)"));
+  if (hdr.size_from_reference) {
+    std::printf("%dx%d from reference, ", hdr.width, hdr.height);
+  } else {
+    std::printf("%dx%d, ", hdr.width, hdr.height);
+  }
+  std::printf("base_q_idx %d", hdr.base_q_idx);
+  if (hdr.tiles.cols > 0) {
+    std::printf(", %d tile(s) (%dx%d)", hdr.tiles.cols * hdr.tiles.rows, hdr.tiles.cols,
+                hdr.tiles.rows);
+  }
+  std::printf("\n");
+
+  if (hdr.type == FrameType::Inter || hdr.type == FrameType::Switch) {
+    std::printf("  references:");
+    static const char* kNames[7] = {"last", "bwdref", "altref2", "altref",
+                                    "golden", "bwd", "intra"};
+    for (int i = 0; i < 7; ++i) {
+      std::printf(" %s=slot %d (hint %d)", kNames[i], hdr.ref_frame_idx[i],
+                  hdr.ref_order_hint[i]);
+    }
+    std::printf("\n");
+    std::printf("  refresh flags 0x%02x, primary ref %d, order hint %d, %s\n",
+                hdr.refresh_frame_flags, hdr.primary_ref_frame, hdr.order_hint,
+                hdr.error_resilient_mode ? "error resilient" : "not error resilient");
+    std::printf("  %s reference select, skip mode %s", hdr.reference_select ? "compound" : "single",
+                hdr.skip_mode_present ? "on" : (hdr.skip_mode_allowed ? "allowed" : "off"));
+    if (hdr.allow_warped_motion) std::printf(", warped motion");
+    if (hdr.use_ref_frame_mvs) std::printf(", ref frame mvs");
+    std::printf("\n");
+  }
+
+  if (hdr.tiles.cols <= 0) return; /* parsing stopped before the filter parameters */
+
   std::printf("  deblock %d/%d luma, %d/%d chroma, sharpness %d; cdef damping %d",
               hdr.loop_filter.level_y[0], hdr.loop_filter.level_y[1],
               hdr.loop_filter.level_u, hdr.loop_filter.level_v,
@@ -77,19 +110,25 @@ void print_frame(const FrameHeader& hdr, size_t payload_size) {
     for (int i = 0; i < count && i < 8; ++i) std::printf(" %d", hdr.cdef.y_strength[i]);
   }
   std::printf("\n");
+  if (hdr.segmentation_enabled) std::printf("  segmentation on\n");
+  if (hdr.delta_q_present) {
+    std::printf("  delta Q per superblock (res %d)%s\n", hdr.delta_q_res,
+                hdr.delta_lf_present ? ", delta LF" : "");
+  }
   if (hdr.frame_id_present) std::printf("  frame id %d\n", hdr.frame_id);
   if (hdr.reduced_tx_set) std::printf("  reduced transform set\n");
-  if (tile_bytes == 0) {
-    std::printf("  no tile data in this OBU; decoding is not implemented yet\n");
-  } else {
+
+  if (parsed == ParseStatus::Ok && payload_size > hdr.tile_data_offset) {
     std::printf("  tile data: %zu bytes at offset %zu; decoding is not implemented yet\n",
-                tile_bytes, hdr.tile_data_offset);
+                payload_size - hdr.tile_data_offset, hdr.tile_data_offset);
+  } else if (parsed == ParseStatus::Ok) {
+    std::printf("  no tile data in this OBU; decoding is not implemented yet\n");
   }
 }
 
 /* Returns 0 on success, 1 on an invalid stream. */
 int probe_temporal_unit(const std::vector<uint8_t>& unit, size_t index,
-                        SequenceHeader* seq, bool* have_seq) {
+                        SequenceHeader* seq, bool* have_seq, RefPool* refs) {
   std::vector<Obu> obus;
   std::string error;
   if (!split_obus(unit.data(), unit.size(), &obus, &error)) {
@@ -114,15 +153,17 @@ int probe_temporal_unit(const std::vector<uint8_t>& unit, size_t index,
         return 1;
       }
       FrameHeader hdr;
-      const ParseStatus parsed = parse_frame_header(*seq, obu.data, obu.size, &hdr, &error);
+      const ParseStatus parsed =
+          parse_frame_header(*seq, obu.data, obu.size, &hdr, &error, refs);
       if (parsed == ParseStatus::Invalid) {
         std::printf("  frame header invalid: %s\n", error.c_str());
         return 1;
       }
-      print_frame(hdr, obu.size);
+      print_frame(hdr, obu.size, parsed);
       if (parsed == ParseStatus::Unsupported) {
         std::printf("  front-end: %s\n", error.c_str());
       }
+      refresh_ref_pool(hdr, refs);
     }
   }
   return status;
@@ -180,6 +221,7 @@ int main(int argc, char** argv) {
 
   SequenceHeader seq;
   bool have_seq = false;
+  RefPool refs;
   int status = 0;
 
   if (data.size() >= 4 && std::memcmp(data.data(), "DKIF", 4) == 0) {
@@ -203,7 +245,7 @@ int main(int argc, char** argv) {
         break;
       }
       std::printf("temporal unit %zu (%zu bytes)\n", index, frame.payload.size());
-      if (probe_temporal_unit(frame.payload, index, &seq, &have_seq) != 0) {
+      if (probe_temporal_unit(frame.payload, index, &seq, &have_seq, &refs) != 0) {
         status = 1;
         break;
       }
@@ -212,7 +254,7 @@ int main(int argc, char** argv) {
     std::printf("parsed %zu temporal unit(s)\n", reader.frames_read());
   } else {
     std::printf("%s: raw OBU stream, %zu bytes\n", path.c_str(), data.size());
-    status = probe_temporal_unit(data, 0, &seq, &have_seq);
+    status = probe_temporal_unit(data, 0, &seq, &have_seq, &refs);
   }
 
   if (!have_seq) {
