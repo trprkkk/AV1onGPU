@@ -15,6 +15,7 @@
 
 #include "frontend/bitreader.hpp"
 #include "frontend/coef_tables.hpp"
+#include "frontend/dequant.hpp"
 #include "frontend/headers.hpp"
 #include "frontend/ivf.hpp"
 #include "frontend/obu.hpp"
@@ -1072,6 +1073,25 @@ void test_tile_decoder() {
   CHECK_EQ(result.coefficients, 64301u);
   CHECK_EQ(result.levels.size(), 64301u);
   CHECK_EQ(result.bytes_used, tile_size);
+
+  /* Dequantisation: the levels expanded back into raster order at the frame's
+   * step sizes. dav1d's own dequantised coefficients for this frame sum to
+   * 3329521 with 26102 non-zero values, which pins the quantiser tables, the
+   * per plane step sizes, the transform size shift and the scan inversion all
+   * at once. */
+  DequantisedTile dequantised;
+  dequantise_tile(header, seq.bit_depth, result, &dequantised);
+  CHECK_EQ(dequantised.bit_depth, 8);
+  CHECK_EQ(dequantised.offsets.size(), static_cast<size_t>(result.transform_blocks));
+  long long magnitude_sum = 0;
+  int non_zero = 0;
+  for (int32_t value : dequantised.coefficients) {
+    if (value == 0) continue;
+    magnitude_sum += value < 0 ? -value : value;
+    ++non_zero;
+  }
+  CHECK_EQ(non_zero, 26102);
+  CHECK_EQ(magnitude_sum, 3329521LL);
 
   /* inter frames are refused rather than misparsed */
   TileDecodeResult other;
