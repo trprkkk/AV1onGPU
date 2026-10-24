@@ -1,0 +1,15 @@
+# build trees
+build/
+build-*/
+out/
+cmake-build-*/
+
+# editor / tool droppings
+.vscode/
+.idea/
+*.swp
+compile_commands.json
+
+# python
+__pycache__/
+*.pyc
