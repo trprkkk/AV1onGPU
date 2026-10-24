@@ -36,7 +36,7 @@ void apply_post_filters_host(Frame* frame, const FrameSyntax& syntax) {
       job.len = e.length;
       job.level = e.level;
       job.sharpness = syntax.sharpness;
-      job.filter_len = e.filter_len;
+      job.filter_size = e.filter_size;
       job.is_chroma = plane != 0;
       job.bitdepth = frame->bit_depth;
       av1g_deblock_job(&job, frame->plane(plane), maxv);

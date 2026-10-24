@@ -395,7 +395,7 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
           edge.length = std::min(step, ph - y);
           if (edge.length < 4) continue;
           edge.level = cfg.deblock_level;
-          edge.filter_len = (p == 0) ? 8 : 6;
+          edge.filter_size = 8;
           syntax.deblock.push_back(edge);
         }
       }
@@ -409,7 +409,7 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
           edge.length = std::min(step, pw - x);
           if (edge.length < 4) continue;
           edge.level = cfg.deblock_level;
-          edge.filter_len = (p == 0) ? 8 : 6;
+          edge.filter_size = 8;
           syntax.deblock.push_back(edge);
         }
       }

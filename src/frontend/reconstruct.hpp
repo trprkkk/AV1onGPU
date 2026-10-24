@@ -47,6 +47,7 @@
 #include "av1gpu/av1gpu.hpp"
 #include "frontend/block_size.hpp"
 #include "frontend/coef_model.hpp"
+#include "frontend/deblock.hpp"
 #include "frontend/dequant.hpp"
 #include "frontend/headers.hpp"
 #include "frontend/tile_decoder.hpp"
@@ -369,6 +370,11 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
       st.decoded[plane].fill(grid_x, grid_y, grid_x + step_x, grid_y + step_y, 1);
     }
   }
+
+  /* The loop filter's edges come from the block grid, not from the transform
+   * blocks: whether an edge is filtered depends on the transform sizes on both
+   * sides of it and on the block that owns it. */
+  if (!plan_deblock(seq, frame, tile, out, error)) return false;
 
   return true;
 }

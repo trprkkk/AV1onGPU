@@ -393,7 +393,7 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
       job.len = e.length;
       job.level = e.level;
       job.sharpness = syntax.sharpness;
-      job.filter_len = e.filter_len;
+      job.filter_size = e.filter_size;
       job.is_chroma = plane != 0;
       job.bitdepth = geom.bit_depth;
       (e.vertical ? plan->deblock_v : plan->deblock_h).push_back(job);

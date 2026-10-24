@@ -416,7 +416,12 @@ class TileParser {
               const int rem = static_cast<int>(decoder_.read_literal(3)) + 1;
               lf_abs = static_cast<int>(decoder_.read_literal(rem)) + (1 << rem) + 1;
             }
-            if (lf_abs != 0) decoder_.read_bit(); /* the sign is applied by the filters */
+            if (lf_abs != 0) {
+              const int sign = decoder_.read_bit() ? -1 : 1;
+              /* DeltaLF is a running value, clipped like the specification says */
+              const int value = delta_lf_[i] + (sign * lf_abs << frame_.delta_lf_res);
+              delta_lf_[i] = std::max(-63, std::min(63, value));
+            }
           }
         }
       }
@@ -505,6 +510,8 @@ class TileParser {
     }
     block.tx_size = tx;
     block.qindex = current_q_;
+
+    for (int i = 0; i < 4; ++i) block.delta_lf[i] = delta_lf_[i];
 
     mark_block(row, col, bw4, bh4, size, block.skip, block.y_mode);
     mark_tx(row, col, tx);
@@ -952,6 +959,9 @@ class TileParser {
 
   int tile_col_start_ = 0, tile_col_end_ = 0, tile_row_start_ = 0, tile_row_end_ = 0;
   int current_q_ = 0;
+  /* DeltaLF[0..3]: a running per tile value, updated by the delta_lf syntax at
+   * a superblock start and copied into every block of that superblock. */
+  int delta_lf_[4] = {0, 0, 0, 0};
   bool read_deltas_ = false;
 
   std::vector<uint8_t> mi_size_;
@@ -985,6 +995,7 @@ class TileParser {
     }
     init_default_cdf(&cdf_, frame_.base_q_idx);
     current_q_ = frame_.base_q_idx;
+    for (int i = 0; i < 4; ++i) delta_lf_[i] = 0;
     decoder_.init(data_, size_, !frame_.disable_cdf_update);
   }
 };

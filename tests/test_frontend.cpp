@@ -1145,13 +1145,49 @@ void test_tile_decoder() {
       if (b.mode == av1gpu::PredictionMode::ChromaFromLuma) ++cfl_blocks;
     CHECK(cfl_blocks > 0);
 
+    /* ---- the deblock plan -------------------------------------------------- */
+    /* The edge plan comes out of the front end rather than the backend, so it
+     * can be checked here without a device: one edge per four samples of every
+     * filtering pass of every plane, levels bounded by the frame header, and
+     * nothing outside of the planes. */
+    CHECK(!syntax.deblock.empty());
+    CHECK_EQ(syntax.sharpness, 0);
+    int deblock_planes[3] = {0, 0, 0};
+    int deblock_filter_sizes[3] = {0, 0, 0};
+    for (const av1gpu::DeblockEdge& e : syntax.deblock) {
+      CHECK(e.plane >= 0 && e.plane < 3);
+      CHECK(e.level > 0 && e.level <= 63);
+      CHECK(e.filter_size == 4 || e.filter_size == 8 || e.filter_size == 16);
+      CHECK(e.length > 0 && e.length % 4 == 0);
+      const int pw = e.plane == 0 ? w : (w + 1) >> 1;
+      const int ph = e.plane == 0 ? h : (h + 1) >> 1;
+      if (e.vertical) {
+        CHECK(e.x >= 0 && e.x < pw);
+        CHECK(e.y >= 0 && e.y + e.length <= ph);
+      } else {
+        CHECK(e.y >= 0 && e.y < ph);
+        CHECK(e.x >= 0 && e.x + e.length <= pw);
+      }
+      ++deblock_planes[e.plane];
+      if (e.filter_size == 16) ++deblock_filter_sizes[e.plane];
+    }
+    CHECK(deblock_planes[0] > 0 && deblock_planes[1] > 0 && deblock_planes[2] > 0);
+    /* Frame 0 signals level 2 for both luma passes and level 1 for each chroma
+     * plane, with no segment or delta-lf adjustment anywhere in the frame. */
+    for (const av1gpu::DeblockEdge& e : syntax.deblock)
+      CHECK_EQ(e.level, e.plane == 0 ? 2 : 1);
+    std::printf("  %d deblock edge(s), %d/%d/%d per plane\n",
+                static_cast<int>(syntax.deblock.size()), deblock_planes[0],
+                deblock_planes[1], deblock_planes[2]);
+
     /* ---- the reconstruction ------------------------------------------------ */
     /* The engine's own arithmetic, on the syntax of a real frame, compared with
-     * dav1d's reference picture for it. dav1d was run with the in-loop filters
-     * disabled because the plan carries no filter parameters, and the two
-     * pictures are bit identical; the hash below is that picture, so any change
-     * in parsing, prediction, chroma from luma or the inverse transforms that
-     * costs a single least significant bit fails here. */
+     * dav1d's reference picture for it. dav1d was run with the deblocking filter
+     * as its only in-loop filter, and the two pictures are bit identical; the
+     * hash below is that picture, so any change in parsing, prediction, chroma
+     * from luma, the inverse transforms or the filter that costs a single least
+     * significant bit fails here. (Without the filter the plane hash is
+     * 0x6112581932b92e2c.) */
     av1gpu::BackendOptions options;
     options.kind = av1gpu::BackendKind::Cpu;
     std::string decode_error;
@@ -1177,7 +1213,101 @@ void test_tile_decoder() {
                 static_cast<unsigned long long>(hash), cfl_blocks);
     /* dav1d's picture, plane by plane, 8 bits per sample, is this frame:
      * 320x240 luma then 160x120 of each chroma plane. */
-    CHECK_EQ(hash, 0x6112581932b92e2cULL);
+    CHECK_EQ(hash, 0x4fbc46962fc5e371ULL);
+
+    /* ---- a much stronger filter, from the same tile data ------------------- */
+    /* The levels are the only thing frame 0's levels of 2 and 1 leave out: at
+     * level 2 the filter barely moves 204 samples of this picture. The levels
+     * are uncompressed header syntax, six bits each, so they can be patched in
+     * place without shifting a single tile byte - and the tile decode above
+     * stays valid, because nothing in the tile depends on them. Each variant's
+     * hash is dav1d's output for the patched file (deblocking filter enabled,
+     * the other in-loop filters off), so the wide filters, the flat masks and
+     * the per pass, per plane level selection are all compared sample for
+     * sample against a reference decoder. */
+    auto decode_with_levels = [&](const int levels[4], FrameSyntax* out_syntax,
+                                  av1gpu::Frame* out_picture, uint64_t* out_hash) {
+      std::vector<uint8_t> tu = frame.payload;
+      size_t obu_start = 0;
+      for (const Obu& obu : obus)
+        if (obu.type == ObuType::Frame || obu.type == ObuType::FrameHeader) {
+          obu_start = static_cast<size_t>(obu.data - frame.payload.data());
+          break;
+        }
+      /* loop_filter_level_y0 sits 36 bits into this stream's frame header. */
+      const size_t base = obu_start * 8 + 36;
+      for (int i = 0; i < 4; ++i)
+        for (int bit = 0; bit < 6; ++bit) {
+          const size_t pos = base + static_cast<size_t>(i) * 6 + static_cast<size_t>(bit);
+          const uint8_t mask = static_cast<uint8_t>(1u << (7 - (pos & 7)));
+          if ((levels[i] >> (5 - bit)) & 1) {
+            tu[pos >> 3] = static_cast<uint8_t>(tu[pos >> 3] | mask);
+          } else {
+            tu[pos >> 3] = static_cast<uint8_t>(tu[pos >> 3] & ~mask);
+          }
+        }
+      std::vector<Obu> patched;
+      if (!split_obus(tu.data(), tu.size(), &patched, &error)) return false;
+      FrameHeader patched_header;
+      bool have_header = false;
+      for (const Obu& obu : patched)
+        if (obu.type == ObuType::Frame || obu.type == ObuType::FrameHeader) {
+          if (parse_frame_header(seq, obu.data, obu.size, &patched_header, &error) !=
+              ParseStatus::Ok)
+            return false;
+          have_header = true;
+          break;
+        }
+      if (!have_header) return false;
+      /* a wrong offset would land in another field, so prove the patch landed */
+      if (patched_header.loop_filter.level_y[0] != levels[0] ||
+          patched_header.loop_filter.level_y[1] != levels[1] ||
+          patched_header.loop_filter.level_u != levels[2] ||
+          patched_header.loop_filter.level_v != levels[3])
+        return false;
+      if (!plan_from_tile(seq, patched_header, result, dequantised, out_syntax, &error))
+        return false;
+      if (!decoder->decode(*out_syntax, out_picture, &decode_error)) return false;
+      uint64_t h = 1469598103934665603ull;
+      for (int p = 0; p < 3; ++p) {
+        const int pw = out_picture->plane_width(p), ph = out_picture->plane_height(p);
+        for (int y = 0; y < ph; ++y) {
+          const uint16_t* row = out_picture->plane(p) + static_cast<size_t>(y) * out_picture->stride[p];
+          for (int x = 0; x < pw; ++x)
+            h = (h ^ static_cast<uint64_t>(row[x] & 0xff)) * 1099511628211ull;
+        }
+      }
+      *out_hash = h;
+      return true;
+    };
+
+    const int level_63[4] = {63, 63, 63, 63};
+    FrameSyntax strong_syntax;
+    av1gpu::Frame strong_picture;
+    uint64_t strong_hash = 0;
+    CHECK(decode_with_levels(level_63, &strong_syntax, &strong_picture, &strong_hash));
+    if (strong_hash) {
+      /* 15666 of the luma samples move here, up to 11 away from the unfiltered
+       * picture, so this covers far more of the filter than level 2 does. */
+      CHECK_EQ(strong_hash, 0x5301b2a20f51ba8fULL);
+      for (const av1gpu::DeblockEdge& e : strong_syntax.deblock) CHECK_EQ(e.level, 63);
+    }
+
+    /* A different level for every pass and plane pins the index the selection
+     * uses: luma vertical, luma horizontal, U, V. */
+    const int mixed[4] = {40, 12, 24, 51};
+    FrameSyntax mixed_syntax;
+    av1gpu::Frame mixed_picture;
+    uint64_t mixed_hash = 0;
+    CHECK(decode_with_levels(mixed, &mixed_syntax, &mixed_picture, &mixed_hash));
+    if (mixed_hash) {
+      CHECK_EQ(mixed_hash, 0xbecedc2b0af15ddaULL);
+      for (const av1gpu::DeblockEdge& e : mixed_syntax.deblock) {
+        const int want = e.plane == 0 ? (e.vertical ? mixed[0] : mixed[1])
+                                      : (e.plane == 1 ? mixed[2] : mixed[3]);
+        CHECK_EQ(e.level, want);
+      }
+    }
   }
 
   /* inter frames are refused rather than misparsed */

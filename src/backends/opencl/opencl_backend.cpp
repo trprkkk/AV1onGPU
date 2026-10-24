@@ -334,7 +334,7 @@ class OpenCLBackend final : public Backend {
       int total = 0;
       cl_mem job_mem = 0, pref_mem = 0;
       if (!upload_jobs(*pass, &job_mem, &pref_mem, &total,
-                       [](const Av1gDeblockJob& j) { return j.len / 4; }))
+                       [](const Av1gDeblockJob& j) { return (j.len + 3) / 4; }))
         return fail(error, "deblock job upload failed");
       cl_kernel k = kernel("av1g_k_deblock");
       set_mem(k, 0, job_mem);

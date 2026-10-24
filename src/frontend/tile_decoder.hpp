@@ -104,6 +104,9 @@ struct TileBlock {
   int filter_intra_mode = 0;
   int palette_size[2] = {0, 0};
   int segment_id = 0;
+  /* DeltaLFs[..][0..3]: the loop filter's delta, accumulated per superblock by
+   * the delta_lf syntax (zero when the frame does not use it). */
+  int delta_lf[4] = {0, 0, 0, 0};
 
   bool has_chroma = true;
   bool have_left = false;

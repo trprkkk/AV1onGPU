@@ -674,7 +674,7 @@ void test_filters() {
     job.step = 1;
     job.len = 8;
     job.level = 32;
-    job.filter_len = 8;
+    job.filter_size = 8;
     job.bitdepth = 8;
     av1g_deblock_job(&job, plane.data(), 255);
     bool flat = true;
@@ -694,7 +694,7 @@ void test_filters() {
     job.step = 1;
     job.len = 4;
     job.level = 16;
-    job.filter_len = 8;
+    job.filter_size = 8;
     job.bitdepth = 8;
     av1g_deblock_job(&job, plane.data(), 255);
     CHECK(plane[4 * stride + 8] < 128);

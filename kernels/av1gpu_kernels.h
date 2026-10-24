@@ -148,10 +148,12 @@ typedef struct {
   int p_off;      /* sample p1 of the first group                        */
   int stride;     /* step across the edge: p0 = p1 + stride, ...          */
   int step;       /* step along the edge between samples                 */
-  int len;
+  int len;        /* samples along the edge; the last group may be short */
   int level;      /* deblocking level for this edge (0 => skip)          */
   int sharpness;
-  int filter_len; /* 4, 6 or 8 taps (14 is handled as 8)                 */
+  int filter_size; /* the specification's filterSize: 4, 8 or 16; it sets
+                      the number of taps per side (4, 6 or 8 for luma, 4 or
+                      6 for chroma) and how flat the region has to be */
   int is_chroma;
   int bitdepth;
 } Av1gDeblockJob;
@@ -1252,18 +1254,142 @@ AV1G_HOST_FN void av1g_inter_block(const Av1gInterJob *job, av1g_px *dst,
 /* deblocking filter                                                  */
 /* ------------------------------------------------------------------ */
 
-/* spec-style threshold derivation from level and sharpness */
-AV1G_FN void av1g_thresholds(int level, int sharpness, int bitdepth, int *limit,
-                             int *blimit, int *thresh) {
-  const int shift = bitdepth - 8;
-  const int base = (level >> 4) * 4 + (level & 15);
-  int l = base - (((level & 15) == 0) ? 1 : 0);
+/* The adaptive filter strength process: level and sharpness give the three
+ * thresholds the filters compare against. `limit` bounds a single sample step,
+ * `blimit` the step across the edge, `thresh` the variance that makes a sample
+ * count as a real edge, and the filters scale all three by the bit depth. */
+AV1G_FN void av1g_thresholds(int level, int sharpness, int *limit, int *blimit,
+                             int *thresh) {
+  const int shift = sharpness > 4 ? 2 : (sharpness > 0 ? 1 : 0);
+  int l = level >> shift;
   if (l < 1) l = 1;
-  if (sharpness > 0 && l > 4) l -= (sharpness >> 2);
-  *limit = (l + 2) << shift;
-  *blimit = ((l + 2) * 3) << shift;
-  *thresh = (l >> 2) << shift;
-  if (*thresh < 1) *thresh = 1;
+  if (sharpness > 0 && l > 9 - sharpness) l = 9 - sharpness;
+  *limit = l;
+  *blimit = 2 * (level + 2) + l;
+  *thresh = level >> 4;
+}
+
+/* filter4_clamp: the intermediate range of the narrow filter, which is centred
+ * on zero instead of on the middle of the sample range. */
+AV1G_FN int av1g_filter4_clamp(int v, int bitdepth) {
+  const int lo = -(1 << (bitdepth - 1)), hi = (1 << (bitdepth - 1)) - 1;
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/*
+ * One sample position of one edge: the filter mask process of the
+ * specification and then the narrow or the wide filter it selects.
+ *
+ * `base` points at p1, so p0 is one stride step further in, p2 one back, and
+ * q0 two steps in (see the job layout above). Edge filtering never crosses a
+ * transform block boundary, so every tap this reads is inside the frame.
+ */
+AV1G_FN void av1g_deblock_px(AV1G_GLOBAL av1g_px *const base, int stride,
+                             const Av1gDeblockJob *job, int maxv) {
+  const int bitdepth = job->bitdepth;
+  const int filter_size = job->filter_size;
+  const int shift = bitdepth - 8;
+  const int mid = 0x80 << shift;
+  const int p1 = (int)base[0];
+  const int p0 = (int)base[stride];
+  const int q0 = (int)base[2 * stride];
+  const int q1 = (int)base[3 * stride];
+  /* how many taps each side the masks look at: 4 for the smallest filter, 6
+   * for chroma, 8 for a luma filter of 8 and 16 for the widest one */
+  const int filter_len =
+      filter_size == 4 ? 4 : (job->is_chroma ? 6 : (filter_size == 8 ? 8 : 16));
+  int limit, blimit, thresh;
+  int limit_bd, blimit_bd, thresh_bd, flat_bd;
+  int mask, hev_mask, flat_mask = 1, flat_mask2 = 1;
+
+  if (job->level == 0) return;
+  av1g_thresholds(job->level, job->sharpness, &limit, &blimit, &thresh);
+  limit_bd = limit << shift;
+  blimit_bd = blimit << shift;
+  thresh_bd = thresh << shift;
+  flat_bd = 1 << shift;
+
+  hev_mask = (av1g_abs(p1 - p0) > thresh_bd) || (av1g_abs(q1 - q0) > thresh_bd);
+
+  mask = 0;
+  mask |= (av1g_abs(p1 - p0) > limit_bd);
+  mask |= (av1g_abs(q1 - q0) > limit_bd);
+  mask |= (av1g_abs(p0 - q0) * 2 + av1g_abs(p1 - q1) / 2 > blimit_bd);
+  if (filter_len >= 6) {
+    const int p2 = (int)base[-stride], q2 = (int)base[4 * stride];
+    mask |= (av1g_abs(p2 - p1) > limit_bd);
+    mask |= (av1g_abs(q2 - q1) > limit_bd);
+  }
+  if (filter_len >= 8) {
+    const int p3 = (int)base[-2 * stride], q3 = (int)base[5 * stride];
+    mask |= (av1g_abs(p3 - (int)base[-stride]) > limit_bd);
+    mask |= (av1g_abs(q3 - (int)base[4 * stride]) > limit_bd);
+  }
+  if (mask != 0) return; /* filterMask == 0: leave the edge alone */
+
+  if (filter_size >= 8) {
+    /* flatMask: the four (or eight) samples on each side are within one step of
+     * the sample at the boundary, i.e. the region is flat enough for the wide
+     * filter */
+    mask = 0;
+    mask |= (av1g_abs(p1 - p0) > flat_bd);
+    mask |= (av1g_abs(q1 - q0) > flat_bd);
+    mask |= (av1g_abs((int)base[-stride] - p0) > flat_bd);
+    mask |= (av1g_abs((int)base[4 * stride] - q0) > flat_bd);
+    if (filter_len >= 8) {
+      mask |= (av1g_abs((int)base[-2 * stride] - p0) > flat_bd);
+      mask |= (av1g_abs((int)base[5 * stride] - q0) > flat_bd);
+    }
+    flat_mask = mask == 0;
+  }
+  if (filter_size >= 16) {
+    /* flatMask2: and the samples further out are too */
+    mask = 0;
+    mask |= (av1g_abs((int)base[-5 * stride] - p0) > flat_bd);
+    mask |= (av1g_abs((int)base[8 * stride] - q0) > flat_bd);
+    mask |= (av1g_abs((int)base[-4 * stride] - p0) > flat_bd);
+    mask |= (av1g_abs((int)base[7 * stride] - q0) > flat_bd);
+    mask |= (av1g_abs((int)base[-3 * stride] - p0) > flat_bd);
+    mask |= (av1g_abs((int)base[6 * stride] - q0) > flat_bd);
+    flat_mask2 = mask == 0;
+  }
+
+  if (filter_size == 4 || !flat_mask) {
+    /* narrow filter: the two samples next to the edge, and one more on each
+     * side when the edge is not a high variance one */
+    const int ps1 = p1 - mid, ps0 = p0 - mid;
+    const int qs0 = q0 - mid, qs1 = q1 - mid;
+    int filter = hev_mask ? av1g_filter4_clamp(ps1 - qs1, bitdepth) : 0;
+    int filter1, filter2;
+    filter = av1g_filter4_clamp(filter + 3 * (qs0 - ps0), bitdepth);
+    filter1 = av1g_filter4_clamp(filter + 4, bitdepth) >> 3;
+    filter2 = av1g_filter4_clamp(filter + 3, bitdepth) >> 3;
+    base[2 * stride] = (av1g_px)av1g_clip_px(av1g_filter4_clamp(qs0 - filter1, bitdepth) + mid, maxv);
+    base[stride] = (av1g_px)av1g_clip_px(av1g_filter4_clamp(ps0 + filter2, bitdepth) + mid, maxv);
+    if (!hev_mask) {
+      const int f = av1g_round2(filter1, 1);
+      base[3 * stride] = (av1g_px)av1g_clip_px(av1g_filter4_clamp(qs1 - f, bitdepth) + mid, maxv);
+      base[0] = (av1g_px)av1g_clip_px(av1g_filter4_clamp(ps1 + f, bitdepth) + mid, maxv);
+    }
+  } else {
+    /* wide filter: a low pass with unity DC gain over the whole row of taps */
+    const int log2_size = (filter_size == 8 || !flat_mask2) ? 3 : 4;
+    const int n = log2_size == 4 ? 6 : (job->is_chroma ? 2 : 3);
+    const int n2 = (log2_size == 3 && !job->is_chroma) ? 0 : 1;
+    int out[12];
+    int i, j;
+    for (i = -n; i < n; ++i) {
+      int t = 0;
+      for (j = -n; j <= n; ++j) {
+        int tap = i + j;
+        tap = tap < -(n + 1) ? -(n + 1) : (tap > n ? n : tap);
+        t += (int)base[(2 + tap) * stride] * (av1g_abs(j) <= n2 ? 2 : 1);
+      }
+      out[i + n] = av1g_round2(t, log2_size);
+    }
+    for (i = -n; i < n; ++i)
+      base[(2 + i) * stride] = (av1g_px)av1g_clip_px(out[i + n], maxv);
+  }
 }
 
 /*
@@ -1275,51 +1401,13 @@ AV1G_FN void av1g_thresholds(int level, int sharpness, int bitdepth, int *limit,
  */
 AV1G_FN void av1g_deblock_group(const Av1gDeblockJob *job,
                                 AV1G_GLOBAL av1g_px *plane, int g, int maxv) {
-  const int stride = job->stride;
-  int limit, blimit, thresh;
   int k;
-
   if (job->level == 0) return;
-  av1g_thresholds(job->level, job->sharpness, job->bitdepth, &limit, &blimit, &thresh);
-
-  for (k = 0; k < 4; ++k) {
-    AV1G_GLOBAL av1g_px *base = plane + job->p_off + (g + k) * job->step;
-    const int p1 = (int)base[0];
-    const int p0 = (int)base[stride];
-    const int q0 = (int)base[2 * stride];
-    const int q1 = (int)base[3 * stride];
-    const int p2 = (job->filter_len >= 6) ? (int)base[-stride] : p1;
-    const int q2 = (job->filter_len >= 6) ? (int)base[4 * stride] : q1;
-    int f, hev;
-
-    /* skip flat areas and real image edges */
-    if (av1g_abs(p0 - q0) * 2 + (av1g_abs(p1 - q1) >> 1) > blimit) continue;
-
-    {
-      const int f0 = av1g_clip(av1g_abs(p1 - q0), 0, 128);
-      const int f1 = av1g_clip(av1g_abs(q1 - p0), 0, 128);
-      f = av1g_clip(av1g_sign(p0 - q0) * ((f0 + f1 + 1) >> 1), -limit, limit);
-    }
-    hev = (av1g_abs(p1 - p0) > thresh) || (av1g_abs(q1 - q0) > thresh);
-
-    if (job->filter_len == 4 || !hev) {
-      /* narrow filter: only the two samples closest to the edge change */
-      base[stride] = (av1g_px)av1g_clip_px(p0 - f, maxv);
-      base[2 * stride] = (av1g_px)av1g_clip_px(q0 + f, maxv);
-    } else {
-      const int p0n = av1g_clip_px(p0 - f, maxv);
-      const int q0n = av1g_clip_px(q0 + f, maxv);
-      base[stride] = (av1g_px)p0n;
-      base[2 * stride] = (av1g_px)q0n;
-      if (job->filter_len >= 6) {
-        const int mid = (p0n + q0n + 1) >> 1;
-        const int hp = av1g_clip((p2 + mid - (p1 << 1)) >> 1, -limit, limit);
-        const int hq = av1g_clip((q2 + mid - (q1 << 1)) >> 1, -limit, limit);
-        base[0] = (av1g_px)av1g_clip_px(p1 + hp, maxv);
-        base[3 * stride] = (av1g_px)av1g_clip_px(q1 + hq, maxv);
-      }
-    }
-  }
+  /* The last group of an edge may be shorter than four samples when the frame
+   * ends in the middle of one; the samples past the edge are not filtered. */
+  for (k = 0; k < 4 && g + k < job->len; ++k)
+    av1g_deblock_px(plane + job->p_off + (g + k) * job->step, job->stride, job,
+                    maxv);
 }
 
 #if !defined(AV1G_DEVICE)

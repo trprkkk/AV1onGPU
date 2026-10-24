@@ -250,7 +250,10 @@ struct DeblockEdge {
   bool vertical = true;
   int length = 0;
   int level = 0;
-  int filter_len = 8; /* 4, 6 or 8 */
+  /* The specification's filterSize: the maximum number of taps the filter may
+   * use (4, 8 or 16). The filter itself picks 4, 6 or 8 taps per side from it
+   * and from the plane, so this is not the tap count. */
+  int filter_size = 8;
 };
 
 /* One 8x8 CDEF block (luma grid; chroma blocks are selected per plane). */

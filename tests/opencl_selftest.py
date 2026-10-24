@@ -85,7 +85,7 @@ int main() {
   S(Av1gDeblockJob);
   F(Av1gDeblockJob, p_off); F(Av1gDeblockJob, stride); F(Av1gDeblockJob, step);
   F(Av1gDeblockJob, len); F(Av1gDeblockJob, level); F(Av1gDeblockJob, sharpness);
-  F(Av1gDeblockJob, filter_len); F(Av1gDeblockJob, is_chroma);
+  F(Av1gDeblockJob, filter_size); F(Av1gDeblockJob, is_chroma);
   F(Av1gDeblockJob, bitdepth);
   S(Av1gCdefJob);
   F(Av1gCdefJob, src_off); F(Av1gCdefJob, src_stride); F(Av1gCdefJob, dst_off);
@@ -369,7 +369,7 @@ def main():
     db.step = stride
     db.len = 8
     db.level = 32
-    db.filter_len = 8
+    db.filter_size = 8
     db.bitdepth = 8
     dbuf = upload(np.frombuffer(db, dtype=np.uint8).copy())
     dpref, dtotal = prefix([db.len // 4])
@@ -400,7 +400,7 @@ def main():
     db.len = 8                   # two groups, rows 8..15
     db.level = 32                # limit 9, blimit 27, thresh 1
     db.sharpness = 0
-    db.filter_len = 4            # narrow filter only
+    db.filter_size = 4           # narrow filter only
     db.bitdepth = 8
     dbuf = upload(np.frombuffer(db, dtype=np.uint8).copy())
     dpref, dtotal = prefix([db.len // 4])
@@ -410,13 +410,44 @@ def main():
            np.int32(dtotal), edge_buf, np.int32(255))
     queue.finish()
     out = download(edge_buf, edge.shape).reshape(size, stride)
-    # f = -8 for this step edge (same formula as the host helper), so p0 and q0
-    # move one closed-form step towards each other on *every* row of the edge.
-    touched = out[8:16, 7].astype(int).tolist() + out[8:16, 8].astype(int).tolist()
+    # level 32, sharpness 0 gives limit 9, blimit 27 and thresh 1, so the step
+    # edge passes the mask but is not flat; the narrow filter then moves p1/p0
+    # up and q0/q1 down by the same amount on *every* row of the edge, which
+    # catches both a group/sample index mix-up and a wrongly shared delta.
+    cols = out[8:16, 4:12].astype(int)
     check("deblock filters every row of a long edge",
-          bool(len(set(out[8:16, 7].astype(int).tolist())) == 1 and
-               len(set(out[8:16, 8].astype(int).tolist())) == 1 and
-               out[8, 7] == 48 and out[8, 8] == 40), True)
+          bool((cols == np.array([24, 24, 42, 43, 45, 46, 24, 24])).all()), True)
+
+    # The plane edge may cut an edge short: the last group then filters fewer
+    # than four samples and must not touch the samples past the edge.
+    short = np.full(stride * size, 24, dtype=np.uint16)
+    spic = short.reshape(size, stride)
+    for row in range(8, 16):
+        spic[row, 6] = 40
+        spic[row, 7] = 40
+        spic[row, 8] = 48
+        spic[row, 9] = 48
+    db = DeblockJob()
+    db.p_off = 8 * stride + 6
+    db.stride = step_of
+    db.step = stride
+    db.len = 6                   # one full group plus two samples
+    db.level = 32
+    db.sharpness = 0
+    db.filter_size = 4
+    db.bitdepth = 8
+    dbuf = upload(np.frombuffer(db, dtype=np.uint8).copy())
+    dpref, dtotal = prefix([(db.len + 3) // 4])
+    dpref_buf = upload(dpref)
+    short_buf = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR,
+                          hostbuf=short)
+    launch(None, program.av1g_k_deblock, dtotal, dbuf, dpref_buf, np.int32(1),
+           np.int32(dtotal), short_buf, np.int32(255))
+    queue.finish()
+    out = download(short_buf, short.shape).reshape(size, stride)
+    check("deblock stops at the end of a short edge",
+          bool((out[8:14, 7] == 43).all() and (out[14:16, 7] == 40).all() and
+               (out[8:14, 8] == 45).all() and (out[14:16, 8] == 48).all()), True)
     untouched = (out[:, :6] == 24).all() and (out[:, 10:] == 24).all()
     untouched = untouched and (out[:8, 6:10] == 24).all() and (out[16:, 6:10] == 24).all()
     # only p0/q0 move with the narrow filter, and only on the rows of the edge
