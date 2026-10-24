@@ -25,6 +25,7 @@
 
 #include "data/tile_trace.hpp"
 #include "entropy_vectors.hpp"
+#include "frontend/cdf.hpp"
 #include "frontend/headers.hpp"
 #include "frontend/ivf.hpp"
 #include "frontend/obu.hpp"
@@ -333,6 +334,18 @@ void test_real_tile_trace() {
     unsigned value = 0;
     if (kind == 0) {
       const int count = tile_trace::kCount[i];
+      if (i == 0) {
+        /* the very first symbol of the tile is the 64x64 partition, decoded
+         * out of our own default table rather than the recorded one */
+        using namespace av1gpu::frontend;
+        CdfContext defaults;
+        init_default_cdf(&defaults);
+        const unsigned first =
+            decoder.read_symbol(defaults.partition.row(kBlockLevel64x64, 0), 9);
+        CHECK_EQ(first, tile_trace::kValue[0]);
+        next += static_cast<size_t>(count);
+        continue;
+      }
       uint16_t table[kMaxCdfSymbols] = {0};
       for (int j = 0; j < count; ++j) table[j] = tile_trace::kCdf[next + j];
       next += static_cast<size_t>(count);
@@ -355,6 +368,49 @@ void test_real_tile_trace() {
   CHECK_EQ(state.count, tile_trace::kFinalCnt);
 }
 
+
+/* The defaults are normative numbers, so they can be checked against something
+ * external: dav1d recorded the exact table it used for the first symbol of the
+ * fixture's key frame, and that symbol is a partition of the 64x64 block at
+ * (0,0) - the first thing every key frame decodes. If the 32768 - x
+ * conversion, the row order or the counter placement were wrong, this fails
+ * before any syntax exists to get confused by. */
+void test_default_cdf() {
+  using namespace av1gpu::frontend;
+  CdfContext cdf;
+  init_default_cdf(&cdf);
+
+  /* the 64x64 partition row dav1d used for the first symbol of the tile */
+  const uint16_t* row = cdf.partition.row(kBlockLevel64x64, 0);
+  for (int i = 0; i < tile_trace::kCount[0]; ++i) CHECK_EQ(row[i], tile_trace::kCdf[i]);
+  CHECK_EQ(row[tile_trace::kCount[0]], 0u); /* the counter starts at zero */
+  /* eight partition types are reachable from a 128x128 block, ten from the
+   * levels below it, four from an 8x8 block */
+  CHECK_EQ(PartitionCdf::symbols(kBlockLevel128x128), 8);
+  CHECK_EQ(PartitionCdf::symbols(kBlockLevel64x64), 10);
+  CHECK_EQ(PartitionCdf::symbols(kBlockLevel8x8), 4);
+
+  /* skip: the 3 contexts are 32768 - {31671, 16515, 4576}; dav1d used 1097
+   * for a 32x32 block with no coded neighbours, which is the second bool it
+   * recorded */
+  CHECK_EQ(cdf.skip.row(0)[0], 1097u);
+  CHECK_EQ(cdf.skip.row(1)[0], 16253u);
+  CHECK_EQ(cdf.skip.row(2)[0], 28192u);
+  CHECK_EQ(cdf.skip.row(0)[1], 0u);
+
+  /* every row is a valid inverse CDF: probabilities decrease, the counter
+   * follows them, and nothing is left at 32768 (an interval of zero width) */
+  for (int level = 0; level < kBlockLevelCount; ++level) {
+    for (int context = 0; context < kPartitionContexts; ++context) {
+      const uint16_t* r = cdf.partition.row(level, context);
+      const int symbols = kPartitionSymbols[level];
+      CHECK(r[0] < 32768u);
+      for (int i = 1; i < symbols; ++i) CHECK(r[i] < r[i - 1]);
+      CHECK_EQ(r[symbols], 0u);
+    }
+  }
+}
+
 } /* namespace */
 
 int main() {
@@ -368,6 +424,7 @@ int main() {
   test_boolean_cdf();
   test_last_symbol();
   test_corrupt_table();
+  test_default_cdf();
   test_real_tile_trace();
   return testing::finish("test_entropy");
 }

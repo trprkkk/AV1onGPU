@@ -186,7 +186,15 @@ stream. Instead:
     the reference decoder formula, because the reference decoders are what real
     encoders target and what a stream has to be decoded with.
 
-Until the CDF tables and the syntax layer land (see `docs/ROADMAP.md`), the
+* **The default tables are checked against a real stream too.** The first symbol
+  of that tile is a 64x64 partition, so dav1d's recorded table for it has to
+  equal `init_default_cdf()`'s row for block level 64x64, context 0, entry for
+  entry - and decoding the symbol out of *our* table has to return the same
+  value and leave the same window/range/counter. That one symbol pins the table
+  convention (`32768 - x`, counter after the probabilities, symbol counts per
+  block level) before any syntax exists to get confused by.
+
+Until the syntax layer lands (see `docs/ROADMAP.md`), the
 front-end can read the tile bytes but not yet interpret them; the trace replay
 above is what makes "the symbol reader is right" a demonstrated fact rather than
 a claim.

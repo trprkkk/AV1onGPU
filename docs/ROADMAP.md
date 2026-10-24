@@ -34,15 +34,25 @@ can be split into independently decodable tiles.
 
 The symbol reader is bit identical to dav1d's `msac`: replaying dav1d's own
 per-symbol trace of the fixture's key frame reproduces all **112,648 events**
-and the range coder state at every one of them (see `docs/ACCURACY.md`). What is
-still missing is everything *above* the symbol reader: the specification's
-default CDF tables and the syntax layer that turns symbols into `FrameSyntax`.
+and the range coder state at every one of them (see `docs/ACCURACY.md`).
+
+**Started: the default probability tables.** `src/frontend/cdf.hpp` holds the
+specification's default tables for the partition symbol (all five block levels,
+all four contexts) and for skip, in the inverse-CDF layout the range decoder
+consumes. `tests/test_entropy.cpp` decodes the first symbol of the fixture's
+key frame out of those tables and requires dav1d's value, so the table
+convention (32768 - x, counter after the probabilities) is pinned against a real
+stream rather than only against the specification text. What is still missing is
+everything *above* the symbol reader: the default tables for the rest of the
+syntax, and the syntax layer that turns symbols into `FrameSyntax`.
 
 **Next, in order:**
 
-1. *CDF tables and the tile syntax.* The default probability tables from the
-   specification, then mode info, partition, transform and coefficient syntax on
-   top of the range decoder, plus `exit_symbol` and the end-of-frame CDF update.
+1. *CDF tables and the tile syntax.* Finish the default tables (mode info,
+   transform and coefficient syntax), then the superblock/partition loop that
+   consumes them, plus `exit_symbol` and the end-of-frame CDF update. The trace
+   of the fixture is the oracle for each layer: every symbol must come out of
+   the tables and in the order dav1d decoded it.
 2. *Tile and partition tree.* Superblock loop, partition symbols, block sizes,
    transform selection, and the coefficient syntax with its scan tables. This is
    the bulk of the work and the point where the front-end first emits a
