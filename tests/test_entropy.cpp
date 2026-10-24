@@ -411,6 +411,178 @@ void test_default_cdf() {
   }
 }
 
+/* One inverse CDF row: probabilities strictly decreasing, the adaptation
+ * counter right after the last symbol, and nothing left in the padding that
+ * follows it. */
+void check_row(const uint16_t* row, int symbols, const char* what) {
+  CHECK_EQ(row[symbols - 1], 0u);
+  if (symbols > 1) CHECK(row[0] < 32768u);
+  for (int i = 1; i < symbols - 1; ++i) {
+    if (row[i] >= row[i - 1]) {
+      std::printf("  %s: entry %d (%u) does not decrease from %u\n", what, i, row[i],
+                  row[i - 1]);
+      CHECK(false);
+      return;
+    }
+  }
+}
+
+/* The tables an inter frame reads. Two independent checks:
+ *
+ *   - the numbers, against the table dav1d's `src/cdf.c` builds with
+ *     CDF1/CDF2/... macros. Every row of every generated table was compared
+ *     with dav1d when the generator was written: 245 of 258 rows appear there
+ *     verbatim (the other 13 are the uniform wedge rows for the block sizes
+ *     AV1 cannot wedge, which dav1d does not store). The rows below are the
+ *     ones a mistake in the conversion, the transpose or the block size
+ *     ordering would move, so they are pinned here as well.
+ *
+ *   - the shape: every table is a valid inverse CDF layout, which is what makes
+ *     read_symbol safe on it. */
+void test_inter_cdf() {
+  using namespace av1gpu::frontend;
+  CdfContext cdf;
+  init_default_cdf(&cdf, 0); /* the inter tables do not depend on the quantiser */
+  const InterCdf& in = cdf.inter;
+
+  /* is_inter: dav1d's `.intra` is CDF1(806), CDF1(16662), CDF1(20186),
+   * CDF1(26538) */
+  CHECK_EQ(in.is_inter[0][0], 31962u);
+  CHECK_EQ(in.is_inter[1][0], 16106u);
+  CHECK_EQ(in.is_inter[2][0], 12582u);
+  CHECK_EQ(in.is_inter[3][0], 6230u);
+
+  /* skip_mode: CDF1(32621), CDF1(20708), CDF1(8127) */
+  CHECK_EQ(in.skip_mode[0][0], 147u);
+  CHECK_EQ(in.skip_mode[1][0], 12060u);
+  CHECK_EQ(in.skip_mode[2][0], 24641u);
+
+  /* compound or single: dav1d's `.comp`, CDF1(26828), CDF1(24035), ... */
+  CHECK_EQ(in.comp_mode[0][0], 5940u);
+  CHECK_EQ(in.comp_mode[4][0], 29867u);
+
+  /* compound type: dav1d's `.comp_dir` */
+  CHECK_EQ(in.comp_ref_type[0][0], 31570u);
+  CHECK_EQ(in.comp_ref_type[2][0], 23602u);
+  CHECK_EQ(in.comp_ref_type[4][0], 10293u);
+
+  /* the reference trees: dav1d keeps these transposed (six steps by three
+   * contexts), so a wrong axis swap shows up here */
+  CHECK_EQ(in.single_ref[0][0][0], 27871u);
+  CHECK_EQ(in.single_ref[2][5][0], 2464u);
+  CHECK_EQ(in.comp_ref[0][0][0], 27822u);
+  CHECK_EQ(in.comp_bwd_ref[1][1][0], 17593u);
+  CHECK_EQ(in.uni_comp_ref[2][0][0], 994u);   /* 32768 - 31774 */
+  CHECK_EQ(in.uni_comp_ref[2][2][0], 6058u);  /* 32768 - 26710 */
+  CHECK_EQ(in.comp_ref_type[1][0], 30698u);
+
+  /* compound mode and the two bits that choose the blend: dav1d's
+   * `.comp_inter_mode`, `.jnt_comp` and `.mask_comp` */
+  CHECK_EQ(in.compound_mode[0][0], 25008u);
+  CHECK_EQ(in.compound_mode[0][6], 5877u);
+  CHECK_EQ(in.compound_idx[0][0], 14524u);
+  CHECK_EQ(in.comp_group_idx[0][0], 6161u);
+  CHECK_EQ(in.comp_group_idx[5][0], 10094u);
+
+  /* distance weighted or wedge: dav1d's `.wedge_comp`, which only covers the
+   * block sizes that can be wedged - 8x8 is entry 3 of the specification's
+   * table, and 9337 is 32768 - 23431 */
+  CHECK_EQ(in.compound_type[kBlock8x8][0], 9337u);
+  CHECK_EQ(in.compound_type[kBlock8x16][0], 19597u);
+  CHECK_EQ(in.compound_type[kBlock4x4][0], 16384u); /* unreachable, but valid */
+  /* the wedge index: dav1d's `.wedge_idx` starts at 8x8 too, CDF15(2438, ...) */
+  CHECK_EQ(in.wedge_index[kBlock8x8][0], 30330u);
+  CHECK_EQ(in.wedge_index[kBlock8x8][14], 1597u);
+
+  /* inter/intra: dav1d's `.interintra` has four entries, the first of which is
+   * never used, so its index 1 is the specification's index 0 */
+  CHECK_EQ(in.inter_intra[0][0], 5881u);       /* 32768 - 26887 */
+  CHECK_EQ(in.inter_intra_mode[0][0], 30893u); /* 32768 - 1875 */
+  CHECK_EQ(in.inter_intra_mode[0][2], 5436u);
+  CHECK_EQ(in.wedge_inter_intra[kBlock8x8][0], 12732u); /* 32768 - 20036 */
+
+  /* motion mode: simple, obmc or warped, then whether obmc is used at all */
+  CHECK_EQ(in.motion_mode[kBlock8x8][0], 25117u); /* 32768 - 7651 */
+  CHECK_EQ(in.motion_mode[kBlock8x8][1], 8008u);  /* 32768 - 24760 */
+  CHECK_EQ(in.use_obmc[kBlock8x8][0], 22331u);    /* 32768 - 10437 */
+  CHECK_EQ(in.use_obmc[kBlock128x128][0], 130u);  /* 32768 - 32638 */
+
+  /* the interpolation filter: dav1d's `.filter`, two directions by eight
+   * filter contexts */
+  CHECK_EQ(in.interp_filter[0][0], 833u); /* 32768 - 31935 */
+  CHECK_EQ(in.interp_filter[0][1], 48u);
+  CHECK_EQ(in.interp_filter[8][0], 858u); /* 32768 - 31910 */
+
+  /* motion vectors: dav1d's `.mv.joint`, `.mv.comp.classes` and the fractional
+   * parts */
+  CHECK_EQ(in.mv_joint[0], 28672u);
+  CHECK_EQ(in.mv_joint[2], 13440u);
+  CHECK_EQ(in.mv_class[0][0], 4096u);
+  CHECK_EQ(in.mv_class[0][9], 1u);
+  CHECK_EQ(in.mv_class0_fr[0][0][0], 16384u);
+  CHECK_EQ(in.mv_class0_fr[0][1][2], 8640u);
+  CHECK_EQ(in.mv_fr[0][0], 24576u);
+  CHECK_EQ(in.mv_bit[0][0], 15360u);
+  CHECK_EQ(in.mv_bit[9][0], 2048u);
+
+  /* new, zero or a predicted motion vector, and how far down the list */
+  CHECK_EQ(in.new_mv[0][0], 8733u);
+  CHECK_EQ(in.new_mv[5][0], 28092u);
+  CHECK_EQ(in.zero_mv[0][0], 30593u);
+  CHECK_EQ(in.ref_mv[3][0], 4146u);
+  CHECK_EQ(in.drl_mode[0][0], 19664u);
+  CHECK_EQ(in.drl_mode[2][0], 13823u);
+
+  /* the transform types an inter block can use */
+  CHECK_EQ(in.txtp_inter1[0][0], 28310u);
+  CHECK_EQ(in.txtp_inter1[1][14], 2019u);
+  CHECK_EQ(in.txtp_inter2[0], 31998u);
+  CHECK_EQ(in.txtp_inter2[10], 2239u);
+  CHECK_EQ(in.txtp_inter3[0][0], 16384u);
+  CHECK_EQ(in.txtp_inter3[3][0], 32020u);
+
+  /* every row of every table, then: a valid inverse CDF, counter zero */
+  const auto rows = [](const uint16_t* flat, int count, int symbols, int stride,
+                       const char* what) {
+    for (int i = 0; i < count; ++i) check_row(flat + static_cast<size_t>(i) * stride, symbols, what);
+  };
+  rows(&in.is_inter[0][0], 4, 2, 2, "is_inter");
+  rows(&in.skip_mode[0][0], 3, 2, 2, "skip_mode");
+  rows(&in.comp_mode[0][0], 5, 2, 2, "comp_mode");
+  rows(&in.comp_ref_type[0][0], 5, 2, 2, "comp_ref_type");
+  rows(&in.uni_comp_ref[0][0][0], 9, 2, 2, "uni_comp_ref");
+  rows(&in.comp_ref[0][0][0], 9, 2, 2, "comp_ref");
+  rows(&in.comp_bwd_ref[0][0][0], 6, 2, 2, "comp_bwd_ref");
+  rows(&in.single_ref[0][0][0], 18, 2, 2, "single_ref");
+  rows(&in.compound_mode[0][0], 8, 8, 8, "compound_mode");
+  rows(&in.compound_idx[0][0], 6, 2, 2, "compound_idx");
+  rows(&in.comp_group_idx[0][0], 6, 2, 2, "comp_group_idx");
+  rows(&in.compound_type[0][0], kBlockSizeCount, 2, 2, "compound_type");
+  rows(&in.wedge_index[0][0], kBlockSizeCount, 16, 16, "wedge_index");
+  rows(&in.inter_intra[0][0], 3, 2, 2, "inter_intra");
+  rows(&in.inter_intra_mode[0][0], 3, 4, 4, "inter_intra_mode");
+  rows(&in.wedge_inter_intra[0][0], kBlockSizeCount, 2, 2, "wedge_inter_intra");
+  rows(&in.use_obmc[0][0], kBlockSizeCount, 2, 2, "use_obmc");
+  rows(&in.motion_mode[0][0], kBlockSizeCount, 3, 3, "motion_mode");
+  rows(&in.interp_filter[0][0], 16, 3, 3, "interp_filter");
+  check_row(in.mv_joint, 4, "mv_joint");
+  check_row(in.mv_sign, 2, "mv_sign");
+  rows(&in.mv_class[0][0], 2, 11, 16, "mv_class");
+  check_row(in.mv_class0_bit, 2, "mv_class0_bit");
+  rows(&in.mv_class0_fr[0][0][0], 4, 4, 4, "mv_class0_fr");
+  check_row(in.mv_class0_hp, 2, "mv_class0_hp");
+  check_row(in.mv_hp, 2, "mv_hp");
+  rows(&in.mv_bit[0][0], 10, 2, 2, "mv_bit");
+  rows(&in.mv_fr[0][0], 2, 4, 4, "mv_fr");
+  rows(&in.new_mv[0][0], 6, 2, 2, "new_mv");
+  rows(&in.zero_mv[0][0], 2, 2, 2, "zero_mv");
+  rows(&in.ref_mv[0][0], 6, 2, 2, "ref_mv");
+  rows(&in.drl_mode[0][0], 3, 2, 2, "drl_mode");
+  rows(&in.txtp_inter1[0][0], 2, 16, 16, "txtp_inter1");
+  check_row(in.txtp_inter2, 12, "txtp_inter2");
+  rows(&in.txtp_inter3[0][0], 4, 2, 2, "txtp_inter3");
+}
+
 } /* namespace */
 
 int main() {
@@ -425,6 +597,7 @@ int main() {
   test_last_symbol();
   test_corrupt_table();
   test_default_cdf();
+  test_inter_cdf();
   test_real_tile_trace();
   return testing::finish("test_entropy");
 }

@@ -1,5 +1,7 @@
 #include "frontend/cdf.hpp"
 
+#include "frontend/cdf_tables_inter.hpp"
+
 #include <cstring>
 
 namespace av1gpu {
@@ -48,6 +50,43 @@ void init_default_cdf(CdfContext* cdf, int base_q_idx) {
   copy_table(cdf->mode.txtp_intra2, t::txtp_intra2);
   copy_table(cdf->mode.txsz, t::txsz);
   copy_table(cdf->mode.txpart, t::txpart);
+
+  namespace it = cdf_tables_inter;
+  copy_table(cdf->inter.is_inter, it::is_inter);
+  copy_table(cdf->inter.skip_mode, it::skip_mode);
+  copy_table(cdf->inter.comp_mode, it::comp_mode);
+  copy_table(cdf->inter.comp_ref_type, it::comp_ref_type);
+  copy_table(cdf->inter.uni_comp_ref, it::uni_comp_ref);
+  copy_table(cdf->inter.comp_ref, it::comp_ref);
+  copy_table(cdf->inter.comp_bwd_ref, it::comp_bwd_ref);
+  copy_table(cdf->inter.single_ref, it::single_ref);
+  copy_table(cdf->inter.compound_mode, it::compound_mode);
+  copy_table(cdf->inter.compound_idx, it::compound_idx);
+  copy_table(cdf->inter.comp_group_idx, it::comp_group_idx);
+  copy_table(cdf->inter.compound_type, it::compound_type);
+  copy_table(cdf->inter.wedge_index, it::wedge_index);
+  copy_table(cdf->inter.inter_intra, it::inter_intra);
+  copy_table(cdf->inter.inter_intra_mode, it::inter_intra_mode);
+  copy_table(cdf->inter.wedge_inter_intra, it::wedge_inter_intra);
+  copy_table(cdf->inter.use_obmc, it::use_obmc);
+  copy_table(cdf->inter.motion_mode, it::motion_mode);
+  copy_table(cdf->inter.interp_filter, it::interp_filter);
+  copy_table(cdf->inter.mv_joint, it::mv_joint);
+  copy_table(cdf->inter.mv_sign, it::mv_sign);
+  copy_table(cdf->inter.mv_class, it::mv_class);
+  copy_table(cdf->inter.mv_class0_bit, it::mv_class0_bit);
+  copy_table(cdf->inter.mv_class0_fr, it::mv_class0_fr);
+  copy_table(cdf->inter.mv_class0_hp, it::mv_class0_hp);
+  copy_table(cdf->inter.mv_hp, it::mv_hp);
+  copy_table(cdf->inter.mv_bit, it::mv_bit);
+  copy_table(cdf->inter.mv_fr, it::mv_fr);
+  copy_table(cdf->inter.new_mv, it::new_mv);
+  copy_table(cdf->inter.zero_mv, it::zero_mv);
+  copy_table(cdf->inter.ref_mv, it::ref_mv);
+  copy_table(cdf->inter.drl_mode, it::drl_mode);
+  copy_table(cdf->inter.txtp_inter1, it::tx_type_inter1);
+  copy_table(cdf->inter.txtp_inter2, it::tx_type_inter2);
+  copy_table(cdf->inter.txtp_inter3, it::tx_type_inter3);
 
   copy_table(cdf->coef.eob_bin_16, t::eob_bin_16[qcat]);
   copy_table(cdf->coef.eob_bin_32, t::eob_bin_32[qcat]);

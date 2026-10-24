@@ -33,6 +33,7 @@
 
 #include <cstdint>
 
+#include "frontend/block_size.hpp"
 #include "frontend/cdf_tables.hpp"
 
 namespace av1gpu {
@@ -142,6 +143,69 @@ struct ModeCdf {
   uint16_t txpart[7][3][2];
 };
 
+/* The tables only an inter frame reads: reference selection (single, compound,
+ * unidirectional), skip mode, motion vectors with their classes and fractional
+ * parts, the dynamic reference list, motion mode, the interp filter, compound
+ * blending and inter/intra. They come from the specification's annex through
+ * tools/gen_cdf_tables.py, in the same inverse layout and the same padding as
+ * the intra tables.
+ *
+ * The comments name the indices each table is selected by, following the CDF
+ * selection rules in section 8.3 of the specification; where a dimension is not
+ * a context but the decoded value itself (the compound reference tree, the
+ * motion vector class) the note says so. */
+struct InterCdf {
+  /* [inter neighbours][2]: is the block inter predicted at all */
+  uint16_t is_inter[4][2];
+  /* [neighbouring skip modes][2] */
+  uint16_t skip_mode[3][2];
+  /* [neighbouring references][2]: single or compound prediction */
+  uint16_t comp_mode[5][2];
+  /* [neighbouring references][2]: compound or unidirectional compound */
+  uint16_t comp_ref_type[5][2];
+  /* [reference counts][step of the reference tree][2] */
+  uint16_t uni_comp_ref[3][3][2];
+  uint16_t comp_ref[3][3][2];
+  uint16_t comp_bwd_ref[3][2][2];
+  uint16_t single_ref[3][6][2];
+  /* [compound mode context][compound mode] */
+  uint16_t compound_mode[8][8];
+  uint16_t compound_idx[6][2];
+  uint16_t comp_group_idx[6][2];
+  /* blend of two predictors: [block size][distance weighted or wedge] */
+  uint16_t compound_type[kBlockSizeCount][2];
+  uint16_t wedge_index[kBlockSizeCount][16];
+  /* inter/intra: [size group][2], then the intra mode of the pair */
+  uint16_t inter_intra[3][2];
+  uint16_t inter_intra_mode[3][4];
+  uint16_t wedge_inter_intra[kBlockSizeCount][2];
+  /* motion mode: [block size][simple, obmc, warped] */
+  uint16_t use_obmc[kBlockSizeCount][2];
+  uint16_t motion_mode[kBlockSizeCount][3];
+  /* [filter context][eight tap, smooth, sharp] */
+  uint16_t interp_filter[16][3];
+  /* motion vectors: which components are coded, then per component the class,
+   * the fractional part and - for class 0 - the integer bit */
+  uint16_t mv_joint[4];
+  uint16_t mv_sign[2];
+  uint16_t mv_class[2][16];
+  uint16_t mv_class0_bit[2];
+  uint16_t mv_class0_fr[2][2][4];
+  uint16_t mv_class0_hp[2];
+  uint16_t mv_hp[2];
+  uint16_t mv_bit[10][2];
+  uint16_t mv_fr[2][4];
+  /* the dynamic reference list: new or predicted motion vector */
+  uint16_t new_mv[6][2];
+  uint16_t zero_mv[2][2];
+  uint16_t ref_mv[6][2];
+  uint16_t drl_mode[3][2];
+  /* transform type, inter: the two classes and the set for 64x64 transforms */
+  uint16_t txtp_inter1[2][16];
+  uint16_t txtp_inter2[16];
+  uint16_t txtp_inter3[4][2];
+};
+
 /* The probability tables one frame starts from. A frame that inherits its
  * context (`primary_ref_frame`) copies the corresponding context of that
  * reference frame instead of calling init_default_cdf. */
@@ -149,6 +213,7 @@ struct CdfContext {
   PartitionCdf partition;
   SkipCdf skip;
   ModeCdf mode;
+  InterCdf inter;
   CoefCdf coef;
 };
 
