@@ -97,22 +97,57 @@ constexpr int kRefIdxAltref = 6;
 /* Inter prediction modes. The single-reference modes come first, in the order
  * the specification's near/global/new syntax reads them; the compound ones
  * follow, in the order of the compound mode symbol. */
+/* YMode for a block that is inter predicted, numbered the way the reference
+ * decoders number it: the four single reference modes first, then the eight
+ * compound combinations in the order the compound_mode symbol codes them. The
+ * ordering of the compound half is the specification's, which is why it is not
+ * simply the cross product: NEAREST_NEW and NEW_NEAREST are adjacent because
+ * they are one symbol apart in the bitstream. */
 enum InterPredMode {
   kModeNearestMv = 0,
-  kModeNearMv,
-  kModeGlobalMv,
-  kModeNewMv,
-  kModeNearestNearestMv,
-  kModeNearestNearMv,
-  kModeNearNearestMv,
-  kModeNearNearMv,
-  kModeNearestNewMv,
-  kModeNewNearestMv,
-  kModeNearNewMv,
-  kModeNewNearMv,
-  kModeGlobalGlobalMv,
-  kModeNewNewMv,
+  kModeNearMv = 1,
+  kModeGlobalMv = 2,
+  kModeNewMv = 3,
+  kModeNearestNearestMv = 4,
+  kModeNearNearMv = 5,
+  kModeNearestNewMv = 6,
+  kModeNewNearestMv = 7,
+  kModeNearNewMv = 8,
+  kModeNewNearMv = 9,
+  kModeGlobalGlobalMv = 10,
+  kModeNewNewMv = 11,
   kInterPredModeCount,
+};
+
+/* The two halves of a compound block's YMode, as a table indexed by the
+ * compound_mode symbol (YMode - NEAREST_NEARESTMV). A single reference block
+ * uses the same table with symbol 0 for its one vector, which is not how the
+ * bitstream selects it but is how the vector is derived. */
+struct CompoundModePair {
+  int mode[2];
+};
+
+constexpr CompoundModePair kCompoundModePairs[8] = {
+    {{kModeNearestMv, kModeNearestMv}},
+    {{kModeNearMv, kModeNearMv}},
+    {{kModeNewMv, kModeNearestMv}},
+    {{kModeNearestMv, kModeNewMv}},
+    {{kModeNearMv, kModeNewMv}},
+    {{kModeNewMv, kModeNearMv}},
+    {{kModeGlobalMv, kModeGlobalMv}},
+    {{kModeNewMv, kModeNewMv}},
+};
+
+/* How the two predictions of a compound block are combined. The order is the
+ * reference decoders' (it puts the two plain averages next to each other so a
+ * comparison means "both are averages"), and the values are what the context
+ * derivations test. */
+enum CompoundType {
+  kCompoundNone = 0,
+  kCompoundWeightedAverage = 1, /* distance weighted, the jnt_comp symbol */
+  kCompoundAverage = 2,
+  kCompoundDiffwtd = 3,         /* masked: the difference weighted mask */
+  kCompoundWedge = 4,           /* masked: a wedge mask */
 };
 
 /* Motion modes, in specification order. */
@@ -172,19 +207,27 @@ struct TileBlock {
    * of an inter frame may still be intra predicted. `ref_frame` holds
    * RefFrameType values, `mv` is in 1/8 luma sample units relative to the
    * block's position (the specification's Mv, before the per-plane scaling),
-   * and `interp_filter` is 0 regular, 1 smooth, 2 sharp, 3 bilinear. */
+   * and `interp_filter` is 0 regular, 1 smooth, 2 sharp, 3 bilinear per
+   * direction (a frame with dual filters codes one per list). */
   bool is_inter = false;
   bool skip_mode = false;
   int ref_frame[2] = {kRefIntra, kRefIntra};
   int mv[2][2] = {{0, 0}, {0, 0}};
   int inter_mode = kModeNearestMv;
   int motion_mode = kMotionTranslation;
-  int interp_filter = 0;
+  int interp_filter[2] = {0, 0};
   bool interintra = false;
   int interintra_mode = 0;
-  /* 0 = average, 1 = distance weighted; both are the only blends this decoder
-   * implements, so a wedge or difference weighted block stops the tile. */
-  int compound_type = 0;
+  /* an inter/intra block whose blend uses a wedge mask instead of a straight
+   * average; the wedge's index is `wedge_index`, shared with compound wedges */
+  bool interintra_wedge = false;
+  /* Compound prediction: the mode picks one vector per reference, and
+   * `compound_type` says how the two predictions are blended. A masked blend
+   * (wedge or difference weighted) also carries the mask: the wedge's index and
+   * the mask sign, or for a difference weighted mask the sign alone. */
+  int compound_type = kCompoundNone;
+  int wedge_index = 0;
+  int mask_sign = 0;
   int drl_index = 0;
 
   bool has_chroma = true;

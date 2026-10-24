@@ -40,8 +40,9 @@ void trace_block(const TileBlock& block) {
                  block.skip ? 1 : 0, block.skip_mode ? 1 : 0, block.segment_id,
                  block.ref_frame[0], block.ref_frame[1], block.mv[0][0], block.mv[0][1],
                  block.mv[1][0], block.mv[1][1], block.inter_mode, block.motion_mode,
-                 block.compound_type, block.drl_index, block.interp_filter,
-                 block.interp_filter, 0, 0, block.interintra ? 1 : 0, block.interintra_mode,
+                 block.compound_type, block.drl_index, block.interp_filter[0],
+                 block.interp_filter[1], block.wedge_index, block.mask_sign,
+                 block.interintra ? 1 : 0, block.interintra_mode,
                  tx_size_index(block.tx_size), block.qindex);
     return;
   }
@@ -224,6 +225,18 @@ bool trace_tmvs() {
 /* INVALID_REF2CUR: a contributing reference frame whose distance to this one is
  * too large to be projected (the order hint wrapped around). */
 constexpr int kInvalidRef2Cur = -32;
+
+/* Wedge_Bits: how many bits a block size's wedge parameters carry. Zero means
+ * the size has no wedge mask at all, and a masked compound block of that size
+ * has to use the difference weighted mask instead. */
+constexpr int8_t kWedgeBits[kBlockSizeCount] = {0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 0,
+                                                0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0};
+
+/* The wedge context: block sizes grouped by aspect ratio, which is the row of
+ * every wedge table the syntax reads. Sizes without a wedge keep 0, which is
+ * what makes an out of range lookup impossible rather than merely unlikely. */
+constexpr int8_t kWedgeContext[kBlockSizeCount] = {0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 0,
+                                                   0, 0, 0, 0, 0, 0, 0, 7, 8, 0, 0};
 
 /* Filter_Intra_Mode_To_Intra_Dir: a filter intra mode stands in for a luma
  * direction when the transform type alphabet is selected. */
@@ -417,13 +430,18 @@ class TileParser {
     uint8_t global_subpel = 0;
     /* dav1d's `mf` bit 1: the block coded a new motion vector. */
     uint8_t coded_newmv = 0;
-    /* the interpolation filter this block used, for the filter context */
-    uint8_t filter = 0;
+    /* the interpolation filter this block used, per direction, for the filter
+     * context */
+    uint8_t filter[2] = {0, 0};
+    /* how this block blended its two predictions, which several of the
+     * compound contexts read from their neighbours */
+    uint8_t comp_type = kCompoundNone;
   };
 
+  /* One candidate in the mv stack: a vector (or, for a compound block, a vector
+   * pair) and the weight the scan accumulated for it. */
   struct MvCand {
-    int x = 0;
-    int y = 0;
+    int mv[2][2] = {{0, 0}, {0, 0}};
     int weight = 0;
   };
 
@@ -535,7 +553,11 @@ class TileParser {
       pocdiff_[i] = std::max(-31, std::min(31, to_ref));
       /* a vector that points at a frame before this one can be projected onto a
        * frame after it; the other direction is not usable */
-      mfmv_sign_[i] = order_hint_delta(seq_, frame_.ref_order_hint[i], frame_.order_hint) < 0;
+      const int from_ref = order_hint_delta(seq_, frame_.ref_order_hint[i], frame_.order_hint);
+      mfmv_sign_[i] = from_ref < 0;
+      /* and a reference *after* this frame flips the sign of the vectors a
+       * neighbour stored for it, which the extended candidate scan does */
+      sign_bias_[i] = from_ref > 0;
     }
     if (!frame_.use_ref_frame_mvs || !seq_.enable_order_hint) return;
 
@@ -682,34 +704,47 @@ class TileParser {
   /* add_temporal_candidate: one projected vector, from a run of `weight / 2`
    * cells. The first call of the whole scan also settles `globalmv_ctx`, the
    * context bit that says whether the temporal prediction already agrees with
-   * the global motion model (in which case the far/near modes are cheap). */
+   * the global motion model (in which case the far/near modes are cheap).
+   *
+   * A compound block projects the same stored vector twice, once with the
+   * distance to each of its references: the stored vector points from the
+   * reference frame to *its* reference, so the two projections land on this
+   * frame along two different directions. */
   void add_temporal_candidate(MvCand* stack, int* count, const TemporalMv& cell, int ref0,
-                              int* globalmv_ctx, int gmv_x, int gmv_y, int weight) {
+                              int ref1, int* globalmv_ctx, int gmv_x, int gmv_y, int weight) {
     if (!cell.valid()) return;
-    int x = project_mv_component(cell.x, pocdiff_[ref0 - 1], cell.ref);
-    int y = project_mv_component(cell.y, pocdiff_[ref0 - 1], cell.ref);
-    lower_mv_precision(&x, &y);
-    if (globalmv_ctx)
-      *globalmv_ctx = (std::abs(x - gmv_x) | std::abs(y - gmv_y)) >= 16;
+    MvCand entry;
+    entry.weight = weight;
+    entry.mv[0][0] = project_mv_component(cell.x, pocdiff_[ref0 - 1], cell.ref);
+    entry.mv[0][1] = project_mv_component(cell.y, pocdiff_[ref0 - 1], cell.ref);
+    lower_mv_precision(&entry.mv[0][0], &entry.mv[0][1]);
+    if (ref1 == kRefIntra) {
+      if (globalmv_ctx)
+        *globalmv_ctx = (std::abs(entry.mv[0][0] - gmv_x) | std::abs(entry.mv[0][1] - gmv_y)) >= 16;
+    } else {
+      entry.mv[1][0] = project_mv_component(cell.x, pocdiff_[ref1 - 1], cell.ref);
+      entry.mv[1][1] = project_mv_component(cell.y, pocdiff_[ref1 - 1], cell.ref);
+      lower_mv_precision(&entry.mv[1][0], &entry.mv[1][1]);
+    }
     const int last = *count;
     for (int n = 0; n < last; ++n) {
-      if (stack[n].x == x && stack[n].y == y) {
-        stack[n].weight += weight;
-        return;
-      }
+      if (stack[n].mv[0][0] != entry.mv[0][0] || stack[n].mv[0][1] != entry.mv[0][1]) continue;
+      if (ref1 != kRefIntra &&
+          (stack[n].mv[1][0] != entry.mv[1][0] || stack[n].mv[1][1] != entry.mv[1][1]))
+        continue;
+      stack[n].weight += weight;
+      return;
     }
     if (last < 8) {
-      stack[last].x = x;
-      stack[last].y = y;
-      stack[last].weight = weight;
+      stack[last] = entry;
       *count = last + 1;
     }
   }
 
   /* The temporal part of find_ref_mvs: the block's cells, the small block edge
    * cases, and the resulting global motion context. */
-  int temporal_candidates(MvCand* stack, int* count, int ref0, int bw4, int bh4, int w4, int h4,
-                          int mi_row, int mi_col, int gmv_x, int gmv_y) {
+  int temporal_candidates(MvCand* stack, int* count, int ref0, int ref1, int bw4, int bh4, int w4,
+                          int h4, int mi_row, int mi_col, int gmv_x, int gmv_y) {
     int globalmv_ctx = frame_.use_ref_frame_mvs ? 1 : 0;
     if (mfmv_count_ == 0) return globalmv_ctx;
 
@@ -730,13 +765,14 @@ class TileParser {
           ++run_len;
           continue;
         }
-        add_temporal_candidate(stack, count, run, ref0, run_gmv_ctx, gmv_x, gmv_y, 2 * run_len);
+        add_temporal_candidate(stack, count, run, ref0, ref1, run_gmv_ctx, gmv_x, gmv_y,
+                               2 * run_len);
         run_gmv_ctx = nullptr;
         run = cell;
         run_len = 1;
       }
     }
-    add_temporal_candidate(stack, count, run, ref0, run_gmv_ctx, gmv_x, gmv_y, 2 * run_len);
+    add_temporal_candidate(stack, count, run, ref0, ref1, run_gmv_ctx, gmv_x, gmv_y, 2 * run_len);
 
     /* Small blocks also look at the cells just past their bottom right corner,
      * which are the ones a neighbouring block's own scan would not reach. */
@@ -744,17 +780,17 @@ class TileParser {
       const int bw8 = bw4 >> 1, bh8 = bh4 >> 1;
       const bool has_bottom = by8 + bh8 < std::min(tile_row_end_ >> 1, (by8 & ~7) + 8);
       if (has_bottom && bx8 - 1 >= std::max(tile_col_start_ >> 1, bx8 & ~7)) {
-        add_temporal_candidate(stack, count, projected_at(bx8 - 1, by8 + bh8), ref0, nullptr, 0,
-                               0, 2);
+        add_temporal_candidate(stack, count, projected_at(bx8 - 1, by8 + bh8), ref0, ref1,
+                               nullptr, 0, 0, 2);
       }
       if (bx8 + bw8 < std::min(tile_col_end_ >> 1, (bx8 & ~7) + 8)) {
         if (has_bottom) {
-          add_temporal_candidate(stack, count, projected_at(bx8 + bw8, by8 + bh8), ref0, nullptr,
-                                 0, 0, 2);
+          add_temporal_candidate(stack, count, projected_at(bx8 + bw8, by8 + bh8), ref0, ref1,
+                                 nullptr, 0, 0, 2);
         }
         if (by8 + bh8 - 1 < std::min(tile_row_end_ >> 1, (by8 & ~7) + 8)) {
           add_temporal_candidate(stack, count, projected_at(bx8 + bw8, by8 + bh8 - 1), ref0,
-                                 nullptr, 0, 0, 2);
+                                 ref1, nullptr, 0, 0, 2);
         }
       }
     }
@@ -804,63 +840,94 @@ class TileParser {
     }
   }
 
-  /* --- candidate scan ---------------------------------------------------- */
+  /* --- candidate scan ----------------------------------------------------
+   *
+   * find_ref_mvs collects the motion vectors a block may inherit: the ones its
+   * neighbours above and to the left used for the same reference (or the same
+   * reference *pair*, for a compound block), plus the vectors the reference
+   * frames projected onto this one. Each candidate carries a weight that says
+   * how much of the block's edge it covers and how often it was seen, and the
+   * stack is sorted by that weight, so the most likely vector comes first.
+   *
+   * The nearest group and the "secondary" one are weighted and sorted
+   * separately: the direct neighbours get a large bonus, so they always precede
+   * the projected and secondary candidates, but within their own group the
+   * weight decides.
+   */
 
-  /* add_spatial_candidate for a single-reference block: the candidates are the
-   * neighbours that name the same reference, and a neighbour that used global
-   * motion contributes the vector the model gives *this* block, not its own. */
-  void add_spatial_candidate(MvCand* stack, int* count, int weight, int row, int col,
-                             int ref0, int gmv_x, int gmv_y, bool gmv_valid,
-                             bool* have_newmv, bool* have_refmv) {
+  /* One scan, for one reference pair. `ref[1] == kRefIntra` marks a single
+   * reference block: the specification writes -1 there, and that value is what
+   * selects the single reference form of every test below. */
+  struct MvScan {
+    MvCand* stack = nullptr;
+    int* count = nullptr;
+    int ref[2] = {kRefIntra, kRefIntra};
+    int gmv[2][2] = {{0, 0}, {0, 0}}; /* the global motion vector per reference */
+    bool gmv_valid[2] = {false, false}; /* ... and whether a match substitutes it */
+    bool have_newmv = false;
+  };
+
+  /* add_spatial_candidate: one neighbour's contribution. A single reference
+   * block only looks at the neighbour's first references that name the same
+   * reference; a compound block needs the exact pair, in the same order, which
+   * is what makes a compound candidate much rarer. A neighbour that used global
+   * motion contributes the vector the model gives *this* block instead of its
+   * own. */
+  void add_spatial_candidate(MvScan& scan, int weight, int row, int col, bool* have_refmv) {
     if (row < 0 || row >= mi_rows() || col < 0 || col >= mi_cols()) return;
     const MiRef& cand = mi_at(row, col);
     if (cand.intra) return;
-    for (int n = 0; n < 2; ++n) {
-      const int cand_ref = cand.ref[n];
-      if (cand_ref <= kRefIntra) break;
-      if (cand_ref != ref0) continue;
-      int cx = cand.mv[n][0], cy = cand.mv[n][1];
-      if (cand.global_subpel && gmv_valid) {
-        cx = gmv_x;
-        cy = gmv_y;
-      }
-      *have_refmv = true;
-      *have_newmv = *have_newmv || cand.coded_newmv;
-      for (int m = 0; m < *count; ++m) {
-        if (stack[m].x == cx && stack[m].y == cy) {
-          stack[m].weight += weight;
-          return;
-        }
-      }
-      if (*count < 8) {
-        stack[*count].x = cx;
-        stack[*count].y = cy;
-        stack[*count].weight = weight;
-        ++*count;
-      }
+    const bool compound = scan.ref[1] != kRefIntra;
+    if (!compound) {
+      if (cand.ref[0] != scan.ref[0] && cand.ref[1] != scan.ref[0]) return;
+    } else if (cand.ref[0] != scan.ref[0] || cand.ref[1] != scan.ref[1]) {
       return;
+    }
+
+    MvCand entry;
+    entry.weight = weight;
+    for (int n = 0; n < (compound ? 2 : 1); ++n) {
+      int slot = n;
+      if (!compound && cand.ref[0] != scan.ref[0]) slot = 1;
+      const bool substitute = cand.global_subpel && scan.gmv_valid[n];
+      entry.mv[n][0] = substitute ? scan.gmv[n][0] : cand.mv[slot][0];
+      entry.mv[n][1] = substitute ? scan.gmv[n][1] : cand.mv[slot][1];
+    }
+
+    *have_refmv = true;
+    scan.have_newmv = scan.have_newmv || cand.coded_newmv;
+    const int last = *scan.count;
+    for (int m = 0; m < last; ++m) {
+      if (scan.stack[m].mv[0][0] != entry.mv[0][0] || scan.stack[m].mv[0][1] != entry.mv[0][1])
+        continue;
+      if (compound && (scan.stack[m].mv[1][0] != entry.mv[1][0] ||
+                       scan.stack[m].mv[1][1] != entry.mv[1][1]))
+        continue;
+      scan.stack[m].weight += weight;
+      return;
+    }
+    if (last < 8) {
+      scan.stack[last] = entry;
+      *scan.count = last + 1;
     }
   }
 
   /* scan_row: walk the row above from the block's left edge to its right edge,
    * adding one candidate per *block* encountered (a neighbour narrower than us
    * contributes several, a wider one only once). */
-  int scan_row(MvCand* stack, int* count, int ref0, int gmv_x, int gmv_y, bool gmv_valid,
-               int row, int base_col, int bw4, int w4, int max_rows, int step,
-               bool* have_newmv, bool* have_refmv) {
+  int scan_row(MvScan& scan, int row, int base_col, int bw4, int w4, int max_rows, int step,
+               bool& have_refmv) {
     int col = base_col;
     const int first_w4 = block_width4(block_size_at(row, col));
     const int first_h4 = block_height4(block_size_at(row, col));
     int len = std::max(step, std::min(bw4, first_w4));
     if (bw4 <= first_w4) {
       const int weight = bw4 == 1 ? 2 : std::max(2, std::min(2 * max_rows, first_h4));
-      add_spatial_candidate(stack, count, len * weight, row, col, ref0, gmv_x, gmv_y,
-                            gmv_valid, have_newmv, have_refmv);
+      add_spatial_candidate(scan, len * weight, row, col, &have_refmv);
       return weight >> 1;
     }
     for (int x = 0;;) {
-      add_spatial_candidate(stack, count, len * 2, row, col, ref0, gmv_x, gmv_y, gmv_valid,
-                            have_newmv, have_refmv);
+      add_spatial_candidate(scan, len * 2, row, col, &have_refmv);
       x += len;
       if (x >= w4) return 1;
       col = base_col + x;
@@ -869,22 +936,19 @@ class TileParser {
     }
   }
 
-  int scan_col(MvCand* stack, int* count, int ref0, int gmv_x, int gmv_y, bool gmv_valid,
-               int base_row, int col, int bh4, int h4, int max_cols, int step,
-               bool* have_newmv, bool* have_refmv) {
+  int scan_col(MvScan& scan, int base_row, int col, int bh4, int h4, int max_cols, int step,
+               bool& have_refmv) {
     int row = base_row;
     const int first_h4 = block_height4(block_size_at(row, col));
     const int first_w4 = block_width4(block_size_at(row, col));
     int len = std::max(step, std::min(bh4, first_h4));
     if (bh4 <= first_h4) {
       const int weight = bh4 == 1 ? 2 : std::max(2, std::min(2 * max_cols, first_w4));
-      add_spatial_candidate(stack, count, len * weight, row, col, ref0, gmv_x, gmv_y,
-                            gmv_valid, have_newmv, have_refmv);
+      add_spatial_candidate(scan, len * weight, row, col, &have_refmv);
       return weight >> 1;
     }
     for (int y = 0;;) {
-      add_spatial_candidate(stack, count, len * 2, row, col, ref0, gmv_x, gmv_y, gmv_valid,
-                            have_newmv, have_refmv);
+      add_spatial_candidate(scan, len * 2, row, col, &have_refmv);
       y += len;
       if (y >= h4) return 1;
       row = base_row + y;
@@ -893,42 +957,146 @@ class TileParser {
     }
   }
 
-  /* find_ref_mvs, single reference case. The stack is the specification's
-   * list of candidate motion vectors; `ctx` packs the contexts the mode syntax
-   * needs (newmv_ctx, globalmv_ctx, refmv_ctx in that bit layout). */
-  void find_ref_mvs(MvCand* stack, int* count, int* ctx, int ref0, BlockSize size, int mi_row,
-                    int mi_col) {
+  /* add_single_extended_candidate: a neighbour that named a *different*
+   * reference still holds a usable vector, mirrored if the two references are
+   * on opposite sides of this frame. It only fills a stack that has fewer than
+   * two candidates, so it never outranks a real match. */
+  void add_single_extended_candidate(MvCand* stack, int* count, int row, int col, int ref0) {
+    if (row < 0 || row >= mi_rows() || col < 0 || col >= mi_cols()) return;
+    const MiRef& cand = mi_at(row, col);
+    if (cand.intra) return;
+    for (int n = 0; n < 2; ++n) {
+      const int cand_ref = cand.ref[n];
+      if (cand_ref <= kRefIntra) break;
+      int cx = cand.mv[n][0], cy = cand.mv[n][1];
+      if (sign_bias_[ref0 - 1] != sign_bias_[cand_ref - 1]) {
+        cx = -cx;
+        cy = -cy;
+      }
+      const int last = *count;
+      int m = 0;
+      for (; m < last; ++m)
+        if (stack[m].mv[0][0] == cx && stack[m].mv[0][1] == cy) break;
+      if (m == last) {
+        stack[m].mv[0][0] = cx;
+        stack[m].mv[0][1] = cy;
+        stack[m].weight = 2;
+        *count = last + 1;
+      }
+    }
+  }
+
+  /* add_compound_extended_candidate: the same idea for a compound block, but the
+   * neighbour's vector has to be assigned to whichever of our two references it
+   * can serve. `same` collects the vectors that already name one of our
+   * references (component 0 for reference 0, component 1 for reference 1) and
+   * `same + 2` the ones that name another reference and therefore need
+   * mirroring - those fill the other component. */
+  void add_compound_extended_candidate(MvCand* same, int* same_count, int row, int col, int ref0,
+                                       int ref1) {
+    MvCand* diff = &same[2];
+    int* diff_count = &same_count[2];
+    if (row < 0 || row >= mi_rows() || col < 0 || col >= mi_cols()) return;
+    const MiRef& cand = mi_at(row, col);
+    if (cand.intra) return;
+    for (int n = 0; n < 2; ++n) {
+      const int cand_ref = cand.ref[n];
+      if (cand_ref <= kRefIntra) break;
+      int cx = cand.mv[n][0], cy = cand.mv[n][1];
+      const bool flip = sign_bias_[cand_ref - 1];
+      if (cand_ref == ref0) {
+        if (same_count[0] < 2) {
+          same[same_count[0]].mv[0][0] = cx;
+          same[same_count[0]].mv[0][1] = cy;
+          ++same_count[0];
+        }
+        if (diff_count[1] < 2) {
+          if (flip != (sign_bias_[ref1 - 1] != 0)) {
+            cx = -cx;
+            cy = -cy;
+          }
+          diff[diff_count[1]].mv[1][0] = cx;
+          diff[diff_count[1]].mv[1][1] = cy;
+          ++diff_count[1];
+        }
+      } else if (cand_ref == ref1) {
+        if (same_count[1] < 2) {
+          same[same_count[1]].mv[1][0] = cx;
+          same[same_count[1]].mv[1][1] = cy;
+          ++same_count[1];
+        }
+        if (diff_count[0] < 2) {
+          if (flip != (sign_bias_[ref0 - 1] != 0)) {
+            cx = -cx;
+            cy = -cy;
+          }
+          diff[diff_count[0]].mv[0][0] = cx;
+          diff[diff_count[0]].mv[0][1] = cy;
+          ++diff_count[0];
+        }
+      } else {
+        int ix = -cx, iy = -cy;
+        if (diff_count[0] < 2) {
+          const bool mirror = flip != (sign_bias_[ref0 - 1] != 0);
+          diff[diff_count[0]].mv[0][0] = mirror ? ix : cx;
+          diff[diff_count[0]].mv[0][1] = mirror ? iy : cy;
+          ++diff_count[0];
+        }
+        if (diff_count[1] < 2) {
+          const bool mirror = flip != (sign_bias_[ref1 - 1] != 0);
+          diff[diff_count[1]].mv[1][0] = mirror ? ix : cx;
+          diff[diff_count[1]].mv[1][1] = mirror ? iy : cy;
+          ++diff_count[1];
+        }
+      }
+    }
+  }
+
+  /* find_ref_mvs: the specification's candidate scan. `ctx` packs the three
+   * contexts the mode syntax needs (newmv_ctx, globalmv_ctx, refmv_ctx in that
+   * bit layout). A single reference block passes `ref1 == kRefIntra`. */
+  void find_ref_mvs(MvCand* stack, int* count, int* ctx, int ref0, int ref1, BlockSize size,
+                    int mi_row, int mi_col) {
     *count = 0;
     const int bw4 = block_width4(size), bh4 = block_height4(size);
     const int w4 = std::min(std::min(bw4, 16), tile_col_end_ - mi_col);
     const int h4 = std::min(std::min(bh4, 16), tile_row_end_ - mi_row);
-    int gmv_x = 0, gmv_y = 0;
-    global_mv(global_motion_of(ref0), mi_row, mi_col, bw4, bh4, &gmv_x, &gmv_y);
-    const bool gmv_valid = global_motion_of(ref0).type > kGmTranslation;
+    const bool compound = ref1 != kRefIntra;
 
-    bool have_newmv = false, have_col_mvs = false, have_row_mvs = false;
+    MvScan scan;
+    scan.stack = stack;
+    scan.count = count;
+    scan.ref[0] = ref0;
+    scan.ref[1] = ref1;
+    for (int n = 0; n < (compound ? 2 : 1); ++n) {
+      const GlobalMotion& gm = global_motion_of(scan.ref[n]);
+      global_mv(gm, mi_row, mi_col, bw4, bh4, &scan.gmv[n][0], &scan.gmv[n][1]);
+      /* the model's vector only stands in for a neighbour's when the model is
+       * more than a translation: a translated neighbour already carries the
+       * same vector explicitly */
+      scan.gmv_valid[n] = gm.type > kGmTranslation;
+    }
+
+    bool have_col_mvs = false, have_row_mvs = false;
     unsigned max_rows = 0, n_rows = ~0U, max_cols = 0, n_cols = ~0U;
     const bool top_avail = mi_row > tile_row_start_;
     const bool left_avail = mi_col > tile_col_start_;
     if (top_avail) {
       max_rows = std::min(static_cast<unsigned>((mi_row - tile_row_start_ + 1) >> 1),
                           2u + (bh4 > 1 ? 1u : 0u));
-      n_rows = scan_row(stack, count, ref0, gmv_x, gmv_y, gmv_valid, mi_row - 1, mi_col, bw4,
-                        w4, static_cast<int>(max_rows), bw4 >= 16 ? 4 : 1, &have_newmv,
-                        &have_row_mvs);
+      n_rows = scan_row(scan, mi_row - 1, mi_col, bw4, w4, static_cast<int>(max_rows),
+                        bw4 >= 16 ? 4 : 1, have_row_mvs);
     }
     if (left_avail) {
       max_cols = std::min(static_cast<unsigned>((mi_col - tile_col_start_ + 1) >> 1),
                           2u + (bw4 > 1 ? 1u : 0u));
-      n_cols = scan_col(stack, count, ref0, gmv_x, gmv_y, gmv_valid, mi_row, mi_col - 1, bh4,
-                        h4, static_cast<int>(max_cols), bh4 >= 16 ? 4 : 1, &have_newmv,
-                        &have_col_mvs);
+      n_cols = scan_col(scan, mi_row, mi_col - 1, bh4, h4, static_cast<int>(max_cols),
+                        bh4 >= 16 ? 4 : 1, have_col_mvs);
     }
     /* top/right */
     if (n_rows != ~0U && above_right_available(mi_row, mi_col, bw4) &&
         std::max(bw4, bh4) <= 16 && mi_col + bw4 < tile_col_end_) {
-      add_spatial_candidate(stack, count, 4, mi_row - 1, mi_col + bw4, ref0, gmv_x, gmv_y,
-                            gmv_valid, &have_newmv, &have_row_mvs);
+      add_spatial_candidate(scan, 4, mi_row - 1, mi_col + bw4, &have_row_mvs);
     }
 
     const int nearest_match = (have_col_mvs ? 1 : 0) + (have_row_mvs ? 1 : 0);
@@ -946,32 +1114,34 @@ class TileParser {
      * that refers only to intra frames has no projected candidates at all, so
      * the flag survives as it is, which is why this is not simply zero when the
      * projection is empty. */
-    const int globalmv_ctx =
-        temporal_candidates(stack, count, ref0, bw4, bh4, w4, h4, mi_row, mi_col, gmv_x, gmv_y);
+    const int globalmv_ctx = temporal_candidates(stack, count, ref0, ref1, bw4, bh4, w4, h4,
+                                                 mi_row, mi_col, scan.gmv[0][0], scan.gmv[0][1]);
 
-    /* top/left: the diagonal neighbour, when both scans ran */
+    /* top/left: the diagonal neighbour, when both scans ran. It adds a
+     * candidate and counts as a reference match, but its vector is not one the
+     * new/global modes can name, so it must not claim a new vector was coded. */
     if (top_avail && left_avail) {
-      bool dummy = false;
-      add_spatial_candidate(stack, count, 4, mi_row - 1, mi_col - 1, ref0, gmv_x, gmv_y,
-                            gmv_valid, &dummy, &have_row_mvs);
+      const bool newmv_before = scan.have_newmv;
+      add_spatial_candidate(scan, 4, mi_row - 1, mi_col - 1, &have_row_mvs);
+      scan.have_newmv = newmv_before;
     }
 
     /* the "secondary" rows and columns, two and three blocks away, which the
      * specification scans at 8x8 resolution */
     for (int n = 2; n <= 3; ++n) {
+      /* a secondary scan adds candidates and counts as a reference match, but it
+       * must not claim the neighbours coded a new vector: only the direct
+       * neighbours decide that half of the mode context */
+      const bool newmv_before = scan.have_newmv;
       if (static_cast<unsigned>(n) > n_rows && static_cast<unsigned>(n) <= max_rows) {
-        bool dummy = false;
-        n_rows += scan_row(stack, count, ref0, gmv_x, gmv_y, gmv_valid, mi_row - 2 * n + 1,
-                           mi_col | 1, bw4, w4, 1 + static_cast<int>(max_rows) - n,
-                           bw4 >= 16 ? 4 : 2, &dummy, &have_row_mvs);
+        n_rows += scan_row(scan, mi_row - 2 * n + 1, mi_col | 1, bw4, w4,
+                           1 + static_cast<int>(max_rows) - n, bw4 >= 16 ? 4 : 2, have_row_mvs);
       }
       if (static_cast<unsigned>(n) > n_cols && static_cast<unsigned>(n) <= max_cols) {
-        bool dummy = false;
-        n_cols += scan_col(stack, count, ref0, gmv_x, gmv_y, gmv_valid, mi_row | 1,
-                           (mi_col - n * 2 + 1) | 1, bh4, h4,
-                           1 + static_cast<int>(max_cols) - n, bh4 >= 16 ? 4 : 2, &dummy,
-                           &have_col_mvs);
+        n_cols += scan_col(scan, mi_row | 1, (mi_col - n * 2 + 1) | 1, bh4, h4,
+                           1 + static_cast<int>(max_cols) - n, bh4 >= 16 ? 4 : 2, have_col_mvs);
       }
+      scan.have_newmv = newmv_before;
     }
 
     const int ref_match_count = (have_col_mvs ? 1 : 0) + (have_row_mvs ? 1 : 0);
@@ -983,11 +1153,11 @@ class TileParser {
         break;
       case 1:
         refmv_ctx = std::min(ref_match_count * 3, 4);
-        newmv_ctx = 3 - (have_newmv ? 1 : 0);
+        newmv_ctx = 3 - (scan.have_newmv ? 1 : 0);
         break;
       default:
         refmv_ctx = 5;
-        newmv_ctx = 5 - (have_newmv ? 1 : 0);
+        newmv_ctx = 5 - (scan.have_newmv ? 1 : 0);
         break;
     }
 
@@ -1019,6 +1189,107 @@ class TileParser {
       len = last;
     }
 
+    /* A compound scan always has two candidates: the mode syntax needs a vector
+     * for each reference, so a short stack is completed from the neighbours that
+     * named some other reference (mirrored onto ours) and, failing that, from
+     * the global motion vectors. */
+    if (compound) {
+      if (*count < 2) {
+        const int sz4 = std::min(w4, h4);
+        MvCand* same = &stack[*count];
+        int same_count[4] = {0, 0, 0, 0};
+        if (n_rows != ~0U) {
+          for (int x = 0; x < sz4;) {
+            const int at = std::min(mi_col + x, mi_cols() - 1);
+            add_compound_extended_candidate(same, same_count, mi_row - 1, at, ref0, ref1);
+            x += block_width4(block_size_at(mi_row - 1, at));
+          }
+        }
+        if (n_cols != ~0U) {
+          for (int y = 0; y < sz4;) {
+            const int at = std::min(mi_row + y, mi_rows() - 1);
+            add_compound_extended_candidate(same, same_count, at, mi_col - 1, ref0, ref1);
+            y += block_height4(block_size_at(at, mi_col - 1));
+          }
+        }
+        MvCand* diff = &same[2];
+        const int* diff_count = &same_count[2];
+        for (int n = 0; n < 2; ++n) {
+          int m = same_count[n];
+          if (m >= 2) continue;
+          const int l = diff_count[n];
+          if (l) {
+            same[m].mv[n][0] = diff[0].mv[n][0];
+            same[m].mv[n][1] = diff[0].mv[n][1];
+            if (++m == 2) continue;
+            if (l == 2) {
+              same[1].mv[n][0] = diff[1].mv[n][0];
+              same[1].mv[n][1] = diff[1].mv[n][1];
+              continue;
+            }
+          }
+          do {
+            same[m].mv[n][0] = scan.gmv[n][0];
+            same[m].mv[n][1] = scan.gmv[n][1];
+          } while (++m < 2);
+        }
+
+        /* If the one candidate we had was the same as the first extended one,
+         * keep the second extended one instead: the two would otherwise be the
+         * same vector twice, which is exactly what the mode syntax must not
+         * see. */
+        const int base = *count;
+        if (base == 1 && stack[0].mv[0][0] == same[0].mv[0][0] &&
+            stack[0].mv[0][1] == same[0].mv[0][1] && stack[0].mv[1][0] == same[0].mv[1][0] &&
+            stack[0].mv[1][1] == same[0].mv[1][1]) {
+          for (int n = 0; n < 2; ++n) {
+            stack[1].mv[n][0] = same[1].mv[n][0];
+            stack[1].mv[n][1] = same[1].mv[n][1];
+          }
+        }
+        for (int n = base; n < 2; ++n) stack[n].weight = 2;
+        *count = 2;
+      }
+
+      /* clamping, both components of every candidate */
+      const int left = -(mi_col + bw4 + 4) * 4 * 8;
+      const int right = (mi_cols() - mi_col + 4) * 4 * 8;
+      const int top = -(mi_row + bh4 + 4) * 4 * 8;
+      const int bottom = (mi_rows() - mi_row + 4) * 4 * 8;
+      for (int n = 0; n < *count; ++n) {
+        for (int m = 0; m < 2; ++m) {
+          stack[n].mv[m][0] = std::max(left, std::min(right, stack[n].mv[m][0]));
+          stack[n].mv[m][1] = std::max(top, std::min(bottom, stack[n].mv[m][1]));
+        }
+      }
+
+      /* Compound_Mode_Ctx_Map: the compound mode has eight contexts, built from
+       * the same scan statistics but far more coarsely than the single
+       * reference modes use them. */
+      switch (refmv_ctx >> 1) {
+        case 0: *ctx = std::min(newmv_ctx, 1); break;
+        case 1: *ctx = 1 + std::min(newmv_ctx, 3); break;
+        default: *ctx = std::max(4, std::min(7, 3 + newmv_ctx)); break;
+      }
+      return;
+    } else if (*count < 2 && ref0 > kRefIntra) {
+      const int sz4 = std::min(w4, h4);
+      if (n_rows != ~0U) {
+        for (int x = 0; x < sz4 && *count < 2;) {
+          const int at = mi_col + x;
+          add_single_extended_candidate(stack, count, mi_row - 1, at, ref0);
+          x += block_width4(block_size_at(mi_row - 1, std::min(at, mi_cols() - 1)));
+        }
+      }
+      if (n_cols != ~0U) {
+        for (int y = 0; y < sz4 && *count < 2;) {
+          const int at = mi_row + y;
+          add_single_extended_candidate(stack, count, at, mi_col - 1, ref0);
+          y += block_height4(block_size_at(std::min(at, mi_rows() - 1), mi_col - 1));
+        }
+      }
+    }
+
     /* clamping */
     if (*count) {
       const int left = -(mi_col + bw4 + 4) * 4 * 8;
@@ -1026,8 +1297,8 @@ class TileParser {
       const int top = -(mi_row + bh4 + 4) * 4 * 8;
       const int bottom = (mi_rows() - mi_row + 4) * 4 * 8;
       for (int n = 0; n < *count; ++n) {
-        stack[n].x = std::max(left, std::min(right, stack[n].x));
-        stack[n].y = std::max(top, std::min(bottom, stack[n].y));
+        stack[n].mv[0][0] = std::max(left, std::min(right, stack[n].mv[0][0]));
+        stack[n].mv[0][1] = std::max(top, std::min(bottom, stack[n].mv[0][1]));
       }
     }
 
@@ -1035,8 +1306,8 @@ class TileParser {
      * count is what the mode syntax tests: an empty stack still means "no
      * candidate", which suppresses the dynamic reference list index bits. */
     for (int n = *count; n < 2; ++n) {
-      stack[n].x = gmv_x;
-      stack[n].y = gmv_y;
+      stack[n].mv[0][0] = scan.gmv[0][0];
+      stack[n].mv[0][1] = scan.gmv[0][1];
       stack[n].weight = 2;
     }
 
@@ -1114,6 +1385,18 @@ class TileParser {
     return top ? a * 2 : 0;
   }
 
+  /* Which references a reference context counts. The names are the
+   * specification's; several of them are aliases of each other, which is why
+   * the compound syntax can ask the same question under two names. */
+  enum RefKind {
+    kRefKindAll = 0,      /* av1_get_ref_ctx, uni_p: forward against backward */
+    kRefKindForward,      /* fwd_ref, fwd_ref_3: LAST+LAST2 against LAST3+GOLDEN */
+    kRefKindForward1,     /* fwd_ref_1, uni_p1: LAST against LAST2 */
+    kRefKindForward2,     /* fwd_ref_2, uni_p2: LAST3 against GOLDEN */
+    kRefKindBackward,     /* bwd_ref, bwd_ref_2: the three backward references */
+    kRefKindBackward1,    /* bwd_ref_1: BWDREF against ALTREF2 */
+  };
+
   /* The reference context helpers all count, over the two neighbours, how many
    * named a reference of each kind. `kind` selects which references count. */
   int ref_context(int row, int col, int kind) {
@@ -1137,6 +1420,9 @@ class TileParser {
           case 5:
             if (ref >= kRefBwdref && ref <= kRefAltref2) count[ref - kRefBwdref]++;
             break;                                                        /* bwd ref 1 */
+          case 6:
+            if (ref >= kRefLast2 && ref <= kRefGolden) count[ref - kRefLast2]++;
+            break;                                                        /* uni p1    */
           default: break;
         }
       }
@@ -1157,6 +1443,9 @@ class TileParser {
         return count[2] == count[1] ? 1 : (count[1] < count[2] ? 0 : 2);
       case 5:
         return count[0] == count[1] ? 1 : (count[0] < count[1] ? 0 : 2);
+      case 6:
+        count[1] += count[2];
+        return count[0] == count[1] ? 1 : (count[0] < count[1] ? 0 : 2);
       default:
         return 0;
     }
@@ -1164,17 +1453,19 @@ class TileParser {
 
   /* get_filter_ctx: 0 when both neighbours used the same filter for this
    * reference, 3 when they disagree, and the neighbour's filter when only one
-   * of them used this reference at all. */
-  int filter_context(int row, int col, bool comp, int ref) {
+   * of them used this reference at all. `dir` picks which of the two filters a
+   * dual filter frame is coding, and `comp` moves on to the compound half of the
+   * table, where the neighbours' statistics are the compound ones. */
+  int filter_context(int row, int col, bool comp, int dir, int ref) {
     const int kNone = 3;
     int a_filter = kNone, l_filter = kNone;
     if (have_top(row)) {
       const MiRef& n = mi_at(row - 1, col);
-      if (!n.intra && (n.ref[0] == ref || n.ref[1] == ref)) a_filter = n.filter;
+      if (n.ref[0] == ref || n.ref[1] == ref) a_filter = n.filter[dir];
     }
     if (have_left(col)) {
       const MiRef& n = mi_at(row, col - 1);
-      if (!n.intra && (n.ref[0] == ref || n.ref[1] == ref)) l_filter = n.filter;
+      if (n.ref[0] == ref || n.ref[1] == ref) l_filter = n.filter[dir];
     }
     const int base = (comp ? 4 : 0);
     if (a_filter == l_filter) return base + a_filter;
@@ -1196,21 +1487,125 @@ class TileParser {
     return std::min(3, std::min(lw, lh));
   }
 
-  /* get_comp_ctx, for frames that allow compound prediction. Only the parts
-   * that can be reached count: a block whose neighbours were all single
-   * reference has no compound information to share. */
+  /* Whether a neighbour's second reference points backwards. An intra
+   * neighbour stores no reference at all, and for these contexts it counts as a
+   * backward one: the reference decoders compare the stored value as unsigned,
+   * which turns the intra sentinel into the largest one. */
+  static bool neighbour_is_backward(const MiRef& n) {
+    return n.intra || n.ref[0] >= kRefBwdref;
+  }
+
+  static bool neighbour_is_compound(const MiRef& n) { return !n.intra && n.ref[1] > kRefIntra; }
+
+  /* get_comp_ctx: how likely the two neighbours make a compound block, which
+   * is what the compound flag's context says. A neighbour that was compound
+   * itself is the strongest signal, then one that at least pointed a reference
+   * backwards (the two directions of a compound block have to differ). */
   int comp_context(int row, int col) {
     const bool top = have_top(row), left = have_left(col);
     const MiRef* a = top ? &mi_at(row - 1, col) : nullptr;
     const MiRef* l = left ? &mi_at(row, col - 1) : nullptr;
-    /* an intra neighbour stores the reference "-1", which counts as a
-     * backward reference for these contexts (dav1d's unsigned comparison) */
-    const auto is_bwd = [](const MiRef& n) { return n.intra || n.ref[0] >= kRefBwdref; };
-    if (top && left) return is_bwd(*l) == is_bwd(*a) ? 0 : 1;
-    if (top) return is_bwd(*a) ? 1 : 0;
-    if (left) return is_bwd(*l) ? 1 : 0;
+    if (a && l) {
+      if (neighbour_is_compound(*a)) {
+        if (neighbour_is_compound(*l)) return 4;
+        return 2 + (neighbour_is_backward(*l) ? 1 : 0);
+      }
+      if (neighbour_is_compound(*l)) return 2 + (neighbour_is_backward(*a) ? 1 : 0);
+      return neighbour_is_backward(*l) == neighbour_is_backward(*a) ? 0 : 1;
+    }
+    if (a) return neighbour_is_compound(*a) ? 3 : (neighbour_is_backward(*a) ? 1 : 0);
+    if (l) return neighbour_is_compound(*l) ? 3 : (neighbour_is_backward(*l) ? 1 : 0);
     return 1;
   }
+
+  /* has_uni_comp: a compound neighbour whose two references are both forward or
+   * both backward, which is the case the compound reference syntax codes with a
+   * shorter tree. */
+  static bool has_uni_comp(const MiRef& n) {
+    return (n.ref[0] < kRefBwdref) == (n.ref[1] < kRefBwdref);
+  }
+
+  /* get_comp_dir_ctx: bidirectionality of the two neighbours. A single
+   * reference neighbour says nothing about the direction, so it is scored
+   * differently from a compound one - the whole point of the context is to
+   * predict whether this block uses a forward and a backward reference or two
+   * of the same direction. */
+  int comp_dir_context(int row, int col) {
+    const bool top = have_top(row), left = have_left(col);
+    const MiRef* a = top ? &mi_at(row - 1, col) : nullptr;
+    const MiRef* l = left ? &mi_at(row, col - 1) : nullptr;
+    const auto is_comp = [](const MiRef* n) { return n && !n->intra && n->comp_type != kCompoundNone; };
+    if (a && l) {
+      const bool a_intra = a->intra, l_intra = l->intra;
+      if (a_intra && l_intra) return 2;
+      if (a_intra || l_intra) {
+        const MiRef& edge = a_intra ? *l : *a;
+        if (!is_comp(&edge)) return 2;
+        return 1 + (has_uni_comp(edge) ? 2 : 0);
+      }
+      const bool a_comp = is_comp(a), l_comp = is_comp(l);
+      if (!a_comp && !l_comp) {
+        return 1 + (((a->ref[0] >= kRefBwdref) == (l->ref[0] >= kRefBwdref)) ? 2 : 0);
+      }
+      if (!a_comp || !l_comp) {
+        const MiRef& edge = a_comp ? *a : *l;
+        if (!has_uni_comp(edge)) return 1;
+        return 3 + (((a->ref[0] >= kRefBwdref) == (l->ref[0] >= kRefBwdref)) ? 1 : 0);
+      }
+      const bool a_uni = has_uni_comp(*a), l_uni = has_uni_comp(*l);
+      if (!a_uni && !l_uni) return 0;
+      if (!a_uni || !l_uni) return 2;
+      return 3 + ((a->ref[0] == kRefBwdref) == (l->ref[0] == kRefBwdref) ? 1 : 0);
+    }
+    const MiRef* edge = l ? l : a;
+    if (!edge) return 2;
+    if (edge->intra) return 2;
+    if (edge->comp_type == kCompoundNone) return 2;
+    return has_uni_comp(*edge) ? 4 : 0;
+  }
+
+  /* get_jnt_comp_ctx: whether the two references are equally far from this
+   * frame, which decides whether the distance weighted blend is even
+   * interesting, plus the neighbours' use of it. */
+  int jnt_comp_context(int row, int col, int ref0, int ref1) {
+    const int d0 = std::abs(order_hint_delta(seq_, frame_.ref_order_hint[ref0 - 1],
+                                             frame_.order_hint));
+    const int d1 = std::abs(order_hint_delta(seq_, frame_.order_hint,
+                                             frame_.ref_order_hint[ref1 - 1]));
+    const int a_ctx = (have_top(row) && !mi_at(row - 1, col).intra &&
+                       (mi_at(row - 1, col).comp_type >= kCompoundAverage ||
+                        mi_at(row - 1, col).ref[0] == kRefAltref))
+                          ? 1
+                          : 0;
+    const int l_ctx = (have_left(col) && !mi_at(row, col - 1).intra &&
+                       (mi_at(row, col - 1).comp_type >= kCompoundAverage ||
+                        mi_at(row, col - 1).ref[0] == kRefAltref))
+                          ? 1
+                          : 0;
+    return 3 * (d0 == d1 ? 1 : 0) + a_ctx + l_ctx;
+  }
+
+  /* get_mask_comp_ctx: whether the neighbours used a masked blend. */
+  int mask_comp_context(int row, int col) {
+    const auto side = [](const MiRef& n) {
+      if (n.intra) return 0;
+      if (n.comp_type >= kCompoundDiffwtd) return 1;
+      return n.ref[0] == kRefAltref ? 3 : 0;
+    };
+    const int a_ctx = have_top(row) ? side(mi_at(row - 1, col)) : 0;
+    const int l_ctx = have_left(col) ? side(mi_at(row, col - 1)) : 0;
+    return std::min(a_ctx + l_ctx, 5);
+  }
+
+  /* Wedge_Bits: the number of wedge bits a block size can carry, as the
+   * reference decoders tabulate it. Only the nine square-ish sizes have a wedge
+   * mask at all; the other sizes have none and therefore code the difference
+   * weighted mask instead. */
+  int wedge_bits(BlockSize size) const { return kWedgeBits[size]; }
+
+  /* The wedge direction context: the wedge table is indexed by this number,
+   * which is the block size grouped by aspect ratio. */
+  int wedge_context(BlockSize size) const { return kWedgeContext[size]; }
 
   /* findoddzero: is there an inter predicted block at an odd 4x4 offset
    * inside this block's span on that edge? OBMC overlaps the neighbours it
@@ -1371,142 +1766,299 @@ class TileParser {
 
   /* inter_frame_mode_info: everything an inter frame codes for a block after
    * skip and the superblock deltas. It ends either with an intra block (which
-   * continues with the chroma mode) or with a single reference inter block
-   * with its motion vector and interpolation filter. */
+   * continues with the chroma mode) or with an inter block carrying one or two
+   * references, their motion vectors, the blend that combines them and the
+   * interpolation filter.
+   *
+   * A skip mode block is the special case the frame header sets up: it is always
+   * inter, always compound, takes both references from the header, uses the
+   * nearest candidate pair and codes nothing but its presence. */
   ParseStatus read_inter_block_mode(TileBlock* block, BlockSize size, int row, int col,
                                     bool has_chroma) {
     const int bw4 = block_width4(size), bh4 = block_height4(size);
     const bool top_avail = have_top(row), left_avail = have_left(col);
+    const bool compound_allowed = std::min(bw4, bh4) > 1;
+    const int mv_prec = (frame_.allow_high_precision_mv ? 1 : 0) - (frame_.force_integer_mv ? 1 : 0);
 
-    /* is_inter */
-    block->is_inter = decoder_.read_symbol(cdf_.inter.is_inter[intra_context(row, col)], 1) != 0;
+    /* is_inter: a skip mode block is inter by definition and codes no flag */
+    if (block->skip_mode) {
+      block->is_inter = true;
+    } else {
+      block->is_inter = decoder_.read_symbol(cdf_.inter.is_inter[intra_context(row, col)], 1) != 0;
+    }
     if (!block->is_inter) {
       const ParseStatus status = read_intra_block_mode(block, size, row, col, false);
       if (status != ParseStatus::Ok) return status;
       return read_chroma_mode(block, size, has_chroma);
     }
 
-    /* compound or single reference */
-    if (frame_.reference_select && std::min(bw4, bh4) > 1) {
-      const int ctx = comp_context(row, col);
-      if (decoder_.read_symbol(cdf_.inter.comp_mode[ctx], 1) != 0) {
-        return unsupported("tile: compound inter prediction is not implemented");
-      }
-    }
-
-    /* read_ref_frames: the reference of a single reference block, as a binary
-     * tree over the seven reference types */
-    /* The table's first index is the context and the second the step of the
-     * tree, which is not the order the steps are coded in: the three
-     * second-level tests live in different rows. */
-    const int ctx1 = ref_context(row, col, 0);
-    if (decoder_.read_symbol(cdf_.inter.single_ref[ctx1][0], 1)) {
-      const int ctx2 = ref_context(row, col, 4);
-      if (decoder_.read_symbol(cdf_.inter.single_ref[ctx2][1], 1)) {
-        block->ref_frame[0] = kRefAltref;
-      } else {
-        const int ctx3 = ref_context(row, col, 5);
-        block->ref_frame[0] =
-            decoder_.read_symbol(cdf_.inter.single_ref[ctx3][5], 1) ? kRefBwdref : kRefAltref2;
-      }
+    /* read_ref_frames: one reference or a pair, and which pair */
+    int ref0 = kRefIntra, ref1 = kRefIntra;
+    bool compound = false;
+    if (block->skip_mode) {
+      compound = true;
+      ref0 = frame_.skip_mode_frame[0];
+      ref1 = frame_.skip_mode_frame[1];
     } else {
-      const int ctx2 = ref_context(row, col, 1);
-      if (decoder_.read_symbol(cdf_.inter.single_ref[ctx2][2], 1)) {
-        const int ctx3 = ref_context(row, col, 3);
-        block->ref_frame[0] = decoder_.read_symbol(cdf_.inter.single_ref[ctx3][4], 1) ? kRefLast3
-                                                                                      : kRefLast2;
+      if (frame_.reference_select && compound_allowed) {
+        const int ctx = comp_context(row, col);
+        compound = decoder_.read_symbol(cdf_.inter.comp_mode[ctx], 1) != 0;
+      }
+      if (compound) {
+        /* the pair is coded as a direction ("bidirectional" or not) and then one
+         * tree per reference over the four forward and the three backward
+         * references */
+        const int dir_ctx = comp_dir_context(row, col);
+        if (decoder_.read_symbol(cdf_.inter.comp_ref_type[dir_ctx], 1)) {
+          /* bidirectional: a forward reference, then a backward one */
+          if (decoder_.read_symbol(
+                  cdf_.inter.comp_ref[ref_context(row, col, kRefKindForward)][0], 1)) {
+            ref0 = 2 + (decoder_.read_symbol(
+                            cdf_.inter.comp_ref[ref_context(row, col, kRefKindForward2)][2], 1)
+                            ? 1
+                            : 0);
+          } else {
+            ref0 = decoder_.read_symbol(
+                       cdf_.inter.comp_ref[ref_context(row, col, kRefKindForward1)][1], 1)
+                       ? 1
+                       : 0;
+          }
+          ref0 += 1;
+          if (decoder_.read_symbol(
+                  cdf_.inter.comp_bwd_ref[ref_context(row, col, kRefKindBackward)][0], 1)) {
+            ref1 = kRefAltref;
+          } else {
+            ref1 = kRefBwdref + (decoder_.read_symbol(
+                                     cdf_.inter.comp_bwd_ref[ref_context(row, col,
+                                                                         kRefKindBackward1)][1],
+                                     1)
+                                     ? 1
+                                     : 0);
+          }
+        } else if (decoder_.read_symbol(
+                       cdf_.inter.uni_comp_ref[ref_context(row, col, kRefKindAll)][0], 1)) {
+          /* unidirectional: BWDREF and ALTREF, or LAST with one of the rest */
+          ref0 = kRefBwdref;
+          ref1 = kRefAltref;
+        } else {
+          ref0 = kRefLast;
+          int index = decoder_.read_symbol(
+              cdf_.inter.uni_comp_ref[ref_context(row, col, kRefKindForward1)][1], 1);
+          if (index) {
+            index += decoder_.read_symbol(
+                cdf_.inter.uni_comp_ref[ref_context(row, col, kRefKindForward2)][2], 1);
+          }
+          ref1 = kRefLast2 + index;
+        }
       } else {
-        const int ctx3 = ref_context(row, col, 2);
-        block->ref_frame[0] =
-            decoder_.read_symbol(cdf_.inter.single_ref[ctx3][3], 1) ? kRefLast2 : kRefLast;
+        /* read_ref_frames: the reference of a single reference block, as a
+         * binary tree over the seven reference types. The table's first index is
+         * the context and the second the step of the tree, which is not the
+         * order the steps are coded in: the three second-level tests live in
+         * different rows. */
+        if (decoder_.read_symbol(
+                cdf_.inter.single_ref[ref_context(row, col, kRefKindAll)][0], 1)) {
+          if (decoder_.read_symbol(
+                  cdf_.inter.single_ref[ref_context(row, col, kRefKindBackward)][1], 1)) {
+            ref0 = kRefAltref;
+          } else {
+            ref0 = decoder_.read_symbol(
+                       cdf_.inter.single_ref[ref_context(row, col, kRefKindBackward1)][5], 1)
+                       ? kRefBwdref
+                       : kRefAltref2;
+          }
+        } else {
+          if (decoder_.read_symbol(
+                  cdf_.inter.single_ref[ref_context(row, col, kRefKindForward)][2], 1)) {
+            ref0 = decoder_.read_symbol(
+                       cdf_.inter.single_ref[ref_context(row, col, kRefKindForward2)][4], 1)
+                       ? kRefLast3
+                       : kRefLast2;
+          } else {
+            ref0 = decoder_.read_symbol(
+                       cdf_.inter.single_ref[ref_context(row, col, kRefKindForward1)][3], 1)
+                       ? kRefLast2
+                       : kRefLast;
+          }
+        }
+        ref1 = kRefIntra;
       }
     }
-    block->ref_frame[1] = kRefIntra;
+    block->ref_frame[0] = ref0;
+    block->ref_frame[1] = ref1;
 
     /* the candidate list, then the mode that picks from it */
     MvCand stack[8];
     int count = 0, ctx = 0;
-    find_ref_mvs(stack, &count, &ctx, block->ref_frame[0], size, row, col);
+    find_ref_mvs(stack, &count, &ctx, ref0, ref1, size, row, col);
     if (trace_) {
       std::fprintf(stderr, "V %d %d n=%d ctx=%d s0=%d,%d s1=%d,%d w0=%d w1=%d\n", col, row,
-                   count, ctx, stack[0].x, stack[0].y, stack[1].x, stack[1].y, stack[0].weight,
-                   stack[1].weight);
+                   count, ctx, stack[0].mv[0][0], stack[0].mv[0][1], stack[1].mv[0][0],
+                   stack[1].mv[0][1], stack[0].weight, stack[1].weight);
     }
 
-    const GlobalMotion& gm = global_motion_of(block->ref_frame[0]);
-    int mv_x = 0, mv_y = 0;
+    const GlobalMotion& gm0 = global_motion_of(ref0);
+    int mv0x = 0, mv0y = 0, mv1x = 0, mv1y = 0;
     bool has_subpel_filter = true;
-    const int mv_prec = (frame_.allow_high_precision_mv ? 1 : 0) - (frame_.force_integer_mv ? 1 : 0);
+    block->drl_index = 0;
 
-    if (decoder_.read_symbol(cdf_.inter.new_mv[ctx & 7], 1)) {
-      /* not a new vector: global motion, nearest or near */
-      if (!decoder_.read_symbol(cdf_.inter.zero_mv[(ctx >> 3) & 1], 1)) {
-        block->inter_mode = kModeGlobalMv;
-        global_mv(gm, row, col, bw4, bh4, &mv_x, &mv_y);
-        has_subpel_filter = std::min(bw4, bh4) == 1 || gm.translation_only();
-      } else {
-        has_subpel_filter = true;
-        if (decoder_.read_symbol(cdf_.inter.ref_mv[(ctx >> 4) & 15], 1)) {
-          block->inter_mode = kModeNearMv;
-          block->drl_index = 1;
-          if (count > 2) {
+    if (block->skip_mode) {
+      /* no mode, no residual: the nearest pair, at the frame's precision */
+      block->inter_mode = kModeNearestNearestMv;
+      mv0x = stack[0].mv[0][0];
+      mv0y = stack[0].mv[0][1];
+      mv1x = stack[0].mv[1][0];
+      mv1y = stack[0].mv[1][1];
+      lower_mv_precision(&mv0x, &mv0y);
+      lower_mv_precision(&mv1x, &mv1y);
+      has_subpel_filter = false;
+    } else if (compound) {
+      const int symbol = static_cast<int>(decoder_.read_symbol(cdf_.inter.compound_mode[ctx], 7));
+      if (trace_) {
+        std::fprintf(stderr, "R comp=%d ctx=%d n=%d\n", symbol, ctx, count);
+      }
+      block->inter_mode = kModeNearestNearestMv + symbol;
+      const CompoundModePair& pair = kCompoundModePairs[symbol];
+      /* the dynamic reference list index: a new vector starts at the nearest
+       * candidate, a near one at the second */
+      if (block->inter_mode == kModeNewNewMv) {
+        if (count > 1) {
+          block->drl_index +=
+              decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 0)], 1);
+          if (block->drl_index == 1 && count > 2) {
             block->drl_index +=
                 decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 1)], 1);
-            if (block->drl_index == 2 && count > 3) {
-              block->drl_index +=
-                  decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 2)], 1);
-            }
           }
+        }
+      } else if (pair.mode[0] == kModeNearMv || pair.mode[1] == kModeNearMv) {
+        block->drl_index = 1;
+        if (count > 2) {
+          block->drl_index +=
+              decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 1)], 1);
+          if (block->drl_index == 2 && count > 3) {
+            block->drl_index +=
+                decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 2)], 1);
+          }
+        }
+      }
+      for (int n = 0; n < 2; ++n) {
+        int mx = 0, my = 0;
+        switch (pair.mode[n]) {
+          case kModeNearMv:
+          case kModeNearestMv:
+            mx = stack[block->drl_index].mv[n][0];
+            my = stack[block->drl_index].mv[n][1];
+            lower_mv_precision(&mx, &my);
+            break;
+          case kModeGlobalMv:
+            global_mv(global_motion_of(n ? ref1 : ref0), row, col, bw4, bh4, &mx, &my);
+            break;
+          default: /* kModeNewMv */
+            mx = stack[block->drl_index].mv[n][0];
+            my = stack[block->drl_index].mv[n][1];
+            read_mv_residual(&mx, &my, mv_prec);
+            break;
+        }
+        if (n == 0) {
+          mv0x = mx;
+          mv0y = my;
         } else {
-          block->inter_mode = kModeNearestMv;
-          block->drl_index = 0;
+          mv1x = mx;
+          mv1y = my;
         }
-        mv_x = stack[block->drl_index].x;
-        mv_y = stack[block->drl_index].y;
-        if (block->drl_index < 2) lower_mv_precision(&mv_x, &mv_y);
       }
+      has_subpel_filter = std::min(bw4, bh4) == 1 || block->inter_mode != kModeGlobalGlobalMv;
     } else {
-      has_subpel_filter = true;
-      block->inter_mode = kModeNewMv;
-      block->drl_index = 0;
-      if (count > 1) {
-        block->drl_index += decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 0)], 1);
-        if (block->drl_index == 1 && count > 2) {
-          block->drl_index += decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 1)], 1);
+      if (decoder_.read_symbol(cdf_.inter.new_mv[ctx & 7], 1)) {
+        /* not a new vector: global motion, nearest or near */
+        if (!decoder_.read_symbol(cdf_.inter.zero_mv[(ctx >> 3) & 1], 1)) {
+          block->inter_mode = kModeGlobalMv;
+          global_mv(gm0, row, col, bw4, bh4, &mv0x, &mv0y);
+          has_subpel_filter = std::min(bw4, bh4) == 1 || gm0.translation_only();
+        } else {
+          if (decoder_.read_symbol(cdf_.inter.ref_mv[(ctx >> 4) & 15], 1)) {
+            block->inter_mode = kModeNearMv;
+            block->drl_index = 1;
+            if (count > 2) {
+              block->drl_index +=
+                  decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 1)], 1);
+              if (block->drl_index == 2 && count > 3) {
+                block->drl_index +=
+                    decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 2)], 1);
+              }
+            }
+          } else {
+            block->inter_mode = kModeNearestMv;
+            block->drl_index = 0;
+          }
+          mv0x = stack[block->drl_index].mv[0][0];
+          mv0y = stack[block->drl_index].mv[0][1];
+          if (block->drl_index < 2) lower_mv_precision(&mv0x, &mv0y);
         }
-      }
-      if (count > 1) {
-        mv_x = stack[block->drl_index].x;
-        mv_y = stack[block->drl_index].y;
       } else {
-        mv_x = stack[0].x;
-        mv_y = stack[0].y;
-        lower_mv_precision(&mv_x, &mv_y);
+        block->inter_mode = kModeNewMv;
+        block->drl_index = 0;
+        if (count > 1) {
+          block->drl_index += decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 0)], 1);
+          if (block->drl_index == 1 && count > 2) {
+            block->drl_index +=
+                decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 1)], 1);
+          }
+        }
+        if (count > 1) {
+          mv0x = stack[block->drl_index].mv[0][0];
+          mv0y = stack[block->drl_index].mv[0][1];
+        } else {
+          mv0x = stack[0].mv[0][0];
+          mv0y = stack[0].mv[0][1];
+          lower_mv_precision(&mv0x, &mv0y);
+        }
+        read_mv_residual(&mv0x, &mv0y, mv_prec);
       }
-      read_mv_residual(&mv_x, &mv_y, mv_prec);
     }
 
-    /* inter/intra compound: allowed for most block sizes, but this decoder
-     * predicts with one reference only */
-    if (seq_.enable_interintra_compound && std::min(bw4, bh4) >= 2 &&
-        std::max(bw4, bh4) <= 8) {
-      const int group = ymode_size_group(size);
+    /* read_interintra_mode: a single reference block whose prediction is blended
+     * with an intra one. Only the sizes from 8x8 to 32x32 can, and only when the
+     * block is neither a skip mode block nor already a compound one - the
+     * reference frame pair of a compound block leaves no room for the intra
+     * one.
+     *
+     * The intra half is not reconstructed yet, but its syntax is short and
+     * reading it is what keeps the range decoder in step: the inter half is
+     * predicted as usual and the intra half is simply missing from the frame. */
+    if (!block->skip_mode && seq_.enable_interintra_compound && !compound && size >= kBlock8x8 &&
+        size <= kBlock32x32) {
+      const int group = ymode_size_group(size) - 1;
       if (decoder_.read_symbol(cdf_.inter.inter_intra[group], 1) != 0) {
-        return unsupported("tile: inter/intra compound prediction is not implemented");
+        block->interintra = true;
+        block->interintra_mode =
+            static_cast<int>(decoder_.read_symbol(cdf_.inter.inter_intra_mode[group], 3));
+        block->interintra_wedge =
+            decoder_.read_symbol(cdf_.inter.wedge_inter_intra[size], 1) != 0;
+        if (block->interintra_wedge) {
+          block->wedge_index =
+              static_cast<int>(decoder_.read_symbol(cdf_.inter.wedge_index[size], 15));
+        }
+        /* the pair is the reference and the intra frame from now on, which is
+         * what the syntax set RefFrame[1] to and what the block carries */
+        ref1 = kRefIntra;
+        block->ref_frame[1] = kRefIntra;
       }
     }
 
     /* motion mode: simple translation, overlapped block motion compensation, or
-     * local warped motion. Both of the latter need prediction work this
-     * decoder does not do yet, but the symbol still decides the stream. */
+     * local warped motion. Both of the latter need prediction work this decoder
+     * does not do yet, but the symbol still decides the stream. */
     block->motion_mode = kMotionTranslation;
-    if (frame_.is_motion_mode_switchable && std::min(bw4, bh4) >= 2 &&
-        !(block->inter_mode == kModeGlobalMv && gm.type > kGmTranslation) &&
+    if (!block->skip_mode && !compound && !block->interintra &&
+        frame_.is_motion_mode_switchable && std::min(bw4, bh4) >= 2 &&
+        !(!frame_.force_integer_mv && block->inter_mode == kModeGlobalMv &&
+          gm0.type > kGmTranslation) &&
         ((left_avail && find_odd_inter(false, row, col, bw4, bh4)) ||
          (top_avail && find_odd_inter(true, row, col, bw4, bh4)))) {
       uint64_t masks[2] = {0, 0};
       find_matching_ref(row, col, bw4, bh4, std::min(bw4, 16), std::min(bh4, 16), left_avail,
-                        top_avail, block->ref_frame[0], masks);
+                        top_avail, ref0, masks);
       const bool allow_warp = !frame_.force_integer_mv && frame_.allow_warped_motion &&
                               (masks[0] | masks[1]);
       if (allow_warp) {
@@ -1524,35 +2076,97 @@ class TileParser {
       if (block->motion_mode == kMotionWarped) ++out_->warped_blocks;
     }
 
-    /* the subpel filter, if this frame switches them */
-    int filter0 = frame_.interpolation_filter, filter1 = filter0;
-    if (frame_.is_filter_switchable) {
-      if (has_subpel_filter) {
-        const bool comp = false;
-        const int fctx = filter_context(row, col, comp, block->ref_frame[0]);
-        filter0 = static_cast<int>(decoder_.read_symbol(cdf_.inter.interp_filter[fctx], 2));
-        filter1 = filter0;
-        if (seq_.enable_dual_filter) {
-          const int fctx2 = filter_context(row, col, comp, block->ref_frame[0]);
-          filter1 =
-              static_cast<int>(decoder_.read_symbol(cdf_.inter.interp_filter[8 + fctx2], 2));
+    /* read_compound_type: nothing to code for a single reference block, and a
+     * skip mode block always averages */
+    if (block->skip_mode) {
+      block->compound_type = kCompoundAverage;
+    } else if (!compound) {
+      block->compound_type = kCompoundNone;
+    } else {
+      bool masked = false;
+      if (seq_.enable_masked_compound) {
+        const int mask_ctx = mask_comp_context(row, col);
+        masked = decoder_.read_symbol(cdf_.inter.comp_group_idx[mask_ctx], 1) != 0;
+        if (trace_) {
+          const RangeDecoder::State st = decoder_.state();
+          std::fprintf(stderr, "Y mask %d %d %llu %u %d\n", mask_ctx, masked ? 1 : 0,
+                       static_cast<unsigned long long>(st.window), st.range, st.count);
+        }
+      }
+      if (!masked) {
+        if (seq_.enable_jnt_comp) {
+          const int jnt_ctx = jnt_comp_context(row, col, ref0, ref1);
+          block->compound_type = kCompoundWeightedAverage +
+                                 (decoder_.read_symbol(cdf_.inter.compound_idx[jnt_ctx], 1) ? 1
+                                                                                            : 0);
+          if (trace_) {
+            const RangeDecoder::State st = decoder_.state();
+            std::fprintf(stderr, "Y jnt %d %d %llu %u %d\n", jnt_ctx,
+                         block->compound_type == kCompoundAverage ? 1 : 0,
+                         static_cast<unsigned long long>(st.window), st.range, st.count);
+          }
+        } else {
+          block->compound_type = kCompoundAverage;
         }
       } else {
-        filter0 = filter1 = 0;
+        if (wedge_bits(size) > 0) {
+          /* masked, with a mask shape to choose: wedge or difference weighted */
+          block->compound_type =
+              kCompoundWedge -
+              (decoder_.read_symbol(cdf_.inter.compound_type[size], 1) ? 1 : 0);
+          if (block->compound_type == kCompoundWedge) {
+            block->wedge_index = static_cast<int>(
+                decoder_.read_symbol(cdf_.inter.wedge_index[size], 15));
+          }
+        } else {
+          block->compound_type = kCompoundDiffwtd;
+        }
+        /* the mask sign for a wedge, the mask type for a difference weighted
+         * mask: one literal bit either way */
+        block->mask_sign = static_cast<int>(decoder_.read_bit());
       }
     }
-    /* the engine has one filter per block; a dual filter pair is only a
-     * problem when its two halves differ */
-    if (filter0 != filter1) return unsupported("tile: dual interpolation filters");
-    block->interp_filter = filter0;
-    block->mv[0][0] = mv_x;
-    block->mv[0][1] = mv_y;
+
+    /* the subpel filter, if this frame switches them */
+    int filter[2] = {frame_.interpolation_filter, frame_.interpolation_filter};
+    if (frame_.is_filter_switchable) {
+      if (has_subpel_filter) {
+        const bool comp = block->compound_type != kCompoundNone;
+        const int fctx = filter_context(row, col, comp, 0, ref0);
+        filter[0] = static_cast<int>(decoder_.read_symbol(cdf_.inter.interp_filter[fctx], 2));
+        filter[1] = filter[0];
+        if (trace_) {
+          const RangeDecoder::State st = decoder_.state();
+          std::fprintf(stderr, "Y f0 %d %d %llu %u %d\n", fctx, filter[0],
+                       static_cast<unsigned long long>(st.window), st.range, st.count);
+        }
+        if (seq_.enable_dual_filter) {
+          const int fctx2 = filter_context(row, col, comp, 1, ref0);
+          filter[1] =
+              static_cast<int>(decoder_.read_symbol(cdf_.inter.interp_filter[8 + fctx2], 2));
+          if (trace_) {
+            const RangeDecoder::State st = decoder_.state();
+            std::fprintf(stderr, "Y f1 %d %d %llu %u %d\n", fctx2, filter[1],
+                         static_cast<unsigned long long>(st.window), st.range, st.count);
+          }
+        }
+      } else {
+        filter[0] = filter[1] = 0;
+      }
+    }
+    block->interp_filter[0] = filter[0];
+    block->interp_filter[1] = filter[1];
+    block->mv[0][0] = mv0x;
+    block->mv[0][1] = mv0y;
+    block->mv[1][0] = mv1x;
+    block->mv[1][1] = mv1y;
     return ParseStatus::Ok;
   }
 
   /* Remember the block in the motion reference map the next block's candidate
    * scan reads. */
-  void mark_inter(int row, int col, BlockSize size, const TileBlock& block, int filter) {
+  void mark_inter(int row, int col, BlockSize size, const TileBlock& block, int filter0,
+                  int filter1) {
     const int bw4 = block_width4(size), bh4 = block_height4(size);
     MiRef entry;
     entry.intra = block.is_inter ? 0 : 1;
@@ -1566,7 +2180,9 @@ class TileParser {
     entry.global_subpel =
         block.is_inter && block.inter_mode == kModeGlobalMv && std::min(bw4, bh4) >= 2;
     entry.coded_newmv = block.is_inter && block.inter_mode == kModeNewMv;
-    entry.filter = static_cast<uint8_t>(filter);
+    entry.filter[0] = static_cast<uint8_t>(filter0);
+    entry.filter[1] = static_cast<uint8_t>(filter1);
+    entry.comp_type = static_cast<uint8_t>(block.is_inter ? block.compound_type : kCompoundNone);
     for (int y = 0; y < bh4 && row + y < mi_rows(); ++y)
       for (int x = 0; x < bw4 && col + x < mi_cols(); ++x) mi_ref_[index(row + y, col + x)] = entry;
   }
@@ -1596,6 +2212,12 @@ class TileParser {
       const int cat = (tx_square_class(tx) != block_class ? 1 : 0) + 2 * (4 - block_class);
       if (cat < 0 || cat > 6) return;
       split = decoder_.read_symbol(cdf_.mode.txpart[cat][above + left], 1) != 0;
+      if (trace_) {
+        const RangeDecoder::State state = decoder_.state();
+        std::fprintf(stderr, "XT %d %d tx=%dx%d depth=%d cat=%d al=%d split=%d dif=%llu rng=%u cnt=%d\n",
+                     col, row, tx.w4(), tx.h4(), depth, cat, above + left, split ? 1 : 0,
+                     static_cast<unsigned long long>(state.window), state.range, state.count);
+      }
     }
     if (!split) {
       set_cell_tx(row, col, w4, h4, tx.lw, tx.lh);
@@ -1734,9 +2356,9 @@ class TileParser {
     }
 
     /* read_skip_mode, then read_skip. A frame that allows skip mode codes a
-     * flag before the skip flag; a block that uses it is skipped and takes its
-     * whole mode info from the two reference frames the frame header named,
-     * which this decoder does not predict yet. */
+     * flag before the skip flag; a block that uses it is always skipped, always
+     * inter and always compound, so it codes neither of the two flags that
+     * would say so. */
     const bool intra_frame =
         frame_.type == FrameType::Key || frame_.type == FrameType::IntraOnly;
     block.skip_mode = false;
@@ -1747,10 +2369,7 @@ class TileParser {
     }
     if (block.skip_mode) {
       block.skip = true;
-      trace_point(row, col, "skip");
-      return unsupported("tile: skip mode is not implemented");
-    }
-    {
+    } else {
       const int sctx = skip_context(row, col);
       block.skip = decoder_.read_symbol(cdf_.skip.row(sctx), 1) != 0;
     }
@@ -1913,7 +2532,8 @@ class TileParser {
                block.is_inter ? block.inter_mode : block.y_mode);
     mark_tx(row, col, bw4, bh4, tx);
     if (block.skip_mode) mi_skip_mode_set(row, col, bw4, bh4);
-    if (!intra_frame) mark_inter(row, col, size, block, block.interp_filter);
+    if (!intra_frame) mark_inter(row, col, size, block, block.interp_filter[0],
+                                 block.interp_filter[1]);
     if (block.is_inter) {
       /* the uv mode of an inter block is not coded: the specification sets it
        * to DC for the purposes of the neighbour contexts */
@@ -2499,6 +3119,9 @@ class TileParser {
   int proj_cols_ = 0;
   int pocdiff_[7] = {0, 0, 0, 0, 0, 0, 0};
   bool mfmv_sign_[7] = {false, false, false, false, false, false, false};
+  /* sign_bias: whether a reference frame is *after* this one, which inverts the
+   * sign of the vectors neighbours stored that point at it */
+  bool sign_bias_[7] = {false, false, false, false, false, false, false};
   int mfmv_ref_[3] = {0, 0, 0};
   int mfmv_ref2cur_[3] = {0, 0, 0};
   uint8_t mfmv_ref2ref_[3][7] = {};
