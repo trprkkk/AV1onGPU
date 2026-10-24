@@ -20,7 +20,6 @@
  * carry a plain sample offset and the backends need a single allocation.
  */
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 
 #include "core/backend.hpp"
@@ -28,12 +27,6 @@
 namespace av1gpu {
 namespace internal {
 namespace {
-
-double now_ms() {
-  using clock = std::chrono::steady_clock;
-  static const clock::time_point start = clock::now();
-  return std::chrono::duration<double, std::milli>(clock::now() - start).count();
-}
 
 /* Dependency grid: one cell per `cell` luma samples holding the wave index of
  * the block that reconstructed that area, or -1. */

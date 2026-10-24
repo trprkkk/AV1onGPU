@@ -20,8 +20,6 @@ using namespace av1gpu::internal;
 
 namespace {
 
-int quantise(double v) { return static_cast<int>(std::floor(v * 4096.0 + 0.5)); }
-
 /* inverse transform of one block, vectorised the same way the decoder does it */
 void inverse_transform(const std::vector<int>& coef, int w, int h, int row_basis,
                        int col_basis, std::vector<int>* out) {

@@ -551,7 +551,9 @@ class CudaBackend final : public Backend {
       *error = "nvrtcCreateProgram failed";
       return false;
     }
-    char arch[32];
+    /* NVRTC spells the minor version as two digits for 10.x and later, so
+     * build the string with enough room for "compute_1200" */
+    char arch[48];
     std::snprintf(arch, sizeof(arch), "--gpu-architecture=compute_%d%d", compute_major_,
                   compute_minor_ >= 5 ? compute_minor_ : 0);
     const char* options[] = {arch, "-default-device"};

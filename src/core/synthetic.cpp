@@ -239,10 +239,8 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
           job.bitdepth = cfg.bit_depth;
           std::vector<uint16_t> tmp(static_cast<size_t>(w) * h, 0);
           const uint16_t* refp = reference->plane(plane);
-          const int ref_stride = reference->stride[plane];
           av1g_inter_block(&job, tmp.data(), refp, refp, filters, maxv);
           std::memcpy(pred.data(), tmp.data(), tmp.size() * sizeof(uint16_t));
-          (void)ref_stride;
         }
 
         /* the decoder writes the prediction into the frame before adding the
@@ -329,7 +327,6 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
       const int shift = p ? ss : 0;
       const int pw = recon.plane_width(p);
       const int ph = recon.plane_height(p);
-      const int stride = recon.stride[p];
       const int step = bs >> shift;
       for (int y = 0; y < ph; y += step) {
         for (int x = step; x < pw; x += step) {
