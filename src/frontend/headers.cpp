@@ -168,19 +168,25 @@ void read_global_motion_params(const SequenceHeader& seq, FrameHeader& h, BitRea
   }
 }
 
-/* skip_mode_params(): AV1 only allows skip mode when the reference list holds a
- * frame that is both in the past and in the future of this one. */
+/* skip_mode_params(): skip mode predicts a block from the *pair* of references
+ * that straddle this frame in display order, so it needs two of them - one in
+ * the past, one in the future. When every reference is in the past it takes the
+ * two nearest ones instead, which still gives a pair whose common motion is
+ * worth reusing. A frame with a single usable reference allows nothing: there
+ * would be no pair to name. */
 void compute_skip_mode(const SequenceHeader& seq, FrameHeader& h, BitReader* r) {
   h.skip_mode_allowed = false;
   h.skip_mode_present = false;
   h.skip_mode_frame[0] = 0;
   h.skip_mode_frame[1] = 0;
-  if (h.error_resilient_mode || !seq.enable_order_hint) return;
+  /* a frame that does not switch between single and compound prediction never
+   * codes a skip mode frame pair */
+  if (!h.reference_select || !seq.enable_order_hint) return;
 
+  /* the nearest reference in the past and the nearest one in the future */
   int forward_idx = -1;
   int backward_idx = -1;
   int forward_hint = 0;
-  int backward_hint = 0;
   for (int i = 0; i < 7; ++i) {
     const int ref_hint = h.ref_order_hint[i];
     const int dist = get_relative_dist(seq, ref_hint, h.order_hint);
@@ -190,36 +196,40 @@ void compute_skip_mode(const SequenceHeader& seq, FrameHeader& h, BitReader* r) 
         forward_hint = ref_hint;
       }
     } else if (dist > 0) {
-      if (backward_idx < 0 || get_relative_dist(seq, ref_hint, backward_hint) < 0) {
+      if (backward_idx < 0 || get_relative_dist(seq, ref_hint, h.ref_order_hint[backward_idx]) < 0) {
         backward_idx = i;
-        backward_hint = ref_hint;
       }
     }
   }
 
-  if (forward_idx >= 0 && backward_idx >= 0) {
+  if (forward_idx < 0) return;
+  if (backward_idx >= 0) {
     h.skip_mode_allowed = true;
-    if (get_relative_dist(seq, forward_hint, backward_hint) < 0) {
-      h.skip_mode_frame[0] = forward_idx + 1;
-      h.skip_mode_frame[1] = backward_idx + 1;
-    } else {
-      h.skip_mode_frame[0] = backward_idx + 1;
-      h.skip_mode_frame[1] = forward_idx + 1;
-    }
-  } else if (forward_idx >= 0) {
-    if (forward_idx > 0) {
-      h.skip_mode_allowed = true;
-      h.skip_mode_frame[0] = h.skip_mode_frame[1] = forward_idx + 1;
-    }
-  } else if (backward_idx >= 0) {
-    if (backward_idx > 0) {
-      h.skip_mode_allowed = true;
-      h.skip_mode_frame[0] = h.skip_mode_frame[1] = backward_idx + 1;
-    }
+    h.skip_mode_frame[0] = std::min(forward_idx, backward_idx) + 1;
+    h.skip_mode_frame[1] = std::max(forward_idx, backward_idx) + 1;
+    h.skip_mode_present = r->read_bit();
+    return;
   }
 
-  if (h.skip_mode_allowed) h.skip_mode_present = r->read_bit();
+  /* no future reference: the second nearest past one completes the pair */
+  int second_idx = -1;
+  int second_hint = 0;
+  for (int i = 0; i < 7; ++i) {
+    const int ref_hint = h.ref_order_hint[i];
+    if (get_relative_dist(seq, ref_hint, forward_hint) < 0) {
+      if (second_idx < 0 || get_relative_dist(seq, ref_hint, second_hint) > 0) {
+        second_idx = i;
+        second_hint = ref_hint;
+      }
+    }
+  }
+  if (second_idx < 0) return;
+  h.skip_mode_allowed = true;
+  h.skip_mode_frame[0] = std::min(forward_idx, second_idx) + 1;
+  h.skip_mode_frame[1] = std::max(forward_idx, second_idx) + 1;
+  h.skip_mode_present = r->read_bit();
 }
+
 
 } /* namespace */
 

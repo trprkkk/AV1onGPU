@@ -2385,7 +2385,7 @@ class TileParser {
     const bool intra_frame =
         frame_.type == FrameType::Key || frame_.type == FrameType::IntraOnly;
     block.skip_mode = false;
-    if (!intra_frame && frame_.skip_mode_allowed && std::min(bw4, bh4) > 1) {
+    if (!intra_frame && frame_.skip_mode_present && std::min(bw4, bh4) > 1) {
       const int smctx = (have_top(row) ? mi_skip_mode(row - 1, col) : 0) +
                         (have_left(col) ? mi_skip_mode(row, col - 1) : 0);
       block.skip_mode = decoder_.read_symbol(cdf_.inter.skip_mode[smctx], 1) != 0;
