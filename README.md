@@ -11,10 +11,11 @@ already has, so an old card can decode AV1 while the CPU stays nearly idle.
 
 * **Backends:** OpenCL 2.0, CUDA (via NVRTC, no CUDA SDK needed to build) and a
   bit exact CPU reference implementation of the same maths.
-* **No AV1 bitstream parser required on the GPU side.** The caller parses with
-  whatever front-end it likes (libaom, dav1d, an in-house parser) and hands over
-  the *decode syntax* of a frame: partition, prediction modes, motion vectors,
-  dequantised coefficients, filter parameters.
+* **The GPU never parses bits.** The caller hands over the *decode syntax* of a
+  frame: partition, prediction modes, motion vectors, dequantised coefficients,
+  filter parameters. A small front-end for AV1 container and header parsing is
+  included (`src/frontend/`), and any other parser (libaom, dav1d, an in-house
+  one) can produce the same `FrameSyntax`.
 * **No SDK to build.** OpenCL and CUDA entry points are resolved with
   `dlopen`/`dlsym` at run time; a missing or broken driver degrades to "backend
   unavailable" instead of failing to start.
@@ -40,7 +41,7 @@ driver at run time.
 | `AV1GPU_ENABLE_OPENCL` | `ON` | build the OpenCL backend and embed its kernels |
 | `AV1GPU_ENABLE_CUDA` | `ON` | build the CUDA backend and embed its kernels |
 | `AV1GPU_ENABLE_OPENMP` | `ON` | thread the CPU reference backend |
-| `AV1GPU_BUILD_TOOLS` | `ON` | the three tools below |
+| `AV1GPU_BUILD_TOOLS` | `ON` | the tools below |
 | `AV1GPU_BUILD_TESTS` | `ON` | unit + pipeline tests |
 | `AV1GPU_SANITIZE` | `OFF` | ASan/UBSan build |
 
@@ -50,6 +51,7 @@ driver at run time.
 build/bin/av1gpu_info                    # devices, kernel sources, feature flags
 build/bin/av1gpu_bench --all             # fps, CPU share and PSNR per backend
 build/bin/av1gpu_play --rgb --output out.rgb    # raw frames, pipe into a player
+build/bin/av1gpu_probe clip.ivf          # what is in this bitstream?
 ```
 
 `av1gpu_bench` is the interesting one for this project: it reports the **CPU
@@ -105,9 +107,53 @@ src/core/post_filters.cpp     host deblock/CDEF/grain, shared with encoders
 src/backends/cpu/             reference backend (the correctness baseline)
 src/backends/opencl/          loader (dlopen) + backend
 src/backends/cuda/            loader (dlopen) + backend (NVRTC at run time)
-tools/                        info, bench, player, plan dumper (av1gpu_dump)
+src/frontend/                 IVF/OBU demuxing, bit reader, header parsing
+tools/                        info, bench, player, probe, plan dumper
 tests/                        kernel unit tests, pipeline tests, OpenCL parity
 ```
+
+## The bitstream front-end
+
+`src/frontend/` turns bytes into the parameters the engine needs:
+
+| file | what it does |
+| --- | --- |
+| `bitreader.hpp` | literal bits: `f(n)`, `su(n)`, `ns(n)`, `uvlc()`, leb128 |
+| `obu.{hpp,cpp}` | OBU header, extension header, leb128 sizes, temporal unit splitting |
+| `ivf.{hpp,cpp}` | the IVF container used by the AV1 test tools |
+| `headers.{hpp,cpp}` | sequence header and frame header syntax |
+
+What parses today: the complete sequence header (profiles 0/1/2, 8/10/12 bit,
+4:2:0 / 4:2:2 / 4:4:4, operating points, timing info, all the feature flags) and
+KEY / INTRA_ONLY frame headers up to the tile data, including the tile grid, the
+quantiser, deblocking levels, CDEF strengths and the transform set.
+
+What is *refused with a message* instead of being misparsed: inter and switch
+frames, `show_existing_frame`, segmentation, delta Q / delta LF, superres, intra
+block copy, restoration filters and film grain data. The arithmetic coded tile
+payload is the next milestone (`docs/ROADMAP.md`).
+
+```sh
+$ build/bin/av1gpu_probe clip.ivf
+clip.ivf: IVF, 320x240, 1 frame(s), timebase 30/1
+temporal unit 0 (25 bytes)
+  obu temporal_delimiter   0 bytes
+  obu sequence_header      10 bytes
+sequence header
+  profile 0, 8 bit, 4:2:0, 320x240 max
+  superblock 64, cdef yes, restoration no, superres no
+  ...
+  obu frame                9 bytes
+  key frame, 320x240, base_q_idx 60, 1 tile(s) (1x1)
+  deblock 24/24 luma, 12/12 chroma, sharpness 2; cdef damping 3, y strengths 4
+  no tile data in this OBU; decoding is not implemented yet
+```
+
+`tests/test_frontend.cpp` writes the same syntax with a small bit writer and
+checks it field by field, including the error paths. The sequence header parser
+was additionally cross-checked against dav1d's parser over 4000 random inputs:
+every header dav1d accepts is parsed with the same field values and the same bit
+position (it found two bugs while it ran, see `docs/ACCURACY.md`).
 
 ## How a frame is scheduled
 
@@ -135,6 +181,8 @@ cd build && ctest --output-on-failure
 
 * `test_kernels` — transform bases, intra/inter prediction, subpel filters,
   deblock, CDEF, grain, colour conversion, on the host.
+* `test_frontend` — bit reader, OBU framing, IVF demuxing, sequence and frame
+  header parsing, and the error paths of all of them.
 * `test_pipeline` — closed loop decode of a synthetic clip on every available
   backend; the decoded frames must match the encoder's own reconstruction
   exactly, and the wavefront cell size must not change the output.
@@ -170,8 +218,9 @@ ctest --test-dir build -R opencl --output-on-failure
 
 ## What is not here
 
-There is no entropy decoder and no bitstream parser in this tree: the library
-starts where parsing ends. `av1gpu::synthetic_encode` is a small closed loop test
+There is no arithmetic (entropy) decoder and no partition tree in this tree yet:
+the front-end reads containers and headers, and the reconstruction engine starts
+at the block syntax. `av1gpu::synthetic_encode` is a small closed loop test
 encoder that produces valid syntax from a generated clip, and it is what the
 tools and tests decode. See `docs/ROADMAP.md` for the intended front-end work
 and `docs/ACCURACY.md` for exactly where this implementation approximates the

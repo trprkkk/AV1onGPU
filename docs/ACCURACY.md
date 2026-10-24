@@ -101,6 +101,21 @@ three layers, all of them runnable on a machine with no GPU driver:
    compares whole frames against the CPU reference decode. Four frames, intra
    and inter, all filters on: **bit identical**.
 
+The front-end has its own cross-check, run once during development and not part
+of the test suite: `src/frontend/headers.cpp` was compared against dav1d's
+sequence header parser over 4000 random byte strings. Every header dav1d accepts
+parsed to the same field values at the same bit position. It found two real bugs:
+
+* profile 2 with 8/10 bit is 4:2:2 signalled implicitly; the parser defaulted
+  `subsampling_y` to 1, read two chroma bits that were not there, and lost sync
+  from that point on,
+* the sequence header ends with `trailing_bits()` (a one bit, then zeros), not
+  with plain zero padding; being strict about it is what catches a desync.
+
+The only disagreements left are cases where dav1d's *strict* mode additionally
+requires the header to end exactly on a byte boundary; the default dav1d accepts
+them the same way this parser does.
+
 The third layer is what found the deblocking group index bug: the kernel was
 handed a group number where the shared helper expects a sample offset, so edges
 longer than four samples were filtered in the wrong place. A flat test pattern

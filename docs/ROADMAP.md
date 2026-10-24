@@ -9,13 +9,29 @@ the order it unlocks the most.
 This is the one thing standing between the library and playing real `.ivf` /
 `.obu` files. The work is an AV1 parser (symbol decoder, partition tree,
 reference frame management) that emits `av1gpu::FrameSyntax`; it does *not*
-touch the GPU. Reasonable sources of the syntax:
+touch the GPU.
 
-* **libaom / dav1d hook.** Both decoders are structured so that the decode of a
-  block can be intercepted after parsing. Emitting syntax there is the least
-  code and gives a conformance-tested parser for free.
-* **A self-contained parser.** More work, but it would make the project
-  dependency free, which matters for the embedded/old-machine audience.
+**Done: containers and headers.** `src/frontend/` reads IVF files and raw OBU
+streams, parses the complete sequence header and KEY / INTRA_ONLY frame headers
+(tile grid, quantiser, deblock levels, CDEF strengths, transform set), and
+reports every feature it does not implement instead of misparsing it.
+`av1gpu_probe` shows what it found in a real file.
+
+**Next, in order:**
+
+1. *Arithmetic decoder.* The tile payload is coded with the AV1 boolean range
+   decoder over adaptive CDFs. Needs the CDF tables from the specification and
+   the symbol reader; testable against hand-built bitstreams like the header
+   parser is now.
+2. *Tile and partition tree.* Superblock loop, partition symbols, block sizes,
+   transform selection, and the coefficient syntax with its scan tables. This is
+   the bulk of the work and the point where the front-end first emits a
+   `FrameSyntax` the engine can decode.
+3. *Reference frame management.* The DPB, `show_existing_frame`, inter frame
+   headers (which are parsed far enough today to say "not yet" cleanly).
+4. *Optional:* a libaom / dav1d hook that emits syntax from an already
+   conformance-tested parser. Useful for testing the engine against real
+   streams long before our own parser is complete.
 
 Schedule: one `SyntaxBuilder` class, no changes to the backends.
 

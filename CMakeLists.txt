@@ -78,6 +78,9 @@ set(AV1GPU_SOURCES
     src/core/synthetic.cpp
     src/core/post_filters.cpp
     src/core/kernel_source.cpp
+    src/frontend/ivf.cpp
+    src/frontend/obu.cpp
+    src/frontend/headers.cpp
     src/backends/cpu/cpu_backend.cpp
 )
 
@@ -117,7 +120,7 @@ endif()
 # tools and tests
 # ---------------------------------------------------------------------------
 if(AV1GPU_BUILD_TOOLS)
-  foreach(tool av1gpu_info av1gpu_bench av1gpu_play av1gpu_dump)
+  foreach(tool av1gpu_info av1gpu_bench av1gpu_play av1gpu_dump av1gpu_probe)
     add_executable(${tool} tools/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE av1gpu)
     set_target_properties(${tool} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -126,7 +129,7 @@ endif()
 
 if(AV1GPU_BUILD_TESTS)
   enable_testing()
-  foreach(test test_kernels test_pipeline)
+  foreach(test test_kernels test_pipeline test_frontend)
     add_executable(${test} tests/${test}.cpp)
     target_link_libraries(${test} PRIVATE av1gpu)
     set_target_properties(${test} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
