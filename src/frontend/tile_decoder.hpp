@@ -62,6 +62,59 @@ enum IntraMode {
   kModeChromaCount,
 };
 
+/* AV1's reference frame types, in specification order. Zero is the intra
+ * "reference", which is also what the context maps store for a block that was
+ * not inter predicted. */
+enum RefFrameType {
+  kRefIntra = 0,
+  kRefLast,
+  kRefLast2,
+  kRefLast3,
+  kRefGolden,
+  kRefBwdref,
+  kRefAltref2,
+  kRefAltref,
+  kRefFrameTypeCount,
+};
+
+/* The seven entries of `ref_frame_idx`, in specification order: they name the
+ * reference *slot* each reference type points at for this frame. */
+constexpr int kRefIdxLast = 0;
+constexpr int kRefIdxLast2 = 1;
+constexpr int kRefIdxLast3 = 2;
+constexpr int kRefIdxGolden = 3;
+constexpr int kRefIdxBwdref = 4;
+constexpr int kRefIdxAltref2 = 5;
+constexpr int kRefIdxAltref = 6;
+
+/* Inter prediction modes. The single-reference modes come first, in the order
+ * the specification's near/global/new syntax reads them; the compound ones
+ * follow, in the order of the compound mode symbol. */
+enum InterPredMode {
+  kModeNearestMv = 0,
+  kModeNearMv,
+  kModeGlobalMv,
+  kModeNewMv,
+  kModeNearestNearestMv,
+  kModeNearestNearMv,
+  kModeNearNearestMv,
+  kModeNearNearMv,
+  kModeNearestNewMv,
+  kModeNewNearestMv,
+  kModeNearNewMv,
+  kModeNewNearMv,
+  kModeGlobalGlobalMv,
+  kModeNewNewMv,
+  kInterPredModeCount,
+};
+
+/* Motion modes, in specification order. */
+enum MotionMode {
+  kMotionTranslation = 0,
+  kMotionObmc,
+  kMotionWarped,
+};
+
 /* One transform block: a rectangle of coefficients as the bitstream coded it.
  *
  * The parser produces levels, not pixels: the coefficient values in scan order,
@@ -107,6 +160,25 @@ struct TileBlock {
   /* DeltaLFs[..][0..3]: the loop filter's delta, accumulated per superblock by
    * the delta_lf syntax (zero when the frame does not use it). */
   int delta_lf[4] = {0, 0, 0, 0};
+
+  /* Inter mode info. `is_inter` is the specification's `intra == 0`: a block
+   * of an inter frame may still be intra predicted. `ref_frame` holds
+   * RefFrameType values, `mv` is in 1/8 luma sample units relative to the
+   * block's position (the specification's Mv, before the per-plane scaling),
+   * and `interp_filter` is 0 regular, 1 smooth, 2 sharp, 3 bilinear. */
+  bool is_inter = false;
+  bool skip_mode = false;
+  int ref_frame[2] = {kRefIntra, kRefIntra};
+  int mv[2][2] = {{0, 0}, {0, 0}};
+  int inter_mode = kModeNearestMv;
+  int motion_mode = kMotionTranslation;
+  int interp_filter = 0;
+  bool interintra = false;
+  int interintra_mode = 0;
+  /* 0 = average, 1 = distance weighted; both are the only blends this decoder
+   * implements, so a wedge or difference weighted block stops the tile. */
+  int compound_type = 0;
+  int drl_index = 0;
 
   bool has_chroma = true;
   bool have_left = false;
@@ -166,6 +238,16 @@ struct TileDecodeResult {
 ParseStatus decode_intra_tile(const SequenceHeader& seq, const FrameHeader& frame,
                               const uint8_t* data, size_t size, TileDecodeResult* out,
                               std::string* error);
+
+/* Decodes the block tree and mode info of one tile of any frame type.
+ *
+ * `refs` is the reference frame store after the frames this one refers to have
+ * been decoded: it resolves `ref_frame_idx` to a slot and tells whether that
+ * slot holds an intra frame (which is what decides if the temporal motion
+ * vector candidates exist). It may be null for a key frame. */
+ParseStatus decode_tile(const SequenceHeader& seq, const FrameHeader& frame,
+                        const RefPool* refs, const uint8_t* data, size_t size,
+                        TileDecodeResult* out, std::string* error);
 
 } /* namespace frontend */
 } /* namespace av1gpu */

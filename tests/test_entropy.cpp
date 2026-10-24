@@ -522,8 +522,14 @@ void test_inter_cdf() {
   CHECK_EQ(in.mv_class0_fr[0][0][0], 16384u);
   CHECK_EQ(in.mv_class0_fr[0][1][2], 8640u);
   CHECK_EQ(in.mv_fr[0][0], 24576u);
-  CHECK_EQ(in.mv_bit[0][0], 15360u);
-  CHECK_EQ(in.mv_bit[9][0], 2048u);
+  /* the binary vector tables are per component: two copies of the default row,
+   * which adapt independently once a vector is coded */
+  CHECK_EQ(in.mv_bit[0][0][0], 15360u);
+  CHECK_EQ(in.mv_bit[9][1][0], 2048u);
+  CHECK_EQ(in.mv_sign[1][0], in.mv_sign[0][0]);
+  CHECK_EQ(in.mv_hp[1][0], in.mv_hp[0][0]);
+  CHECK_EQ(in.mv_class0_hp[1][0], in.mv_class0_hp[0][0]);
+  CHECK_EQ(in.mv_class0_bit[1][0], in.mv_class0_bit[0][0]);
 
   /* new, zero or a predicted motion vector, and how far down the list */
   CHECK_EQ(in.new_mv[0][0], 8733u);
@@ -566,13 +572,13 @@ void test_inter_cdf() {
   rows(&in.motion_mode[0][0], kBlockSizeCount, 3, 3, "motion_mode");
   rows(&in.interp_filter[0][0], 16, 3, 3, "interp_filter");
   check_row(in.mv_joint, 4, "mv_joint");
-  check_row(in.mv_sign, 2, "mv_sign");
+  rows(&in.mv_sign[0][0], 2, 2, 2, "mv_sign");
   rows(&in.mv_class[0][0], 2, 11, 16, "mv_class");
-  check_row(in.mv_class0_bit, 2, "mv_class0_bit");
+  rows(&in.mv_class0_bit[0][0], 2, 2, 2, "mv_class0_bit");
   rows(&in.mv_class0_fr[0][0][0], 4, 4, 4, "mv_class0_fr");
-  check_row(in.mv_class0_hp, 2, "mv_class0_hp");
-  check_row(in.mv_hp, 2, "mv_hp");
-  rows(&in.mv_bit[0][0], 10, 2, 2, "mv_bit");
+  rows(&in.mv_class0_hp[0][0], 2, 2, 2, "mv_class0_hp");
+  rows(&in.mv_hp[0][0], 2, 2, 2, "mv_hp");
+  rows(&in.mv_bit[0][0][0], 20, 2, 2, "mv_bit");
   rows(&in.mv_fr[0][0], 2, 4, 4, "mv_fr");
   rows(&in.new_mv[0][0], 6, 2, 2, "new_mv");
   rows(&in.zero_mv[0][0], 2, 2, 2, "zero_mv");

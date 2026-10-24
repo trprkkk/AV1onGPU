@@ -155,6 +155,9 @@ struct ModeCdf {
  * a context but the decoded value itself (the compound reference tree, the
  * motion vector class) the note says so. */
 struct InterCdf {
+  /* [size group][13]: the intra mode of an intra block inside an inter frame
+   * (a key frame codes the same symbol with its own neighbour contexts) */
+  uint16_t y_mode[4][16];
   /* [inter neighbours][2]: is the block inter predicted at all */
   uint16_t is_inter[4][2];
   /* [neighbouring skip modes][2] */
@@ -186,14 +189,19 @@ struct InterCdf {
   uint16_t interp_filter[16][3];
   /* motion vectors: which components are coded, then per component the class,
    * the fractional part and - for class 0 - the integer bit */
+  /* The two components (vertical first) keep separate copies of every motion
+   * vector table, because adapting one must not change the other: the
+   * specification initialises both from the same default rows, so the tables
+   * start equal but drift apart as soon as a vector is coded. The defaults are
+   * one row per symbol, so the copies below are broadcast at init time. */
   uint16_t mv_joint[4];
-  uint16_t mv_sign[2];
+  uint16_t mv_sign[2][2];
   uint16_t mv_class[2][16];
-  uint16_t mv_class0_bit[2];
+  uint16_t mv_class0_bit[2][2];
   uint16_t mv_class0_fr[2][2][4];
-  uint16_t mv_class0_hp[2];
-  uint16_t mv_hp[2];
-  uint16_t mv_bit[10][2];
+  uint16_t mv_class0_hp[2][2];
+  uint16_t mv_hp[2][2];
+  uint16_t mv_bit[10][2][2];
   uint16_t mv_fr[2][4];
   /* the dynamic reference list: new or predicted motion vector */
   uint16_t new_mv[6][2];

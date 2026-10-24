@@ -40,6 +40,7 @@ OUTPUT = os.path.join(ROOT, "src", "frontend", "cdf_tables_inter.hpp")
 # specification's own initialiser, so a table that grows or shrinks upstream
 # changes the generated array instead of being silently truncated.
 TABLES = [
+    ("y_mode", "Default_Y_Mode_Cdf"),
     ("is_inter", "Default_Is_Inter_Cdf"),
     ("skip_mode", "Default_Skip_Mode_Cdf"),
     ("comp_mode", "Default_Comp_Mode_Cdf"),
@@ -79,6 +80,7 @@ TABLES = [
 
 # The context shape each table is indexed by, for the comment in front of it.
 NOTES = {
+    "y_mode": "intra mode of an intra block found in an inter frame, per size group",
     "is_inter": "neighbours that were inter predicted",
     "skip_mode": "neighbours that used skip mode",
     "comp_mode": "how the neighbours were referenced",

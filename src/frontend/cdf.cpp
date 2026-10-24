@@ -17,6 +17,17 @@ void copy_table(A& dst, const B& src) {
   std::memcpy(&dst, &src, sizeof(dst));
 }
 
+/* A default row that the specification copies once per motion vector component:
+ * the two copies start equal and then adapt independently. */
+template <int N, typename A, typename B>
+void broadcast_table(A& dst, const B& src) {
+  static_assert(sizeof(dst) == sizeof(src) * static_cast<size_t>(N),
+                "CDF table broadcast shape mismatch");
+  std::memcpy(&dst, &src, sizeof(src));
+  for (int n = 1; n < N; ++n)
+    std::memcpy(reinterpret_cast<char*>(&dst) + n * sizeof(src), &src, sizeof(src));
+}
+
 } /* namespace */
 
 void init_default_cdf(CdfContext* cdf, int base_q_idx) {
@@ -52,6 +63,7 @@ void init_default_cdf(CdfContext* cdf, int base_q_idx) {
   copy_table(cdf->mode.txpart, t::txpart);
 
   namespace it = cdf_tables_inter;
+  copy_table(cdf->inter.y_mode, it::y_mode);
   copy_table(cdf->inter.is_inter, it::is_inter);
   copy_table(cdf->inter.skip_mode, it::skip_mode);
   copy_table(cdf->inter.comp_mode, it::comp_mode);
@@ -72,13 +84,13 @@ void init_default_cdf(CdfContext* cdf, int base_q_idx) {
   copy_table(cdf->inter.motion_mode, it::motion_mode);
   copy_table(cdf->inter.interp_filter, it::interp_filter);
   copy_table(cdf->inter.mv_joint, it::mv_joint);
-  copy_table(cdf->inter.mv_sign, it::mv_sign);
+  broadcast_table<2>(cdf->inter.mv_sign, it::mv_sign);
   copy_table(cdf->inter.mv_class, it::mv_class);
-  copy_table(cdf->inter.mv_class0_bit, it::mv_class0_bit);
+  broadcast_table<2>(cdf->inter.mv_class0_bit, it::mv_class0_bit);
   copy_table(cdf->inter.mv_class0_fr, it::mv_class0_fr);
-  copy_table(cdf->inter.mv_class0_hp, it::mv_class0_hp);
-  copy_table(cdf->inter.mv_hp, it::mv_hp);
-  copy_table(cdf->inter.mv_bit, it::mv_bit);
+  broadcast_table<2>(cdf->inter.mv_class0_hp, it::mv_class0_hp);
+  broadcast_table<2>(cdf->inter.mv_hp, it::mv_hp);
+  broadcast_table<2>(cdf->inter.mv_bit, it::mv_bit);
   copy_table(cdf->inter.mv_fr, it::mv_fr);
   copy_table(cdf->inter.new_mv, it::new_mv);
   copy_table(cdf->inter.zero_mv, it::zero_mv);

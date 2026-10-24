@@ -20,6 +20,15 @@ namespace av1gpu {
 namespace frontend {
 namespace cdf_tables_inter {
 
+/* Default_Y_Mode_Cdf: 12 symbols, 4.
+   * intra mode of an intra block found in an inter frame, per size group */
+inline const uint16_t y_mode[4][16] = {
+    { 9967, 9279, 8475, 8012, 7167, 6645, 6162, 5350, 4823, 3540, 3083, 2419, 0, 0, 0, 0 },
+    { 14095, 12923, 10137, 9450, 8818, 8119, 7241, 5404, 4616, 3067, 2784, 1916, 0, 0, 0, 0 },
+    { 12998, 11789, 9372, 8829, 8527, 8114, 7632, 5695, 4938, 3408, 3038, 2109, 0, 0, 0, 0 },
+    { 12613, 11467, 9930, 9590, 9507, 9235, 9065, 7964, 7416, 6193, 5752, 4719, 0, 0, 0, 0 },
+};
+
 /* Default_Is_Inter_Cdf: 1 symbols, 4.
    * neighbours that were inter predicted */
 inline const uint16_t is_inter[4][2] = {
