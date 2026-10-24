@@ -429,9 +429,15 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
     FilterType filter_h = FilterType::Regular, filter_v = FilterType::Regular;
     CompoundType compound = CompoundType::None;
     int blend[2] = {8, 8};
-    /* One prediction block per plane, filled in below and pushed once its
-     * transforms have been collected. */
+    /* The prediction blocks of one plane, filled in below and pushed once the
+     * plane's transforms have been collected. A luma block is always one
+     * prediction block. A chroma block of a luma block that is only four
+     * samples wide (or high) is not: its chroma covers two luma blocks in that
+     * direction, and the specification predicts each of them with its own
+     * motion vector (compute_prediction(): predW = Block_Width >> subX), so the
+     * chroma block is split into one prediction block per luma cell. */
     BlockSyntax inter_block[3];
+    std::vector<BlockSyntax> inter_regions[3];
     bool inter_used[3] = {false, false, false};
     if (inter) {
       if (block.interintra) {
@@ -567,6 +573,70 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
             }
           }
         }
+        /* The chroma of a luma block that is one 4x4 wide (or high) is shared
+         * between the two luma blocks that own the samples, and each of them
+         * predicts its half with its own vector, reference frames and filters.
+         * The specification (compute_prediction()) splits such a block into
+         * regions of Block_Width >> subX by Block_Height >> subY samples,
+         * taken from the luma cells at candRow/candCol - the top left cell of
+         * the pair or quad, not this block's own cell. One intra luma block
+         * under the chroma disables the split: the specification then predicts
+         * the whole chroma block from this block's own motion information. */
+        int pred_w = bs.w, pred_h = bs.h;
+        if (plane > 0 && ss_x) pred_w = std::max(1, (bw4 * 4) >> sub_x);
+        if (plane > 0 && ss_y) pred_h = std::max(1, (bh4 * 4) >> sub_y);
+        const int cell_col = (block.mi_col >> sub_x) << sub_x;
+        const int cell_row = (block.mi_row >> sub_y) << sub_y;
+        const int span_cols = (bs.w >> 2) << sub_x;
+        const int span_rows = (bs.h >> 2) << sub_y;
+        bool split = plane > 0 && (pred_w < bs.w || pred_h < bs.h);
+        if (split) {
+          for (int r = 0; r < span_rows && split; ++r) {
+            for (int c = 0; c < span_cols; ++c) {
+              const TileBlock* cell = mi_block(cell_row + r, cell_col + c);
+              if (!cell || !cell->is_inter) {
+                split = false;
+                break;
+              }
+            }
+          }
+        }
+        if (!split) {
+          inter_regions[plane].push_back(bs);
+        } else {
+          for (int y = 0; y < bs.h; y += pred_h) {
+            for (int x = 0; x < bs.w; x += pred_w) {
+              BlockSyntax region = bs;
+              region.x = bs.x + x;
+              region.y = bs.y + y;
+              region.w = std::min(pred_w, bs.w - x);
+              region.h = std::min(pred_h, bs.h - y);
+              /* overlapped motion compensation is a property of the block, and
+               * a block this small has none */
+              region.obmc.clear();
+              const TileBlock* cell =
+                  mi_block(cell_row + y / pred_h, cell_col + x / pred_w);
+              if (cell && cell->is_inter) {
+                region.mv[0][0] = cell->mv[0][0];
+                region.mv[0][1] = cell->mv[0][1];
+                region.mv[1][0] = cell->mv[1][0];
+                region.mv[1][1] = cell->mv[1][1];
+                const int ref0 = cell->ref_frame[0] - 1;
+                const int ref1 = cell->ref_frame[1] - 1;
+                if (ref0 >= 0 && ref0 < 7 && (!refs || refs->slot[ref0] >= 0))
+                  region.ref[0] = ref0;
+                if (ref1 >= 0 && ref1 < 7 && (!refs || refs->slot[ref1] >= 0))
+                  region.ref[1] = ref1;
+                else
+                  region.ref[1] = -1;
+                if (region.ref[1] < 0) region.compound = CompoundType::None;
+                region.filter = to_filter_type(cell->interp_filter[1]);
+                region.filter_v = to_filter_type(cell->interp_filter[0]);
+              }
+              inter_regions[plane].push_back(region);
+            }
+          }
+        }
       }
     }
 
@@ -644,8 +714,10 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
       }
       ++next_offset;
       if (inter) {
-        /* one prediction block per plane carries every transform of that plane */
-        inter_block[plane].transforms.push_back(tb);
+        /* one prediction block per plane carries every transform of that plane;
+         * the first region starts at the plane block's own origin, which is
+         * what the transform offsets are relative to */
+        inter_regions[plane][0].transforms.push_back(tb);
       } else {
         bs.transforms.push_back(tb);
         out->blocks.push_back(bs);
@@ -657,8 +729,10 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
     }
 
     if (inter) {
-      for (int plane = 0; plane < 3; ++plane)
-        if (inter_used[plane]) out->blocks.push_back(inter_block[plane]);
+      for (int plane = 0; plane < 3; ++plane) {
+        if (!inter_used[plane]) continue;
+        for (const BlockSyntax& region : inter_regions[plane]) out->blocks.push_back(region);
+      }
     }
   }
 

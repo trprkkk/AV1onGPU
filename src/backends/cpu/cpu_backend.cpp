@@ -12,6 +12,8 @@
  */
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "core/backend.hpp"
@@ -128,6 +130,14 @@ class CpuBackend final : public Backend {
     const int* filters = tables::filters().data();
     uint16_t* frame = frame_.data();
 
+    /* AV1GPU_INTERRECT=x0,y0,x1,y1 prints every inter prediction job whose
+     * origin falls inside that rectangle of a chroma plane, with the frame it
+     * belongs to. Comparing a wrong sample with the job that should have
+     * produced it is the quickest way to see a vector or a reference slot go
+     * astray, which is why the dump is on the job rather than on the block. */
+    static int g_decode_count = 0;
+    ++g_decode_count;
+
     if (std::getenv("AV1GPU_PLAN_STATS")) {
       size_t ni = 0, nt = 0, nr = 0, nx = 0;
       for (const WaveJobs& w : plan.waves) {
@@ -199,6 +209,24 @@ class CpuBackend final : public Backend {
                          job.w, job.h, job.ref_x, job.ref_y, job.mv0_x, job.mv0_y, job.sub_x,
                          job.sub_y, job.filt, job.filt_v, job.compound, job.ref0_slot,
                          job.ref1_slot, job.obmc_count, job.dst_off);
+          }
+        }
+        if (const char* rect = std::getenv("AV1GPU_INTERRECT")) {
+          int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+          if (std::sscanf(rect, "%d,%d,%d,%d", &x0, &y0, &x1, &y1) == 4) {
+            for (int p = 1; p < 3; ++p) {
+              if (job.dst_off < g.plane_off[p]) continue;
+              if (p == 1 && job.dst_off >= g.plane_off[2]) continue;
+              const int rel = job.dst_off - g.plane_off[p];
+              const int jx = rel % g.stride[p], jy = rel / g.stride[p];
+              if (jx < x0 || jx > x1 || jy < y0 || jy > y1) continue;
+              std::fprintf(stderr,
+                           "IJOB frame=%d plane=%d x=%d y=%d w=%d h=%d mv=%d,%d/%d,%d "
+                           "filter=%d/%d compound=%d slots=%d,%d obmc=%d\n",
+                           g_decode_count - 1, p, jx, jy, job.w, job.h, job.mv0_x,
+                           job.mv0_y, job.mv1_x, job.mv1_y, job.filt, job.filt_v,
+                           job.compound, job.ref0_slot, job.ref1_slot, job.obmc_count);
+            }
           }
         }
         av1g_inter_block(&job, frame, frame, ref_pool_.data(), filters, maxv);
