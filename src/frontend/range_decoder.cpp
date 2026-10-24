@@ -120,8 +120,22 @@ void RangeDecoder::normalize(uint64_t dif, unsigned rng) {
   if (static_cast<unsigned>(old_cnt) < static_cast<unsigned>(shift)) refill();
 }
 
+/* AV1GPU_SYMTRACE=1 logs every decoded value with the state it was decoded
+ * from. Two decoders that read the same stream then compare symbol by symbol,
+ * which is finer than the per-block dumps when a block body disagrees. */
+namespace {
+bool symtrace_enabled() {
+  static const bool enabled = std::getenv("AV1GPU_SYMTRACE") != nullptr;
+  return enabled;
+}
+} /* namespace */
+
 unsigned RangeDecoder::decode_bool_equi() {
   if (failed_) return 0;
+  const bool symtrace = symtrace_enabled();
+  const uint64_t trace_dif = dif_;
+  const unsigned trace_rng = rng_;
+  const int trace_cnt = cnt_;
   const unsigned r = rng_;
   const uint64_t dif = dif_;
   /* probability 1/2: the multiply degenerates into a shift */
@@ -131,12 +145,16 @@ unsigned RangeDecoder::decode_bool_equi() {
   if (above) {
     v += r - 2 * v;
     normalize(dif - threshold, v);
+    if (symtrace) std::fprintf(stderr, "Y 0 %llu %u %d 0\n",
+                               static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt);
     hash_symbol(0);
     trace_bool("E", 0, 0);
     trace_state(dif_, rng_, cnt_);
     return 0;
   }
   normalize(dif, v);
+  if (symtrace) std::fprintf(stderr, "Y 0 %llu %u %d 1\n",
+                             static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt);
   hash_symbol(1);
   trace_bool("E", 1, 0);
   trace_state(dif_, rng_, cnt_);
@@ -145,6 +163,10 @@ unsigned RangeDecoder::decode_bool_equi() {
 
 unsigned RangeDecoder::decode_bool(unsigned probability) {
   if (failed_) return 0;
+  const bool symtrace = symtrace_enabled();
+  const uint64_t trace_dif = dif_;
+  const unsigned trace_rng = rng_;
+  const int trace_cnt = cnt_;
   const unsigned r = rng_;
   const uint64_t dif = dif_;
   unsigned v = ((r >> 8) * (probability >> kProbShift) >> (7 - kProbShift)) + kMinProb;
@@ -153,12 +175,16 @@ unsigned RangeDecoder::decode_bool(unsigned probability) {
   if (above) {
     v += r - 2 * v;
     normalize(dif - threshold, v);
+    if (symtrace) std::fprintf(stderr, "Y 1 %llu %u %d 0\n",
+                               static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt);
     hash_symbol(0);
     trace_bool("B", 0, probability);
     trace_state(dif_, rng_, cnt_);
     return 0;
   }
   normalize(dif, v);
+  if (symtrace) std::fprintf(stderr, "Y 1 %llu %u %d 1\n",
+                             static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt);
   hash_symbol(1);
   trace_bool("B", 1, probability);
   trace_state(dif_, rng_, cnt_);
@@ -167,6 +193,10 @@ unsigned RangeDecoder::decode_bool(unsigned probability) {
 
 unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
   if (failed_) return 0;
+  const bool symtrace = symtrace_enabled();
+  const uint64_t trace_dif = dif_;
+  const unsigned trace_rng = rng_;
+  const int trace_cnt = cnt_;
   const unsigned c = static_cast<unsigned>(dif_ >> (kWindowBits - 16));
   const unsigned r = rng_ >> 8;
   /* the trace shows the table as it was before this symbol adapted it */
@@ -201,6 +231,9 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
   }
 
   normalize(dif_ - (static_cast<uint64_t>(v) << (kWindowBits - 16)), u - v);
+  if (symtrace) std::fprintf(stderr, "Y 2 %llu %u %d %d\n",
+                             static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt,
+                             symbol);
   hash_symbol(static_cast<unsigned>(symbol));
 
   if (tracing) {

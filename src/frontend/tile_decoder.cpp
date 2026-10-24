@@ -1351,10 +1351,35 @@ class TileParser {
     *ctx = (refmv_ctx << 4) | (globalmv_ctx << 3) | newmv_ctx;
   }
 
+  void trace_stack(int col, int row, int count, const MvCand* stack) const {
+    if (!trace_enabled()) return;
+    std::fprintf(stderr, "ST X %d %d n=%d", col, row, count);
+    for (int i = 0; i < count && i < 8; ++i)
+      std::fprintf(stderr, " [%d %d,%d w=%d]", i, stack[i].mv[0][1], stack[i].mv[0][0],
+                   stack[i].weight);
+    std::fprintf(stderr, "\n");
+  }
+
+  void trace_drl(int col, int row, int idx, int ctx, int count, const MvCand* stack) const {
+    if (!trace_enabled()) return;
+    std::fprintf(stderr, "DRL %d %d idx=%d ctx=%d n=%d w0=%d w1=%d cdf=%u,%u\n", col, row, idx, ctx,
+                 count, stack[0].weight, stack[1].weight, cdf_.inter.drl_mode[ctx][0],
+                 cdf_.inter.drl_mode[ctx][1]);
+  }
+
   /* get_drl_context */
   int drl_context(const MvCand* stack, int idx) const {
     if (stack[idx].weight >= 640) return stack[idx + 1].weight < 640 ? 1 : 0;
     return stack[idx + 1].weight < 640 ? 2 : 0;
+  }
+
+  /* One dynamic reference list bit: the context comes from how strong the two
+   * candidates at `idx` and `idx + 1` are, and the trace prints both the
+   * context and the row it lands on, which is what a wrong context shows up as. */
+  int read_drl_bit(int col, int row, int idx, int count, const MvCand* stack) {
+    const int ctx = drl_context(stack, idx);
+    trace_drl(col, row, idx, ctx, count, stack);
+    return static_cast<int>(decoder_.read_symbol(cdf_.inter.drl_mode[ctx], 1));
   }
 
   /* read_mv_residual: the difference from the predicted vector, coded as a
@@ -1929,6 +1954,7 @@ class TileParser {
     MvCand stack[8];
     int count = 0, ctx = 0;
     find_ref_mvs(stack, &count, &ctx, ref0, ref1, size, row, col);
+    trace_stack(col, row, count, stack);
     if (trace_) {
       std::fprintf(stderr, "V %d %d n=%d ctx=%d s0=%d,%d s1=%d,%d w0=%d w1=%d\n", col, row,
                    count, ctx, stack[0].mv[0][0], stack[0].mv[0][1], stack[1].mv[0][0],
@@ -1962,20 +1988,20 @@ class TileParser {
       if (block->inter_mode == kModeNewNewMv) {
         if (count > 1) {
           block->drl_index +=
-              decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 0)], 1);
+              read_drl_bit(col, row, 0, count, stack);
           if (block->drl_index == 1 && count > 2) {
             block->drl_index +=
-                decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 1)], 1);
+                read_drl_bit(col, row, 1, count, stack);
           }
         }
       } else if (pair.mode[0] == kModeNearMv || pair.mode[1] == kModeNearMv) {
         block->drl_index = 1;
         if (count > 2) {
           block->drl_index +=
-              decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 1)], 1);
+              read_drl_bit(col, row, 1, count, stack);
           if (block->drl_index == 2 && count > 3) {
             block->drl_index +=
-                decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 2)], 1);
+                read_drl_bit(col, row, 2, count, stack);
           }
         }
       }
@@ -2019,10 +2045,10 @@ class TileParser {
             block->drl_index = 1;
             if (count > 2) {
               block->drl_index +=
-                  decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 1)], 1);
+                  read_drl_bit(col, row, 1, count, stack);
               if (block->drl_index == 2 && count > 3) {
                 block->drl_index +=
-                    decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 2)], 1);
+                    read_drl_bit(col, row, 2, count, stack);
               }
             }
           } else {
@@ -2037,10 +2063,10 @@ class TileParser {
         block->inter_mode = kModeNewMv;
         block->drl_index = 0;
         if (count > 1) {
-          block->drl_index += decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 0)], 1);
+          block->drl_index += read_drl_bit(col, row, 0, count, stack);
           if (block->drl_index == 1 && count > 2) {
             block->drl_index +=
-                decoder_.read_symbol(cdf_.inter.drl_mode[drl_context(stack, 1)], 1);
+                read_drl_bit(col, row, 1, count, stack);
           }
         }
         if (count > 1) {
@@ -2099,6 +2125,14 @@ class TileParser {
                         top_avail, ref0, masks);
       const bool allow_warp = !frame_.force_integer_mv && frame_.allow_warped_motion &&
                               (masks[0] | masks[1]);
+      if (trace_enabled()) {
+        const RangeDecoder::State mm_state = decoder_.state();
+        std::fprintf(stderr, "MM %d %d bs=%d warp=%d obmc_cdf=%u,%u dif=%llu rng=%u cnt=%d\n", col,
+                     row, static_cast<int>(size), allow_warp ? 1 : 0,
+                     cdf_.inter.use_obmc[size][0], cdf_.inter.use_obmc[size][1],
+                     static_cast<unsigned long long>(mm_state.window), mm_state.range,
+                     mm_state.count);
+      }
       if (allow_warp) {
         block->motion_mode = static_cast<int>(decoder_.read_symbol(cdf_.inter.motion_mode[size], 2));
       } else {
@@ -2127,7 +2161,7 @@ class TileParser {
         masked = decoder_.read_symbol(cdf_.inter.comp_group_idx[mask_ctx], 1) != 0;
         if (trace_) {
           const RangeDecoder::State st = decoder_.state();
-          std::fprintf(stderr, "Y mask %d %d %llu %u %d\n", mask_ctx, masked ? 1 : 0,
+          std::fprintf(stderr, "MK mask %d %d %llu %u %d\n", mask_ctx, masked ? 1 : 0,
                        static_cast<unsigned long long>(st.window), st.range, st.count);
         }
       }
@@ -2139,7 +2173,7 @@ class TileParser {
                                                                                             : 0);
           if (trace_) {
             const RangeDecoder::State st = decoder_.state();
-            std::fprintf(stderr, "Y jnt %d %d %llu %u %d\n", jnt_ctx,
+            std::fprintf(stderr, "MK jnt %d %d %llu %u %d\n", jnt_ctx,
                          block->compound_type == kCompoundAverage ? 1 : 0,
                          static_cast<unsigned long long>(st.window), st.range, st.count);
           }
@@ -2175,7 +2209,7 @@ class TileParser {
         filter[1] = filter[0];
         if (trace_) {
           const RangeDecoder::State st = decoder_.state();
-          std::fprintf(stderr, "Y f0 %d %d %llu %u %d\n", fctx, filter[0],
+          std::fprintf(stderr, "MK f0 %d %d %llu %u %d\n", fctx, filter[0],
                        static_cast<unsigned long long>(st.window), st.range, st.count);
         }
         if (seq_.enable_dual_filter) {
@@ -2184,7 +2218,7 @@ class TileParser {
               static_cast<int>(decoder_.read_symbol(cdf_.inter.interp_filter[8 + fctx2], 2));
           if (trace_) {
             const RangeDecoder::State st = decoder_.state();
-            std::fprintf(stderr, "Y f1 %d %d %llu %u %d\n", fctx2, filter[1],
+            std::fprintf(stderr, "MK f1 %d %d %llu %u %d\n", fctx2, filter[1],
                          static_cast<unsigned long long>(st.window), st.range, st.count);
           }
         }
