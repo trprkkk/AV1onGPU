@@ -22,6 +22,7 @@
 #include "frontend/headers.hpp"
 #include "frontend/ivf.hpp"
 #include "frontend/obu.hpp"
+#include "frontend/tile_decoder.hpp"
 #include "frontend/tiles.hpp"
 
 namespace {
@@ -132,9 +133,34 @@ void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const uint8_
   }
   if (group.tiles.size() == 1) {
     const TileExtent& tile = group.tiles[0];
-    std::printf("  tile data: %zu bytes at offset %zu (%dx%d at %d,%d); tile syntax not "
-                "implemented yet\n",
-                tile.size, tile.offset, tile.w, tile.h, tile.x, tile.y);
+    std::printf("  tile data: %zu bytes at offset %zu (%dx%d at %d,%d)\n", tile.size,
+                tile.offset, tile.w, tile.h, tile.x, tile.y);
+    /* The tile is arithmetic coded, so the only way to know that its bytes are
+     * understood is to decode them. This reads as far as the syntax layer
+     * reaches and reports where it stopped. */
+    TileDecodeResult decoded;
+    const ParseStatus status =
+        decode_intra_tile(seq, hdr, payload + tile.offset, tile.size, &decoded, &tile_error);
+    if (status == ParseStatus::Ok) {
+      std::printf("  tile decoded: %zu block(s), %zu of %zu bytes used\n",
+                  decoded.blocks.size(), decoded.bytes_used, tile.size);
+    } else if (status == ParseStatus::Unsupported) {
+      std::printf("  tile: %zu block(s) parsed, %zu of %zu bytes used, then: %s\n",
+                  decoded.blocks.size(), decoded.bytes_used, tile.size,
+                  decoded.stop_reason.empty() ? tile_error.c_str()
+                                              : decoded.stop_reason.c_str());
+    } else {
+      std::printf("  tile: %s\n", tile_error.c_str());
+    }
+    if (!decoded.blocks.empty()) {
+      const TileBlock& first = decoded.blocks.front();
+      std::printf("  first block: %dx%d at mi (%d,%d), partition %d, skip %d, modes %d/%d, "
+                  "transform %dx%d, q %d\n",
+                  block_width4(first.size) * 4, block_height4(first.size) * 4, first.mi_row,
+                  first.mi_col, static_cast<int>(first.partition), static_cast<int>(first.skip),
+                  first.y_mode, first.uv_mode, first.tx_size.width(), first.tx_size.height(),
+                  first.qindex);
+    }
   } else {
     std::printf("  tile group: %zu of %d tiles, %d..%d\n", group.tiles.size(),
                 hdr.tiles.cols * hdr.tiles.rows, group.start, group.end);
