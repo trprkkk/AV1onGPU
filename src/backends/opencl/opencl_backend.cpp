@@ -95,7 +95,10 @@ class OpenCLBackend final : public Backend {
     char driver[256] = {0};
     cl_ulong mem = 0;
     cl_uint cus = 0;
-    cl_uint max_wg = 0;
+    /* CL_DEVICE_MAX_WORK_GROUP_SIZE is a size_t, and a driver is allowed to
+     * insist on that size: PoCL returns CL_INVALID_VALUE for a four byte
+     * buffer, which used to read as "no device". */
+    size_t max_wg = 0;
     api_.GetDeviceInfo(device_, opencl::CL_DEVICE_NAME, sizeof(name), name, nullptr);
     api_.GetDeviceInfo(device_, opencl::CL_DEVICE_VENDOR, sizeof(vendor), vendor, nullptr);
     api_.GetDeviceInfo(device_, opencl::CL_DEVICE_VERSION, sizeof(version), version, nullptr);
@@ -428,10 +431,13 @@ class OpenCLBackend final : public Backend {
     if (keep_reference) {
       slot = allocate_slot();
       if (slot < 0) return fail(error, "OpenCL reference pool exhausted");
-      if (api_.EnqueueCopyBuffer(queue_, frame_, ref_pool_,
+      /* frame_ is the source, so the slot offset is the *destination* one;
+       * getting those the other way round makes the driver reject the copy as
+       * out of range on every slot but zero. */
+      if (api_.EnqueueCopyBuffer(queue_, frame_, ref_pool_, 0,
                                  static_cast<size_t>(slot) * g.buffer_size *
                                      sizeof(uint16_t),
-                                 0, g.buffer_size * sizeof(uint16_t), 0, nullptr,
+                                 g.buffer_size * sizeof(uint16_t), 0, nullptr,
                                  nullptr) != opencl::CL_SUCCESS)
         return fail(error, "reference copy failed");
       api_.Finish(queue_);

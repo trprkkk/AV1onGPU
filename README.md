@@ -239,7 +239,12 @@ python3 tests/opencl_pipeline.py --frames 4 --qstep 6
 `tests/` and this section assume Linux or macOS. On a machine without an ICD
 loader both OpenCL tests exit with 77 ("skipped") instead of failing, because
 that is a missing driver and not a wrong kernel; with pocl the two tests run on
-the CPU and still compile and execute the real kernel sources.
+the CPU and still compile and execute the real kernel sources. The tests use the
+loader pyopencl bundles, so the Python layer needs nothing else; the C++ backend,
+which `dlopen`s `libOpenCL.so.1`, needs a system (or built) ICD loader as well —
+with one in place `--backend opencl` decodes the fixtures bit exactly on a PoCL
+CPU device. `-DAV1GPU_TEST_PYTHON=/path/to/venv/bin/python` points ctest at the
+interpreter that has numpy and pyopencl, instead of the system one.
 
 ```sh
 # PoCL in a scratch prefix, no ICD loader in the container
@@ -250,13 +255,18 @@ ctest --test-dir build -R opencl --output-on-failure
 
 ## What is not here
 
-There is no arithmetic (entropy) decoder and no partition tree in this tree yet:
-the front-end reads containers and headers, and the reconstruction engine starts
-at the block syntax, so a real `.ivf` can be inspected but not yet decoded. `av1gpu::synthetic_encode` is a small closed loop test
-encoder that produces valid syntax from a generated clip, and it is what the
-tools and tests decode. See `docs/ROADMAP.md` for the intended front-end work
-and `docs/ACCURACY.md` for exactly where this implementation approximates the
-AV1 specification and where it is bit exact.
+Inter/intra compound, intrabc and palette are the inter and intra tools that are
+still missing; film grain uses a synthetic template instead of the
+specification's synthesis filter (see `docs/ROADMAP.md`, sections 3 and 4).
+`av1gpu::synthetic_encode` is a small closed loop test encoder that produces
+valid syntax from a generated clip and does not need any of those.
+
+The CUDA backend compiles the same kernel source as the OpenCL and CPU backends
+with NVRTC but has had no NVIDIA device in the development environment, so it is
+checked by construction and by the shared source, not by a run: only the OpenCL
+backend and the CPU backend have been run end to end on real streams here.
+`docs/ACCURACY.md` records exactly where this implementation approximates the
+specification and where it is bit exact.
 
 ## License
 

@@ -122,6 +122,36 @@ three layers, all of them runnable on a machine with no GPU driver:
    compares whole frames against the CPU reference decode. Four frames, intra
    and inter, all filters on: **bit identical**.
 
+To those a fourth layer can be added where a software OpenCL device exists: the
+C++ backend itself, not just the kernel source. PoCL (`pip install pyopencl
+pocl-binary-distribution`, plus any ICD loader) exposes the host CPU as an
+OpenCL device, and
+
+```sh
+av1gpu_decode --backend opencl --frames 30 tests/data/lw_t2.ivf \
+    --hash-check tests/data/lw_t2.hash
+```
+
+then checks the whole backend — context, buffers, job upload, launch order,
+reference copies — against a reference decoder's pictures. Every stream in the
+fixture set decodes bit exactly that way on a two-core PoCL device (14 streams),
+and `av1gpu_bench` reports the same PSNR for `--backend cpu` and `--backend
+opencl`. This is an arithmetic and plumbing check, not a performance one: a CPU
+OpenCL device runs the kernels on the CPU.
+
+Running that layer for the first time found two bugs the kernel tests could not
+see, because nothing in this tree had ever created a device:
+
+* `CL_DEVICE_MAX_WORK_GROUP_SIZE` is a `size_t` and was queried into a `cl_uint`.
+  PoCL answers `CL_INVALID_VALUE` for a four byte buffer, which read as a limit
+  of zero and rejected a perfectly working device with "device workgroup limit
+  too small". The query now uses `size_t`, as the API specifies.
+* The decode path copied a finished picture into its reference slot with the
+  *slot* offset given as the source offset: `clEnqueueCopyBuffer(frame_,
+  ref_pool_, slot * size, 0, size, ...)`. Slot 0 worked by accident; every other
+  slot asked the driver to read past the end of `frame_` and failed with
+  "reference copy failed", so the second reference of a stream could not be kept.
+
 The front-end has its own cross-checks. Two of them are one-off development
 experiments, and one is part of the test suite:
 

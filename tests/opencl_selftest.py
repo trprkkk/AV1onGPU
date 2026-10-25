@@ -59,6 +59,24 @@ static void emit_plane(const char* what, const uint16_t* plane, int stride, int 
   for (int i = 0; i < (n); ++i) \
     std::printf("{\"struct\":\"%s\",\"field\":\"%s%d\",\"offset\":%zu}\n", #T, #f, i, \
                 offsetof(T, f) + (size_t)i * sizeof(((T*)0)->f[0]))
+/* an array of ints, one entry per element */
+#define FA2(T, f, m) \
+  for (int j = 0; j < (m); ++j) \
+    std::printf("{\"struct\":\"%s\",\"field\":\"%s_%d\",\"offset\":%zu}\n", #T, #f, j, \
+                offsetof(T, f) + (size_t)j * sizeof(((T*)0)->f[0]))
+/* an array of structs of plain ints: the mirror needs one int per member, so the
+ * probe walks the array as a flat int view and names them f<i>_<j> */
+#define FS(T, f, n, E) \
+  for (int i = 0; i < (n); ++i) \
+    for (int j = 0; j < (int)(sizeof(E) / sizeof(int)); ++j) \
+      std::printf("{\"struct\":\"%s\",\"field\":\"%s%d_%d\",\"offset\":%zu}\n", #T, #f, i, j, \
+                  offsetof(T, f) + (size_t)i * sizeof(E) + (size_t)j * sizeof(int))
+/* a two dimensional int array */
+#define FM(T, f, n, m) \
+  for (int i = 0; i < (n); ++i) \
+    for (int j = 0; j < (m); ++j) \
+      std::printf("{\"struct\":\"%s\",\"field\":\"%s%d_%d\",\"offset\":%zu}\n", #T, #f, i, j, \
+                  offsetof(T, f) + ((size_t)i * (m) + (size_t)j) * sizeof(((T*)0)->f[0][0]))
 #define S(T) std::printf("{\"struct\":\"%s\",\"size\":%zu}\n", #T, sizeof(T))
 
 int main() {
@@ -175,6 +193,19 @@ int main() {
   F(Av1gInterJob, mv0_x); F(Av1gInterJob, mv0_y); F(Av1gInterJob, mv1_x);
   F(Av1gInterJob, mv1_y); F(Av1gInterJob, filt); F(Av1gInterJob, compound);
   F(Av1gInterJob, w0); F(Av1gInterJob, w1); F(Av1gInterJob, bitdepth);
+  F(Av1gInterJob, sub_x); F(Av1gInterJob, sub_y); F(Av1gInterJob, filt_v);
+  F(Av1gInterJob, mask_kind); F(Av1gInterJob, mask_sign);
+  F(Av1gInterJob, wedge_dir); F(Av1gInterJob, wedge_xoff); F(Av1gInterJob, wedge_yoff);
+  F(Av1gInterJob, wedge_flip);
+  F(Av1gInterJob, luma_ref0_off); F(Av1gInterJob, luma_ref1_off);
+  F(Av1gInterJob, luma_stride); F(Av1gInterJob, luma_x); F(Av1gInterJob, luma_y);
+  F(Av1gInterJob, luma_ref_w); F(Av1gInterJob, luma_ref_h);
+  F(Av1gInterJob, obmc_count);
+  FS(Av1gInterJob, obmc, 8, Av1gObmcCandidate);
+  FA2(Av1gInterJob, warp, 2);
+  FM(Av1gInterJob, warp_params, 2, 6);
+  FM(Av1gInterJob, warp_abcd, 2, 4);
+  FA2(Av1gInterJob, mask_warp, 2);
   S(Av1gDeblockJob);
   F(Av1gDeblockJob, p_off); F(Av1gDeblockJob, stride); F(Av1gDeblockJob, step);
   F(Av1gDeblockJob, len); F(Av1gDeblockJob, level); F(Av1gDeblockJob, sharpness);

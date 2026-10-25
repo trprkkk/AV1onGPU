@@ -158,10 +158,21 @@ if(AV1GPU_BUILD_TESTS)
   # Compiles the real OpenCL source with a real OpenCL compiler and runs a few
   # jobs. Needs pyopencl + a runtime; exits with 77 when unavailable, which ctest
   # reports as a skip.
+  #
+  # Those two modules are often only present in a virtualenv, so the interpreter
+  # can be pointed at one: -DAV1GPU_TEST_PYTHON=/path/to/venv/bin/python. Without
+  # it the system interpreter is used, which usually has neither module, and the
+  # tests report themselves as skipped instead of silently passing.
   find_package(Python3 COMPONENTS Interpreter QUIET)
-  if(Python3_Interpreter_FOUND)
+  set(AV1GPU_TEST_PYTHON "" CACHE FILEPATH
+      "Python for the OpenCL tests; must have numpy and pyopencl")
+  set(AV1GPU_TEST_PY "${Python3_EXECUTABLE}")
+  if(AV1GPU_TEST_PYTHON)
+    set(AV1GPU_TEST_PY "${AV1GPU_TEST_PYTHON}")
+  endif()
+  if(AV1GPU_TEST_PY)
     add_test(NAME opencl_selftest
-             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_selftest.py)
+             COMMAND ${AV1GPU_TEST_PY} ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_selftest.py)
     set_tests_properties(opencl_selftest PROPERTIES SKIP_RETURN_CODE 77)
 
     # Replays real decode plans through the OpenCL kernels and compares whole
@@ -169,7 +180,7 @@ if(AV1GPU_BUILD_TESTS)
     # only built with the tools, and pyopencl + a runtime.
     if(TARGET av1gpu_dump)
       add_test(NAME opencl_pipeline
-               COMMAND ${Python3_EXECUTABLE}
+               COMMAND ${AV1GPU_TEST_PY}
                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_pipeline.py
                        --dumper $<TARGET_FILE:av1gpu_dump>)
       set_tests_properties(opencl_pipeline PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
