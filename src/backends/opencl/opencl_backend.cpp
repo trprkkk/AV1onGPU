@@ -138,9 +138,9 @@ class OpenCLBackend final : public Backend {
     return build_program(options_.verbose ? error : nullptr, error);
   }
 
-  PlanLayout prepare(const FrameGeometry& geometry) override {
+  PlanLayout prepare(const FrameGeometry& geometry, int coded_width) override {
     /* 64 sample aligned rows keep the row accesses coalesced */
-    const PlanLayout g = make_plan_layout(geometry, 64);
+    const PlanLayout g = make_plan_layout(geometry, coded_width, 64);
     const size_t size = g.buffer_size;
     layout_ = g;
     ensure(&frame_, &frame_cap_, size * sizeof(uint16_t));
@@ -163,8 +163,9 @@ class OpenCLBackend final : public Backend {
     const size_t size = layout_.buffer_size;
     std::vector<uint16_t> packed(size, 0);
     for (int p = 0; p < 3; ++p) {
-      const int w = layout_.plane_w[p];
-      const int h = layout_.plane_h[p];
+      /* an uploaded frame is a display picture, i.e. the upscaled one */
+      const int w = layout_.out_w[p];
+      const int h = layout_.out_h[p];
       for (int y = 0; y < h; ++y)
         std::memcpy(packed.data() + layout_.plane_off[p] +
                         static_cast<size_t>(y) * layout_.stride[p],
@@ -384,6 +385,33 @@ class OpenCLBackend final : public Backend {
       ++launches;
     }
 
+    /* ---- superres ---------------------------------------------------------- */
+    /* frame_ holds the coded picture, so the upscaler reads the scratch copy of
+     * it and writes the display picture back into frame_ - a kernel cannot read
+     * samples another work item has already overwritten. */
+    if (!plan.upscale.empty()) {
+      if (api_.EnqueueCopyBuffer(queue_, frame_, scratch_, 0, 0,
+                                 g.buffer_size * sizeof(uint16_t), 0, nullptr,
+                                 nullptr) != opencl::CL_SUCCESS)
+        return fail(error, "superres snapshot copy failed");
+      int total = 0;
+      cl_mem job_mem = 0, pref_mem = 0;
+      if (!upload_jobs(plan.upscale, &job_mem, &pref_mem, &total,
+                       [](const Av1gUpscaleJob& j) { return j.rows * j.upscaled_w; }))
+        return fail(error, "upscale job upload failed");
+      cl_kernel k = kernel("av1g_k_upscale");
+      set_mem(k, 0, job_mem);
+      set_mem(k, 1, pref_mem);
+      set_int(k, 2, static_cast<int>(plan.upscale.size()));
+      set_int(k, 3, total);
+      set_mem(k, 4, scratch_);
+      set_mem(k, 5, frame_);
+      set_mem(k, 6, filters_);
+      set_int(k, 7, maxv);
+      if (!enqueue(k, total, 64)) return fail(error, "av1g_k_upscale failed");
+      ++launches;
+    }
+
     /* ---- film grain -------------------------------------------------------- */
     if (!plan.grain.empty()) {
       ensure(&grain_, &grain_cap_, plan.grain_template.size());
@@ -426,8 +454,8 @@ class OpenCLBackend final : public Backend {
                                  nullptr, nullptr) != opencl::CL_SUCCESS)
         return fail(error, "clEnqueueReadBuffer failed");
       for (int p = 0; p < 3; ++p) {
-        const int w = g.plane_w[p];
-        const int h = g.plane_h[p];
+        const int w = g.out_w[p];
+        const int h = g.out_h[p];
         for (int y = 0; y < h; ++y)
           std::memcpy(out->plane(p) + static_cast<size_t>(y) * out->stride[p],
                       staging_.data() + g.plane_off[p] +

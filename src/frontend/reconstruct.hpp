@@ -223,8 +223,13 @@ inline int intra_filter_type(const PlanState& st, int mi_row, int mi_col, int pl
  * reference has to be resampled, which this stage does not do yet. */
 struct ReferenceInfo {
   int slot[7] = {-1, -1, -1, -1, -1, -1, -1};
+  /* the reference's coded size (RefFrameWidth / RefFrameHeight) */
   int width[7] = {0, 0, 0, 0, 0, 0, 0};
   int height[7] = {0, 0, 0, 0, 0, 0, 0};
+  /* and its display size (RefUpscaledWidth), which reference scaling needs:
+   * the pool holds the upscaled picture, so that is what a motion vector
+   * addresses. */
+  int upscaled_width[7] = {0, 0, 0, 0, 0, 0, 0};
 };
 
 /* MAX_FRAME_DISTANCE: the clamp the distance weights apply to a frame
@@ -309,7 +314,10 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
   const bool ss_x = !seq.monochrome && seq.ss_x;
   const bool ss_y = !seq.monochrome && seq.ss_y;
 
-  out->width = width;
+  out->width = frame.upscaled_width > 0 ? frame.upscaled_width : width;
+  /* a superres frame codes its tiles at FrameWidth and displays them at
+   * UpscaledWidth; the engine upscales between CDEF and the output */
+  out->coded_width = (out->width != width) ? width : 0;
   out->height = height;
   out->bit_depth = seq.bit_depth;
   out->ss_x = ss_x ? 1 : 0;
@@ -324,7 +332,11 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
    * has to care. */
   if (refs) {
     out->reference_slots.assign(7, -1);
-    for (int i = 0; i < 7; ++i) out->reference_slots[static_cast<size_t>(i)] = refs->slot[i];
+    for (int i = 0; i < 7; ++i) {
+      out->reference_slots[static_cast<size_t>(i)] = refs->slot[i];
+      out->reference_width[i] = refs->upscaled_width[i];
+      out->reference_height[i] = refs->height[i];
+    }
   }
 
   PlanState st;

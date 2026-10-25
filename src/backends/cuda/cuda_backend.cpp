@@ -144,8 +144,8 @@ class CudaBackend final : public Backend {
     return build_module(error);
   }
 
-  PlanLayout prepare(const FrameGeometry& geometry) override {
-    const PlanLayout g = make_plan_layout(geometry, 64);
+  PlanLayout prepare(const FrameGeometry& geometry, int coded_width) override {
+    const PlanLayout g = make_plan_layout(geometry, coded_width, 64);
     const size_t size = g.buffer_size;
     layout_ = g;
     /* prepare() has no way to report an error, so record the failure and let
@@ -175,8 +175,8 @@ class CudaBackend final : public Backend {
     const size_t size = layout_.buffer_size;
     std::vector<uint16_t> packed(size, 0);
     for (int p = 0; p < 3; ++p) {
-      const int w = layout_.plane_w[p];
-      const int h = layout_.plane_h[p];
+      const int w = layout_.out_w[p];
+      const int h = layout_.out_h[p];
       for (int y = 0; y < h; ++y)
         std::memcpy(packed.data() + layout_.plane_off[p] +
                         static_cast<size_t>(y) * layout_.stride[p],
@@ -391,6 +391,33 @@ class CudaBackend final : public Backend {
       ++launches;
     }
 
+    /* ---- superres ---------------------------------------------------------- */
+    /* The upscaler reads a snapshot of the coded picture (the scratch buffer)
+     * and writes the display picture into frame_: within one row a work item
+     * reads samples ahead of the ones it writes, so the two must be different
+     * buffers. */
+    if (!plan.upscale.empty()) {
+      if (driver_.MemcpyDtoD(scratch_, frame_, g.buffer_size * sizeof(uint16_t)) !=
+          cuda::CUDA_SUCCESS)
+        return fail(error, "superres snapshot copy failed");
+      int total = 0;
+      CUdeviceptr job_mem = 0, pref_mem = 0;
+      if (!upload_jobs(plan.upscale, &job_mem, &pref_mem, &total,
+                       [](const Av1gUpscaleJob& j) { return j.rows * j.upscaled_w; }))
+        return fail(error, "upscale job upload failed");
+      Launcher a;
+      add_mem(a, job_mem);
+      add_mem(a, pref_mem);
+      add_int(a, static_cast<int>(plan.upscale.size()));
+      add_int(a, total);
+      add_mem(a, scratch_);
+      add_mem(a, frame_);
+      add_mem(a, filters_);
+      add_int(a, maxv);
+      if (!launch("av1g_k_upscale", total, a)) return fail(error, "av1g_k_upscale failed");
+      ++launches;
+    }
+
     if (!plan.grain.empty()) {
       if (!ensure(&grain_, &grain_cap_, plan.grain_template.size()) ||
           !ensure(&lut_, &lut_cap_, sizeof(plan.grain_lut)))
@@ -442,8 +469,8 @@ class CudaBackend final : public Backend {
           cuda::CUDA_SUCCESS)
         return fail(error, "frame read back failed");
       for (int p = 0; p < 3; ++p) {
-        const int w = g.plane_w[p];
-        const int h = g.plane_h[p];
+        const int w = g.out_w[p];
+        const int h = g.out_h[p];
         for (int y = 0; y < h; ++y)
           std::memcpy(out->plane(p) + static_cast<size_t>(y) * out->stride[p],
                       staging_.data() + g.plane_off[p] +

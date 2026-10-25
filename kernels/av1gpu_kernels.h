@@ -75,6 +75,24 @@ AV1G_FN int av1g_rshift_rnd(long long v, int n) {
   return (int)((v + (1LL << (n - 1))) >> n);
 }
 
+/* round(x / 2^n) for any sign of x, in the specification's Round2Signed sense:
+ * the addition happens on the *magnitude*, so a negative value rounds away
+ * from zero instead of towards the next integer above it. */
+AV1G_FN int av1g_rshift_rnd_signed(int v, int n) {
+  const int s = v < 0 ? -1 : 0;
+  return (v + (1 << (n - 1)) + s) >> n;
+}
+
+/* Reference scaling and superres share the specification's Q14 scale: one
+ * sample at the same size is 1 << 14, and motion compensation addresses a
+ * reference sample in 1/1024 of a sample (SCALE_SUBPEL_BITS). */
+#define AV1G_SCALE_ONE (1 << 14)
+#define AV1G_REF_SCALE_SHIFT 14
+#define AV1G_SCALE_SUBPEL_BITS 10
+/* off = (1 << (SCALE_SUBPEL_BITS - SUBPEL_BITS)) / 2: half a current sample, in
+ * 1/1024 of a reference sample, which centres the eight taps on the sample. */
+#define AV1G_SCALE_SUBPEL_OFF (1 << (AV1G_SCALE_SUBPEL_BITS - 4 - 1))
+
 /* ------------------------------------------------------------------ */
 /* job descriptors (identical layout on host and device)              */
 /* ------------------------------------------------------------------ */
@@ -168,6 +186,12 @@ typedef struct {
   int mv0_x, mv0_y;   /* 1/8 pel, in *luma* samples, as the bitstream codes it */
   int mv1_x, mv1_y;
   int sub_x, sub_y;   /* plane subsampling; the vector is halved per axis  */
+  /* Reference scaling (7.11.3.3): the reference frame's *upscaled* size over
+   * this frame's coded size, Q14, where AV1G_SCALE_ONE means "the same size"
+   * and takes the plain path. A superres frame is coded narrower than it is
+   * displayed, so even a reference of the very same picture is scaled up when
+   * it is predicted from. */
+  int scale_x, scale_y;
   int filt;           /* horizontal filter class, AV1G_FILT_*             */
   int filt_v;         /* vertical filter class, AV1G_FILT_*               */
   int compound;       /* AV1G_COMPOUND_*                                  */
@@ -1354,11 +1378,16 @@ typedef struct {
   int ref_w, ref_h;   /* visible reference size, for clamping             */
   int border;         /* extra border samples available (0)               */
   int bitdepth;
+  int scale_x, scale_y; /* reference scaling, Q14 (AV1G_SCALE_ONE: none)  */
 } Av1gInterCtx;
 
 AV1G_FN void av1g_inter_ctx(const Av1gInterJob *job, Av1gInterCtx *ctx) {
   ctx->sub_x = job->sub_x;
   ctx->sub_y = job->sub_y;
+  /* a job that does not set the scales (a test, or a frame whose references are
+   * all the same size) is unscaled */
+  ctx->scale_x = job->scale_x > 0 ? job->scale_x : AV1G_SCALE_ONE;
+  ctx->scale_y = job->scale_y > 0 ? job->scale_y : AV1G_SCALE_ONE;
   ctx->ref_w = job->ref_w;
   ctx->ref_h = job->ref_h;
   ctx->border = job->border;
@@ -1416,6 +1445,91 @@ AV1G_FN int av1g_inter_tap(const Av1gInterCtx *ctx, AV1G_GLOBAL const av1g_px *r
            av1g_filt(filters, fv, yf, j);
   }
   return (acc + (1 << (round1 - 1))) >> round1;
+}
+
+/*
+ * The same two stage interpolation when the reference frame and the current
+ * frame are not the same size (7.11.3.3 and 7.11.3.4). The sampling position is
+ * no longer a function of the motion vector alone: it is the sample's position
+ * mapped through the reference's upscaled size over this frame's coded size,
+ * so the phase drifts across the block and every sample needs its own
+ * arithmetic.
+ *
+ * The position is kept in 1/1024 of a reference sample (SCALE_SUBPEL_BITS),
+ * which is the precision the specification derives startX/stepX in, and the
+ * eight taps are taken from it exactly as in the unscaled path - the integer
+ * part indexes the sample, the fractional part the 1/16 phase of the filter.
+ * The taps are clamped to the reference's visible samples, not to a border:
+ * the specification's Clip3(0, lastX, ...) has no emulated edge on this path.
+ *
+ * startX/startY are the reference position of the *patch origin*, and the
+ * sample at (x, y) is one step further along per sample (stepX/stepY, which is
+ * the reference-to-current size ratio in 1/1024). So unlike the unscaled path
+ * the position cannot be written as (base_x + x): the patch origin is what the
+ * motion vector displaces, and x only adds a step.
+ */
+AV1G_FN int av1g_inter_tap_scaled(const Av1gInterCtx *ctx, AV1G_GLOBAL const av1g_px *ref,
+                                  int ref_off, int ref_stride, int base_x, int base_y,
+                                  int extent_w, int extent_h, int mvx, int mvy, int filt,
+                                  int filt_v, int x, int y, int compound,
+                                  AV1G_GLOBAL const int *filters) {
+  /* The patch origin's position in this frame, in 1/16 of a sample
+   * (SUBPEL_BITS), the way the specification's origX/origY are built: the
+   * patch origin plus the vector, which is in 1/8 samples and doubles on the
+   * way in. The sample offset (x, y) is *not* part of it - it multiplies the
+   * step below. */
+  const int origin_x = (base_x << 4) + ((2 * mvx) >> ctx->sub_x) + 8;
+  const int origin_y = (base_y << 4) + ((2 * mvy) >> ctx->sub_y) + 8;
+  /* baseX = origX * xScale - (halfSample << REF_SCALE_SHIFT), with halfSample
+   * 8: the vector addresses the centre of the sample, the filter the corner of
+   * the eight tap window. startX is that in 1/1024 of a reference sample plus
+   * the half tap offset, stepX the size of one current sample there. */
+  const int baseX = origin_x * ctx->scale_x - (8 << AV1G_REF_SCALE_SHIFT);
+  const int baseY = origin_y * ctx->scale_y - (8 << AV1G_REF_SCALE_SHIFT);
+  const int start_x =
+      av1g_rshift_rnd_signed(baseX, AV1G_REF_SCALE_SHIFT + 4 - AV1G_SCALE_SUBPEL_BITS) +
+      AV1G_SCALE_SUBPEL_OFF;
+  const int start_y =
+      av1g_rshift_rnd_signed(baseY, AV1G_REF_SCALE_SHIFT + 4 - AV1G_SCALE_SUBPEL_BITS) +
+      AV1G_SCALE_SUBPEL_OFF;
+  const int step_x = av1g_rshift_rnd_signed(ctx->scale_x, AV1G_REF_SCALE_SHIFT - AV1G_SCALE_SUBPEL_BITS);
+  const int step_y = av1g_rshift_rnd_signed(ctx->scale_y, AV1G_REF_SCALE_SHIFT - AV1G_SCALE_SUBPEL_BITS);
+  const int px = start_x + step_x * x;
+  const int py = start_y + step_y * y;
+  const int cx = px >> AV1G_SCALE_SUBPEL_BITS;
+  const int cy = py >> AV1G_SCALE_SUBPEL_BITS;
+  const int xf = (px & ((1 << AV1G_SCALE_SUBPEL_BITS) - 1)) >> (AV1G_SCALE_SUBPEL_BITS - 4);
+  const int yf = (py & ((1 << AV1G_SCALE_SUBPEL_BITS) - 1)) >> (AV1G_SCALE_SUBPEL_BITS - 4);
+  const int fh = av1g_filt_row(filt, extent_w);
+  const int fv = av1g_filt_row(filt_v, extent_h);
+  const int x0 = 0, x1 = ctx->ref_w - 1, y0 = 0, y1 = ctx->ref_h - 1;
+  int round0 = ctx->bitdepth >= 12 ? 5 : 3;
+  int round1 = compound ? 7 : 11;
+  int acc = 0, i, j;
+  if (ctx->bitdepth >= 12 && !compound) round1 -= 2;
+  for (j = 0; j < AV1G_FILT_TAPS; ++j) {
+    int rowacc = 0;
+    for (i = 0; i < AV1G_FILT_TAPS; ++i) {
+      const int s = av1g_fetch(ref + ref_off, ref_stride, cx - 3 + i, cy - 3 + j, x0, x1, y0, y1);
+      rowacc += s * av1g_filt(filters, fh, xf, i);
+    }
+    acc += ((rowacc + (1 << (round0 - 1))) >> round0) * av1g_filt(filters, fv, yf, j);
+  }
+  return (acc + (1 << (round1 - 1))) >> round1;
+}
+
+/* One sample of one reference: the plain path when both scales are 1:1, which
+ * keeps every stream without superres on the arithmetic it always had. */
+AV1G_FN int av1g_mc_tap(const Av1gInterJob *job, const Av1gInterCtx *ctx,
+                        AV1G_GLOBAL const av1g_px *ref, int ref_off, int ref_stride,
+                        int base_x, int base_y, int extent_w, int extent_h, int mvx,
+                        int mvy, int filt, int filt_v, int x, int y, int compound,
+                        AV1G_GLOBAL const int *filters) {
+  if (ctx->scale_x == AV1G_SCALE_ONE && ctx->scale_y == AV1G_SCALE_ONE)
+    return av1g_inter_tap(ctx, ref, ref_off, ref_stride, base_x, base_y, extent_w,
+                          extent_h, mvx, mvy, filt, filt_v, x, y, compound, filters);
+  return av1g_inter_tap_scaled(ctx, ref, ref_off, ref_stride, base_x, base_y, extent_w,
+                               extent_h, mvx, mvy, filt, filt_v, x, y, compound, filters);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1592,24 +1706,26 @@ AV1G_FN int av1g_mask_luma_diff(const Av1gInterJob *job, AV1G_GLOBAL const av1g_
   lctx.ref_h = job->luma_ref_h;
   lctx.border = 0;
   lctx.bitdepth = job->bitdepth;
+  lctx.scale_x = job->scale_x;
+  lctx.scale_y = job->scale_y;
   v0 = job->mask_warp[0]
            ? av1g_warp_tap(0, 0, job->luma_ref_w, job->luma_ref_h, job->warp_params[0],
                            job->warp_abcd[0], job->ref0_slot >= 0 ? pool : cur,
                            job->luma_ref0_off, job->luma_stride, job->luma_x, job->luma_y,
                            lx, ly, job->bitdepth, 1, filters)
-           : av1g_inter_tap(&lctx, job->ref0_slot >= 0 ? pool : cur, job->luma_ref0_off,
-                            job->luma_stride, job->luma_x, job->luma_y, extent_w, extent_h,
-                            job->mv0_x, job->mv0_y, job->filt, job->filt_v, lx, ly, 1,
-                            filters);
+           : av1g_mc_tap(job, &lctx, job->ref0_slot >= 0 ? pool : cur, job->luma_ref0_off,
+                         job->luma_stride, job->luma_x, job->luma_y, extent_w, extent_h,
+                         job->mv0_x, job->mv0_y, job->filt, job->filt_v, lx, ly, 1,
+                         filters);
   v1 = job->mask_warp[1]
            ? av1g_warp_tap(0, 0, job->luma_ref_w, job->luma_ref_h, job->warp_params[1],
                            job->warp_abcd[1], job->ref1_slot >= 0 ? pool : cur,
                            job->luma_ref1_off, job->luma_stride, job->luma_x, job->luma_y,
                            lx, ly, job->bitdepth, 1, filters)
-           : av1g_inter_tap(&lctx, job->ref1_slot >= 0 ? pool : cur, job->luma_ref1_off,
-                            job->luma_stride, job->luma_x, job->luma_y, extent_w, extent_h,
-                            job->mv1_x, job->mv1_y, job->filt, job->filt_v, lx, ly, 1,
-                            filters);
+           : av1g_mc_tap(job, &lctx, job->ref1_slot >= 0 ? pool : cur, job->luma_ref1_off,
+                         job->luma_stride, job->luma_x, job->luma_y, extent_w, extent_h,
+                         job->mv1_x, job->mv1_y, job->filt, job->filt_v, lx, ly, 1,
+                         filters);
   return v0 - v1;
 }
 
@@ -1768,10 +1884,10 @@ AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
                                        job->warp_params[0], job->warp_abcd[0], ref0,
                                        job->ref0_off, job->ref0_stride, job->ref_x,
                                        job->ref_y, x, y, job->bitdepth, compound, filters)
-                       : av1g_inter_tap(&ctx, ref0, job->ref0_off, job->ref0_stride,
-                                        job->ref_x, job->ref_y, job->w, job->h, job->mv0_x,
-                                        job->mv0_y, job->filt, job->filt_v, x, y, compound,
-                                        filters);
+                       : av1g_mc_tap(job, &ctx, ref0, job->ref0_off, job->ref0_stride,
+                                     job->ref_x, job->ref_y, job->w, job->h, job->mv0_x,
+                                     job->mv0_y, job->filt, job->filt_v, x, y, compound,
+                                     filters);
     out = v0;
     if (compound) {
       const int v1 = job->warp[1]
@@ -1779,10 +1895,10 @@ AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
                                          job->warp_params[1], job->warp_abcd[1], ref1,
                                          job->ref1_off, job->ref1_stride, job->ref_x,
                                          job->ref_y, x, y, job->bitdepth, 1, filters)
-                         : av1g_inter_tap(&ctx, ref1, job->ref1_off, job->ref1_stride,
-                                          job->ref_x, job->ref_y, job->w, job->h, job->mv1_x,
-                                          job->mv1_y, job->filt, job->filt_v, x, y, 1,
-                                          filters);
+                         : av1g_mc_tap(job, &ctx, ref1, job->ref1_off, job->ref1_stride,
+                                       job->ref_x, job->ref_y, job->w, job->h, job->mv1_x,
+                                       job->mv1_y, job->filt, job->filt_v, x, y, 1,
+                                       filters);
       /* Both halves are at 16 times the sample precision here, and
        * InterPostRound (2 * FILTER_BITS - InterRound0 - InterRound1, so 4 at 8
        * bit) is the shift that takes them back down. Neither half is clipped
@@ -1856,10 +1972,10 @@ AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
     j = x - c->rx;
     i = y - c->ry;
     m = c->pass == 0 ? av1g_obmc_mask(c->h, i) : av1g_obmc_mask(c->w, j);
-    pred = av1g_inter_tap(&ctx, c->ref_slot >= 0 ? pool : cur, c->ref_off,
-                          job->ref0_stride, job->ref_x + c->rx, job->ref_y + c->ry,
-                          c->w, c->h, c->mv_x, c->mv_y, c->filt, c->filt_v, j, i, 0,
-                          filters);
+    pred = av1g_mc_tap(job, &ctx, c->ref_slot >= 0 ? pool : cur, c->ref_off,
+                       job->ref0_stride, job->ref_x + c->rx, job->ref_y + c->ry,
+                       c->w, c->h, c->mv_x, c->mv_y, c->filt, c->filt_v, j, i, 0,
+                       filters);
     pred = av1g_clip_px(pred, maxv);
     out = (m * out + (64 - m) * pred + 32) >> 6;
   }
@@ -1878,6 +1994,81 @@ AV1G_HOST_FN void av1g_inter_block(const Av1gInterJob *job, av1g_px *dst,
 }
 
 #endif
+/* ------------------------------------------------------------------ */
+/* superres: upscaling the coded frame to its display width           */
+/* ------------------------------------------------------------------ */
+/* The upscaling process (7.15) resamples the *coded* frame, which is narrower
+ * than the picture it represents, back to the display width with an eight tap
+ * filter whose phase is derived per column. It runs on the CDEF output, before
+ * loop restoration, so a frame's references and its output are all in the
+ * upscaled domain - only the reconstruction itself happens on the narrow grid.
+ *
+ * The filter table is Upscale_Filter[64][8], appended to the same host table
+ * the subpel and warp filters live in (see tables::filters()).
+ */
+#define AV1G_SUPERRES_SCALE_MASK (AV1G_SCALE_ONE - 1)
+#define AV1G_SUPERRES_EXTRA_BITS 8
+#define AV1G_SUPERRES_FILTER_TAPS 8
+#define AV1G_SUPERRES_FILTER_OFFSET 3
+#define AV1G_UPSCALE_FILTER_OFFSET (AV1G_WARP_FILTER_OFFSET + AV1G_WARP_FILTER_ROWS * 8)
+
+/* One plane of a superres frame: the rows [y0, y0 + rows) of a coded plane are
+ * resampled from its coded width to the display width. src and dst are two
+ * different buffers (the upscale reads samples the same row writes), which is
+ * what lets every sample be computed independently. */
+typedef struct {
+  int src_off, dst_off;       /* plane origin in the source / target buffer   */
+  int src_stride, dst_stride;
+  int y0, rows;               /* the rows this job produces                  */
+  int upscaled_w;             /* output width of the plane                   */
+  int max_x;                  /* last coded sample of the plane, for clamps  */
+  int step_x;                 /* Q14, one source sample per output sample    */
+  int initial_subpel_x;       /* phase of the first output column            */
+  int bitdepth;
+} Av1gUpscaleJob;
+
+/* The upscaling process's two constants, for one plane pair: the step between
+ * output samples and the phase of the first one, both at Q14 and both derived
+ * from the coded and display widths of *that plane* (7.15). */
+AV1G_FN void av1g_superres_params(int downscaled_w, int upscaled_w, int *step, int *initial) {
+  const int s = ((downscaled_w << AV1G_REF_SCALE_SHIFT) + (upscaled_w / 2)) / upscaled_w;
+  const int err = (upscaled_w * s) - (downscaled_w << AV1G_REF_SCALE_SHIFT);
+  int sub = (-((upscaled_w - downscaled_w) << (AV1G_REF_SCALE_SHIFT - 1)) + (upscaled_w / 2)) /
+                upscaled_w +
+            (1 << (AV1G_SUPERRES_EXTRA_BITS - 1)) - err / 2;
+  *step = s;
+  *initial = sub & AV1G_SUPERRES_SCALE_MASK;
+}
+
+/* One output sample: the eight taps around its source position, clamped to the
+ * coded plane, filtered and rounded by FILTER_BITS. */
+AV1G_FN void av1g_upscale_px(const Av1gUpscaleJob *job, AV1G_GLOBAL const av1g_px *src,
+                            AV1G_GLOBAL av1g_px *dst, AV1G_GLOBAL const int *filters, int x,
+                            int y, int maxv) {
+  const int src_x = -(AV1G_SCALE_ONE) + job->initial_subpel_x + x * job->step_x;
+  const int px = src_x >> AV1G_REF_SCALE_SHIFT;
+  const int sub = (src_x & AV1G_SUPERRES_SCALE_MASK) >> AV1G_SUPERRES_EXTRA_BITS;
+  const int row = job->y0 + y;
+  int sum = 0, k;
+  for (k = 0; k < AV1G_SUPERRES_FILTER_TAPS; ++k) {
+    const int sx = av1g_clip(px + k - AV1G_SUPERRES_FILTER_OFFSET, 0, job->max_x);
+    sum += (int)src[job->src_off + row * job->src_stride + sx] *
+           filters[AV1G_UPSCALE_FILTER_OFFSET + sub * AV1G_SUPERRES_FILTER_TAPS + k];
+  }
+  dst[job->dst_off + row * job->dst_stride + x] =
+      (av1g_px)av1g_clip_px(av1g_rshift_rnd(sum, 7), maxv);
+}
+
+#if !defined(AV1G_DEVICE)
+AV1G_HOST_FN void av1g_upscale_plane(const Av1gUpscaleJob *job, const av1g_px *src,
+                                     av1g_px *dst, const int *filters, int maxv) {
+  int x, y;
+  for (y = 0; y < job->rows; ++y)
+    for (x = 0; x < job->upscaled_w; ++x)
+      av1g_upscale_px(job, src, dst, filters, x, y, maxv);
+}
+#endif /* !AV1G_DEVICE */
+
 /* ------------------------------------------------------------------ */
 /* deblocking filter                                                  */
 /* ------------------------------------------------------------------ */

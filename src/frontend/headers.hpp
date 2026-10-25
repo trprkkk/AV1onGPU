@@ -368,11 +368,17 @@ struct FrameHeader {
   int frame_id = 0;
 
   bool frame_size_override = false;
-  int width = 0;   /* upscaled width: what the decoder produces */
+  /* `width` is the specification's FrameWidth - the width the tile data codes,
+   * which is what every stage up to the upscaling process works on. A superres
+   * frame codes it narrower than it displays the picture: `upscaled_width` is
+   * the specification's UpscaledWidth, the display width, and is what the
+   * upscaling process (7.16) produces, what the output frame holds and what the
+   * reference pool stores. The two are equal for a frame without superres. */
+  int width = 0; /* FrameWidth: the coded width */
   int height = 0;
   int render_width = 0;
   int render_height = 0;
-  int frame_width = 0; /* coded width before superres upscaling */
+  int upscaled_width = 0; /* UpscaledWidth: the display width */
   bool superres = false;
   int superres_denominator = 8;
 

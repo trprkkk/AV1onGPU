@@ -1,6 +1,9 @@
 #include "frontend/headers.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #include "frontend/bitreader.hpp"
 
@@ -239,6 +242,16 @@ void compute_skip_mode(const SequenceHeader& seq, FrameHeader& h, BitReader* r) 
 }
 
 
+/* AV1GPU_HDRPOS=1 prints, in bits, where a few fields sit in the payload they
+ * were read from. It exists to build test streams: a fixture that has to say
+ * "this frame is superres" has to be *patched* rather than encoded (no encoder
+ * available here can produce one), and this turns that into "write these bits"
+ * instead of a second copy of the header syntax in a script. */
+bool hdrpos_enabled() {
+  static const bool on = std::getenv("AV1GPU_HDRPOS") != nullptr;
+  return on;
+}
+
 } /* namespace */
 
 /* get_relative_dist(): sign extended distance between two order hints. */
@@ -279,7 +292,7 @@ void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
     if (frame.refresh_frame_flags & (1 << i)) {
       RefSlot& slot = pool->slots[i];
       slot.valid = true;
-      slot.upscaled_width = frame.frame_width;
+      slot.upscaled_width = frame.upscaled_width;
       slot.width = frame.width;
       slot.height = frame.height;
       slot.render_width = frame.render_width;
@@ -404,6 +417,7 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
 
   seq.width_n_bits = static_cast<int>(r.read(4)) + 1;
   seq.height_n_bits = static_cast<int>(r.read(4)) + 1;
+  const size_t pos_max_frame_width = r.bits_read();
   seq.max_frame_width = static_cast<int>(r.read(seq.width_n_bits)) + 1;
   seq.max_frame_height = static_cast<int>(r.read(seq.height_n_bits)) + 1;
 
@@ -450,6 +464,7 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
     }
   }
 
+  const size_t pos_enable_superres = r.bits_read();
   seq.enable_superres = r.read_bit();
   seq.enable_cdef = r.read_bit();
   seq.enable_restoration = r.read_bit();
@@ -514,6 +529,13 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
   if (status != ParseStatus::Ok) return status;
 
   *out = seq;
+  if (hdrpos_enabled()) {
+    std::fprintf(stderr,
+                 "HDRPOS seq max_frame_width=%zu max_frame_height=%zu enable_superres=%zu "
+                 "width_bits=%d\n",
+                 pos_max_frame_width, pos_max_frame_width + static_cast<size_t>(seq.width_n_bits),
+                 pos_enable_superres, seq.width_n_bits);
+  }
   return ParseStatus::Ok;
 }
 
@@ -649,6 +671,10 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
 
   FrameHeader h;
   BitReader r(data, size);
+  /* Where the superres related fields sit, for AV1GPU_HDRPOS (see above). */
+  size_t pos_frame_size_width = SIZE_MAX;
+  size_t pos_use_superres = SIZE_MAX;
+  size_t pos_allow_intrabc = SIZE_MAX;
 
   if (!seq.reduced_still_picture_header) {
     h.show_existing_frame = r.read_bit();
@@ -685,9 +711,9 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
     h.showable_frame = true;
     h.width = slot.width;
     h.height = slot.height;
-    h.frame_width = slot.width;
-    h.render_width = slot.width;
-    h.render_height = slot.height;
+    h.upscaled_width = slot.upscaled_width > 0 ? slot.upscaled_width : slot.width;
+    h.render_width = slot.render_width > 0 ? slot.render_width : h.upscaled_width;
+    h.render_height = slot.render_height > 0 ? slot.render_height : slot.height;
     h.order_hint_present = seq.enable_order_hint;
     h.order_hint = slot.order_hint;
     *out = h;
@@ -905,7 +931,10 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
         return invalid("frame size taken from an empty reference slot", error);
       }
       h.size_from_reference = true;
-      h.frame_width = slot.upscaled_width;
+      /* found_ref copies the reference's *upscaled* width: a frame that takes
+       * its size from a reference takes the display size, and decides its own
+       * superres denom below */
+      h.upscaled_width = slot.upscaled_width > 0 ? slot.upscaled_width : slot.width;
       h.height = slot.height;
       h.render_width = slot.render_width;
       h.render_height = slot.render_height;
@@ -918,23 +947,30 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
      * reference without found_ref - a smaller reference does not make a frame
      * smaller. */
     if (h.frame_size_override) {
-      h.frame_width = static_cast<int>(r.read(seq.width_n_bits)) + 1;
+      pos_frame_size_width = r.bits_read();
+      h.upscaled_width = static_cast<int>(r.read(seq.width_n_bits)) + 1;
       h.height = static_cast<int>(r.read(seq.height_n_bits)) + 1;
     } else {
-      h.frame_width = seq.max_frame_width;
+      h.upscaled_width = seq.max_frame_width;
       h.height = seq.max_frame_height;
     }
   }
-  h.width = h.frame_width;
+  h.width = h.upscaled_width;
   /* superres_params() is read on both paths: a frame that took its size from a
    * reference still decides whether to scale that size down. */
+  /* the position is recorded even when the sequence has no superres: that is
+   * where a patched stream has to insert the field (see AV1GPU_HDRPOS) */
+  pos_use_superres = r.bits_read();
   if (seq.enable_superres) {
     h.superres = r.read_bit();
     if (h.superres) {
       h.superres_denominator = 9 + static_cast<int>(r.read(3));
       const int denominator = h.superres_denominator;
-      h.width = std::max((h.frame_width * 8 + (denominator >> 1)) / denominator,
-                         std::min(16, h.frame_width));
+      /* FrameWidth = max((UpscaledWidth * 8 + SuperresDenom / 2) / SuperresDenom,
+       *                 min(16, UpscaledWidth)): eight eighths of the display width
+       * per denominator eighth, never below 16 samples. */
+      h.width = std::max((h.upscaled_width * 8 + (denominator >> 1)) / denominator,
+                         std::min(16, h.upscaled_width));
     }
   }
   /* render_size() is not coded when the size came from a reference: the render
@@ -945,15 +981,19 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
       h.render_width = static_cast<int>(r.read(16)) + 1;
       h.render_height = static_cast<int>(r.read(16)) + 1;
     } else {
-      h.render_width = h.width;
+      /* with no render size coded the frame renders at its *display* size */
+      h.render_width = h.upscaled_width;
       h.render_height = h.height;
     }
   }
   /* allow_intrabc is only present on an intra frame: the specification reads
    * it inside `if (FrameIsIntra)`, and UpscaledWidth == FrameWidth rules out
    * superres. Reading it on an inter frame shifts every following field. */
+  pos_allow_intrabc = r.bits_read();
   if (key_or_intra && h.allow_screen_content_tools && !h.superres) {
     h.allow_intrabc = r.read_bit();
+  } else {
+    pos_allow_intrabc = SIZE_MAX;
   }
   /* allow_intrabc only says the *frame* may use intra block copy: the flag is
    * per block (use_intrabc), and an encoder sets it for the whole frame as soon
@@ -1274,6 +1314,9 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
     *out = h;
     return invalid("frame header runs past the end of the OBU", error);
   }
+  /* the last bit of the header proper, before the alignment padding: a patched
+   * stream has to know it to realign (see AV1GPU_HDRPOS) */
+  const size_t header_bits = r.bits_read();
   r.align_to_byte();
   h.tile_data_offset = r.bytes_read();
 
@@ -1285,13 +1328,18 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
   if (h.tiles.col_start_sb.back() != sbw || h.tiles.row_start_sb.back() != sbh) {
     return invalid("tile grid does not cover the frame", error);
   }
-  if (h.superres) {
-    *out = h;
-    return unsupported("superres (coded width below display width) is not implemented",
-                       error);
-  }
 
   *out = h;
+  if (hdrpos_enabled()) {
+    std::fprintf(stderr,
+                 "HDRPOS frame type=%d show=%d override=%d found=%d size_w=%zu "
+                 "use_superres=%zu intrabc=%zu header_bits=%zu tile_data_offset=%zu "
+                 "upscaled=%d coded=%d superres=%d denom=%d\n",
+                 static_cast<int>(h.type), h.show_frame ? 1 : 0, h.frame_size_override ? 1 : 0,
+                 h.size_from_reference ? 1 : 0, pos_frame_size_width, pos_use_superres,
+                 pos_allow_intrabc, header_bits, h.tile_data_offset,
+                 h.upscaled_width, h.width, h.superres ? 1 : 0, h.superres_denominator);
+  }
   return ParseStatus::Ok;
 }
 

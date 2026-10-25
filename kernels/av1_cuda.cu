@@ -106,6 +106,18 @@ extern "C" __global__ void av1g_k_cdef(const Av1gCdefJob *jobs, const int *joff,
   av1g_cdef_block(&job, src, dst, src, maxv);
 }
 
+/* Superres: one thread per output sample, from the coded picture into the
+ * upscaled one. */
+extern "C" __global__ void av1g_k_upscale(const Av1gUpscaleJob *jobs,
+                                          const int *joff, int njobs, int total,
+                                          const av1g_px *src, av1g_px *dst,
+                                          const int *filters, int maxv) {
+  AV1G_JOB_LOOKUP(job_idx, elem);
+  Av1gUpscaleJob job = jobs[job_idx];
+  av1g_upscale_px(&job, src, dst, filters, elem % job.upscaled_w,
+                  elem / job.upscaled_w, maxv);
+}
+
 extern "C" __global__ void av1g_k_grain(const Av1gGrainJob *jobs,
                                         const int *joff, int njobs, int total,
                                         av1g_px *dst, const signed char *grain,

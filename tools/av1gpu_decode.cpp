@@ -523,6 +523,9 @@ int main(int argc, char** argv) {
         reference_info.slot[i] = pool_slot[which];
         reference_info.width[i] = refs.slots[which].width;
         reference_info.height[i] = refs.slots[which].height;
+        reference_info.upscaled_width[i] = refs.slots[which].upscaled_width > 0
+                                               ? refs.slots[which].upscaled_width
+                                               : refs.slots[which].width;
       }
 
       FrameSyntax syntax;
@@ -604,7 +607,9 @@ int main(int argc, char** argv) {
         geom.bit_depth = syntax.bit_depth;
         geom.ss_x = syntax.ss_x;
         geom.ss_y = syntax.ss_y;
-        const internal::PlanLayout layout = plan_backend->prepare(geom);
+        const internal::PlanLayout layout =
+            plan_backend->prepare(geom, syntax.coded_width > 0 ? syntax.coded_width
+                                                              : syntax.width);
         if (!internal::build_frame_plan(syntax, layout, backend_options,
                                         plan_backend->reference_capacity(), &plan, &error)) {
           std::printf("frame %zu: plan: %s\n", index, error.c_str());
@@ -645,9 +650,15 @@ int main(int argc, char** argv) {
         ++plan_index;
       }
 
-      std::printf("frame %zu: %dx%d, %zu block(s), %d transform block(s), "
+      /* a superres frame is coded narrower than it is displayed, and the size
+       * an output frame has is the displayed one */
+      std::string geometry = std::to_string(frame.width) + "x" + std::to_string(frame.height);
+      if (frame.upscaled_width > 0 && frame.upscaled_width != frame.width)
+        geometry += " (displayed " + std::to_string(frame.upscaled_width) + "x" +
+                    std::to_string(frame.height) + ")";
+      std::printf("frame %zu: %s, %zu block(s), %d transform block(s), "
                   "%d wave(s), %.2f ms%s\n",
-                  index, frame.width, frame.height, syntax.blocks.size(),
+                  index, geometry.c_str(), syntax.blocks.size(),
                   decoded.transform_blocks, decoder->stats().waves,
                   decoder->stats().total_ms, frame.show_frame ? "" : " (not shown)");
       ++decoded_frames;

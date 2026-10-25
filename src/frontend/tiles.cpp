@@ -25,7 +25,7 @@ void tile_rect(const FrameHeader& frame, const SequenceHeader& seq, int col, int
   const int row_end = tiles.row_start_sb[static_cast<size_t>(row) + 1];
   extent->x = col_start * sb_size;
   extent->y = row_start * sb_size;
-  extent->w = std::min(frame.frame_width, col_end * sb_size) - extent->x;
+  extent->w = std::min(frame.width, col_end * sb_size) - extent->x;
   extent->h = std::min(frame.height, row_end * sb_size) - extent->y;
 }
 

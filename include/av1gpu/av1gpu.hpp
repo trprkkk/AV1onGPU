@@ -370,7 +370,12 @@ struct ColorSyntax {
 
 /* Everything the decoder needs to reconstruct one frame. */
 struct FrameSyntax {
+  /* The display size: what the frame decodes to and what an output frame holds.
+   * A superres frame codes its tiles at `coded_width`, which is narrower, and
+   * the upscaling process resamples the result to `width` before the output and
+   * before the picture goes into the reference pool. */
   int width = 0;
+  int coded_width = 0; /* 0: the frame is not superres, `width` is what it codes */
   int height = 0;
   int bit_depth = 8;
   int ss_x = 1;
@@ -383,6 +388,14 @@ struct FrameSyntax {
 
   /* Short term reference slots the inter blocks index into. */
   std::vector<int> reference_slots;
+  /* The display size of each reference type (indexed by RefFrameType - 1), as
+   * the reference pool has it stored. Reference scaling needs it: a superres
+   * frame is coded narrower than the references it predicts from, so a motion
+   * vector addresses a larger picture than the one being reconstructed. Zero
+   * means "the same size as this frame", which is what a stream without
+   * superres always has. */
+  int reference_width[7] = {0, 0, 0, 0, 0, 0, 0};
+  int reference_height[7] = {0, 0, 0, 0, 0, 0, 0};
 
   std::vector<BlockSyntax> blocks;
 

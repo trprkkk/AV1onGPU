@@ -32,12 +32,25 @@ struct FrameGeometry {
  * flat buffer (the three planes back to back), so every job carries a plain
  * sample offset and a backend needs a single allocation per frame. */
 struct PlanLayout {
+  /* The *coded* geometry: superres codes a frame narrower than it displays it,
+   * and every reconstruction job works on the narrow grid. */
   FrameGeometry frame;
-  int plane_w[3] = {0, 0, 0};  /* visible samples */
+  int plane_w[3] = {0, 0, 0};  /* visible coded samples */
   int plane_h[3] = {0, 0, 0};
+  /* The *display* geometry: what the upscaling process produces, and what the
+   * output frame and the reference pool hold. Equal to the coded size for a
+   * stream without superres. */
+  int out_width = 0;
+  int out_height = 0;
+  int out_w[3] = {0, 0, 0};
+  int out_h[3] = {0, 0, 0};
   int stride[3] = {0, 0, 0};   /* row pitch, including the edge padding */
   int plane_off[3] = {0, 0, 0};
   size_t buffer_size = 0;
+
+  /* True when the frame is coded narrower than it is displayed, i.e. when the
+   * upscaling process has to run before the output and the reference store. */
+  bool upscaled() const { return out_width != plane_w[0]; }
 };
 
 /* Edge padding, in luma samples.
@@ -59,8 +72,13 @@ constexpr int kPlanePadding = 64;
 
 /* Builds the plane layout the backends share: visible sample counts, padded
  * strides and plane offsets into one flat sample buffer. `stride_align` is the
- * row alignment the backend wants (32 for the CPU, 64 for the GPU ones). */
-PlanLayout make_plan_layout(const FrameGeometry& geometry, int stride_align);
+ * row alignment the backend wants (32 for the CPU, 64 for the GPU ones).
+ *
+ * `geometry` is the *display* geometry; `coded_width` is the width the tile
+ * data codes, which a superres frame codes narrower than it displays. The
+ * buffer is sized for the display geometry, so one allocation holds the coded
+ * picture and the upscaled one - the upscaler needs both. */
+PlanLayout make_plan_layout(const FrameGeometry& geometry, int coded_width, int stride_align);
 
 /* All work of one dependency level. Within a wave no block reads another
  * block's reconstructed samples, so the jobs can run in any order or in
@@ -104,6 +122,10 @@ struct FramePlan {
   std::vector<Av1gDeblockJob> deblock_v;
   std::vector<Av1gDeblockJob> deblock_h;
   std::vector<Av1gCdefJob> cdef;
+  /* Superres: the rows of each plane resampled from the coded width to the
+   * display width. Runs on the CDEF output and before the film grain, which is
+   * why the grain jobs below are built on the display geometry. */
+  std::vector<Av1gUpscaleJob> upscale;
   std::vector<Av1gGrainJob> grain;
 
   /* Film grain template (host generated, uploaded once per frame). */
@@ -122,7 +144,9 @@ class Backend {
 
   /* Allocates (or reuses) the working buffers for a geometry and reports the
    * layout that job offsets must be built against. */
-  virtual PlanLayout prepare(const FrameGeometry& geometry) = 0;
+  /* `geometry` is the display geometry; `coded_width` the width the tiles
+   * code, which is smaller for a superres frame. */
+  virtual PlanLayout prepare(const FrameGeometry& geometry, int coded_width) = 0;
 
   /* Uploads a host frame into the reference pool; returns the slot id. */
   virtual int upload_reference(const Frame& frame, std::string* error) = 0;

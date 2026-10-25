@@ -124,15 +124,19 @@ three layers, all of them runnable on a machine with no GPU driver:
    OpenCL compiler (pocl) and checks one job of every kernel.
 3. `tests/opencl_pipeline.py` — `av1gpu_dump` writes the real decode plans of a
    clip, the test replays *every* job of *every* wave through the real kernels in
-   backend order (waves, deblock vertical, deblock horizontal, CDEF, grain) and
-   compares whole frames against the CPU reference decode. Four frames, intra
+   backend order (waves, deblock vertical, deblock horizontal, CDEF, upscale,
+   grain) and compares whole frames against the CPU reference decode. Four frames, intra
    and inter, all filters on: **bit identical**. With `--input` the plans come
    from `av1gpu_decode --dump-plans` for a real stream instead, so the reference
    pool slots are the decoder's own: `lw_t2` and `lw_t3` (local warped motion and
    OBMC, 30 frames each), `palette_sc` (102 palette blocks, 10 frames),
-   `inter_intra` (23 inter/intra compound blocks, 110 frames) and
+   `inter_intra` (23 inter/intra compound blocks, 110 frames), `seg_altq`
+   (two quantiser classes), `superres` (320 columns coded, 480 displayed) and
    `svt_av1_320x240` (a different encoder, 6 frames) are all **bit identical**
-   too.
+   too. `superres` is the one where the replay needs the plan to carry the
+   display geometry as well as the coded one: the upscale job reads the coded
+   frame and writes the displayed one, so the test snapshots the former before
+   the job runs.
 
    The replay sizes every buffer from the plan, and it checks the plan before it
    starts: each inverse transform job needs `w * h` ints of scratch at its
@@ -634,6 +638,86 @@ disabled feature is ignored. Returning 0 from `read_segment_id_symbol` while
 still reading the symbol - so that every frame parses to the end of its tile -
 decodes only 2 of `seg_altq`'s 30 frames to the recorded pixels (the two before
 segmentation turns on): a pixel error no entropy check would see.
+
+## Superres
+
+A superres frame is coded narrower than it is displayed. `frame_size()` codes
+`use_superres` and a three bit `coded_denom` when the sequence allows it, and the
+coded width is then derived rather than coded:
+`FrameWidth = max((UpscaledWidth * 8 + SuperresDenom / 2) / SuperresDenom, min(16, UpscaledWidth))`
+(5.9.5, `SuperresDenom = coded_denom + 9`). Everything the tiles touch - `MiCols`,
+the superblock grid, the loop filters - is in that coded width, and only the
+output is 1.5x wider.
+
+**Header.** One bit is not where it looks. `allow_intrabc` is only coded when
+`UpscaledWidth == FrameWidth` (5.9.2), so a superres frame has no such field; a
+parser that reads one shifts the rest of the header by a bit and desynchronises
+the range coder at the first tile byte. Superres used to be refused by name here,
+which hid that. Two more bits depend on the decision: a reference frame whose
+stored width differs from this frame's is *scaled* (5.9.2 `is_scaled`), and for a
+scaled reference the tile syntax codes `use_obmc` in place of the `motion_mode`
+symbol and global warped motion is disallowed (7.11.9, 7.11.10) - both of which
+the reference pool already carried once `RefUpscaledWidth` was added to it.
+
+**Upscale (7.16).** Horizontal only, after CDEF and before loop restoration, with
+an eight tap filter from `Upscale_Filter[64][8]` - the same table as dav1d's
+`dav1d_resize_filter` with the encoder's sign convention flipped back. Per
+plane:
+
+```
+stepX = ((downscaled << 14) + upscaled / 2) / upscaled
+initialSubpelX = (-((upscaled - downscaled) << 13) + upscaled / 2) / upscaled
+                 + 128 - err / 2        (err = upscaled * stepX - (downscaled << 14))
+srcX(x) = -16384 + (initialSubpelX & 16383) + x * stepX
+```
+
+and the output sample is `Round2(sum of tap[t] * Clip3(0, src_w - 1, (srcX >> 10) + t - 3), 7)`.
+The `& 16383` is not cosmetic: the negative start is what makes the first output
+columns read the pixels before the corresponding coded column. For 320 -> 480
+(`SuperresDenom` 12) the numbers are `stepX = 10923` and `initialSubpelX = 13702`,
+and the kernel reproduces dav1d's luma plane exactly, sample for sample.
+`src_w` in that clip is the *coded* width: the filter is clipped to the picture
+it reads, not to the picture it writes.
+
+**Scaled reference prediction (7.11.3.2).** A reference stored 1.5x wider is
+predicted from with a per sample step, not with a single motion vector offset:
+
+```
+xScale  = ((RefUpscaledWidth << 14) + (FrameWidth >> 1)) / FrameWidth
+originX = (base_x << 4) + ((2 * mvx) >> subX) + 8
+baseX   = originX * xScale - (8 << 14)
+startX  = Round2Signed(baseX, 14 + 4 - 10) + 32
+stepX   = Round2Signed(xScale, 14 - 10)
+px(x)   = startX + stepX * x          (1/1024 of a reference sample)
+```
+
+and the same for the vertical axis; the horizontal phase `px` selects the row of
+the eight tap filter and the integer part the eight samples it reads, clipped to
+the reference, with `Round2(sum, 3)` between the passes and `Round2(sum, 11)` at
+the end (the same rounding the unscaled path uses). `AV1G_REF_SCALE_SHIFT` is the
+14 bit scale fraction, `AV1G_SCALE_SUBPEL_BITS` the 10 bit subpel position.
+
+Two things here are easy to get wrong, and both were:
+
+* The subpel origin is the *patch* origin plus the vector; a sample adds
+  `stepX * x` to it. Building it as `(base_x + x) << 4` - the unscaled
+  behaviour, with the sample index baked into the origin - is right only when
+  `stepX` is exactly 1024. That one made every superres frame differ from dav1d
+  in about 115,000 samples while the same kernel passed every unscaled stream.
+* The half sample offset that goes with a scaled accumulation is
+  `AV1G_SCALE_SUBPEL_OFF` = 32, not the unscaled path's 16. With both in place
+  the kernel agrees with a line by line transcription of the 7.11.3.2 pseudocode
+  over 128 taps, including the clipping at both edges (`mismatches 0 of 128`).
+
+**What is verified.** `tests/data/superres.ivf` is a 30 frame stream relabelled
+to 320 coded / 480 displayed (see `tests/data/README.md` - no encoder here can
+signal superres, so the headers are patched). Every frame is bit exact against
+dav1d, both through the CPU backend (`stream_superres`) and through the OpenCL
+kernels (`opencl_superres`), and the reference frames it predicts from are the
+upscaled ones that were stored. The plan format carries both geometries (`v4`
+added `out_width`/`out_height` and the per plane display sizes next to the coded
+ones, plus the upscale jobs), which is what lets the replay check the displayed
+picture rather than the coded one.
 
 ## Measured quality (synthetic clip, 640×360, CPU reference backend)
 

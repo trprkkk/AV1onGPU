@@ -43,7 +43,8 @@ sys.path.insert(0, HERE)
 import opencl_selftest as selftest  # noqa: E402  (probe, kernel source, helpers)
 
 MAGIC = b"AV1GPLAN"
-FORMAT_VERSION = 3       # 2 added the palette map, 3 the itx scratch size
+FORMAT_VERSION = 4       # 2 the palette map, 3 the itx scratch size,
+                         # 4 the display geometry and the upscale jobs
 REFERENCE_SLOTS = 9      # kReferenceSlots in the backends
 CDEF_DIM = 8             # AV1G_CDEF_DIM
 MASK_DIFFWTD = 2         # AV1G_MASK_DIFFWTD
@@ -108,6 +109,13 @@ def read_plan(path, layouts):
     plan["plane_h"] = r.ints(3)
     plan["stride"] = r.ints(3)
     plan["plane_off"] = r.ints(3)
+    # a superres frame is coded narrower than it is displayed: the reconstruction
+    # and the loop filters work on the coded size, the upscale jobs, the film
+    # grain and the output on the displayed one
+    plan["out_width"] = r.i32()
+    plan["out_height"] = r.i32()
+    plan["out_w"] = r.ints(3)
+    plan["out_h"] = r.ints(3)
     plan["buffer_size"] = r.i64()
     # the inverse transform scratch arena: Av1gItxJob::tmp_off indexes it and a
     # job needs w * h ints, which is more than its coefficient area
@@ -130,7 +138,8 @@ def read_plan(path, layouts):
                                r.i32())
         plan["waves"].append(wave)
     for key, name in (("deblock_v", "DeblockJob"), ("deblock_h", "DeblockJob"),
-                      ("cdef", "CdefJob"), ("grain", "GrainJob")):
+                      ("cdef", "CdefJob"), ("upscale", "UpscaleJob"),
+                      ("grain", "GrainJob")):
         plan[key] = r.jobs(layouts["Av1g" + name], r.i32())
 
     plan["coefficients"] = r.ints(plan["coef_count"])
@@ -360,6 +369,20 @@ class Replay:
                         (job_buf, pref, np.int32(len(jobs)), np.int32(total), snapshot,
                          frame, np.int32(maxv)))
 
+        # ---- superres: the coded picture resampled to the display width ----
+        # The kernel reads one buffer and writes the other: a row's output is a
+        # filtered window of samples a few columns ahead of where it writes, so
+        # the coded picture is snapshotted first - the same reason CDEF copies.
+        if plan["upscale"]:
+            jobs = plan["upscale"]
+            job_buf, pref, total = self.jobs(
+                jobs, [j.rows * j.upscaled_w for j in jobs])
+            snapshot = self.buffer(np.zeros(size, dtype=np.uint16), readonly=False)
+            cl.enqueue_copy(self.queue, snapshot, frame)
+            self.launch("av1g_k_upscale", total,
+                        (job_buf, pref, np.int32(len(jobs)), np.int32(total), snapshot,
+                         frame, filter_buf, np.int32(maxv)))
+
         # ---- film grain ----------------------------------------------------
         if plan["grain"]:
             jobs = plan["grain"]
@@ -387,8 +410,10 @@ def compare(plan, decoded, expected, index):
     pos = 0
     worst = 0
     parts = []
+    # the output frame is the *displayed* one: a superres frame's planes are as
+    # wide as the upscaled picture, even though the tiles coded less
     for p in range(3):
-        w, h, stride, off = (plan["plane_w"][p], plan["plane_h"][p],
+        w, h, stride, off = (plan["out_w"][p], plan["out_h"][p],
                              plan["stride"][p], plan["plane_off"][p])
         got = decoded[off:off + stride * h].reshape(h, stride)[:, :w].reshape(-1)
         want = expected[pos:pos + w * h]
@@ -400,7 +425,7 @@ def compare(plan, decoded, expected, index):
                          (p, bad, delta.size, int(delta.max())))
         diff_total += bad
         worst = max(worst, int(delta.max()) if bad else 0)
-    total = int(sum(plan["plane_w"][p] * plan["plane_h"][p] for p in range(3)))
+    total = int(sum(plan["out_w"][p] * plan["out_h"][p] for p in range(3)))
     if diff_total == 0:
         print("frame %d: %d samples, exact" % (index, total))
         return []

@@ -60,11 +60,11 @@ inline bool plan_cdef(const SequenceHeader& seq, const FrameHeader& frame,
   }
   if (!any) return true;
 
-  const int mi_cols = (frame.frame_width + 3) >> 2;
+  const int mi_cols = (frame.width + 3) >> 2;
   const int mi_rows = (frame.height + 3) >> 2;
   const int ss_x = seq.ss_x, ss_y = seq.ss_y;
   const int planes = seq.monochrome ? 1 : 3;
-  const int width = frame.frame_width, height = frame.height;
+  const int width = frame.width, height = frame.height;
 
   /* Skips per 4x4 cell, which is what the block process looks at. */
   std::vector<uint8_t> skip(static_cast<size_t>(mi_cols) * mi_rows, 0);

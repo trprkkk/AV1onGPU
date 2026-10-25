@@ -103,13 +103,23 @@ void Frame::allocate(int w, int h, int bd, int sx, int sy) {
 
 namespace internal {
 
-PlanLayout make_plan_layout(const FrameGeometry& geometry, int stride_align) {
+PlanLayout make_plan_layout(const FrameGeometry& geometry, int coded_width, int stride_align) {
   PlanLayout g;
   g.frame = geometry;
-  g.plane_w[0] = geometry.width;
-  g.plane_h[0] = geometry.height;
-  g.plane_w[1] = g.plane_w[2] =
+  if (coded_width <= 0 || coded_width > geometry.width) coded_width = geometry.width;
+  /* the display geometry, which the output frame and the reference pool use */
+  g.out_width = geometry.width;
+  g.out_height = geometry.height;
+  g.out_w[0] = geometry.width;
+  g.out_h[0] = geometry.height;
+  g.out_w[1] = g.out_w[2] =
       (geometry.width + (1 << geometry.ss_x) - 1) >> geometry.ss_x;
+  g.out_h[1] = g.out_h[2] =
+      (geometry.height + (1 << geometry.ss_y) - 1) >> geometry.ss_y;
+  /* the coded geometry: what the tiles code and the reconstruction produces */
+  g.plane_w[0] = coded_width;
+  g.plane_h[0] = geometry.height;
+  g.plane_w[1] = g.plane_w[2] = (coded_width + (1 << geometry.ss_x) - 1) >> geometry.ss_x;
   g.plane_h[1] = g.plane_h[2] =
       (geometry.height + (1 << geometry.ss_y) - 1) >> geometry.ss_y;
   size_t size = 0;
@@ -119,12 +129,15 @@ PlanLayout make_plan_layout(const FrameGeometry& geometry, int stride_align) {
      * room relative to its own samples. */
     const int pad = (p == 0) ? kPlanePadding
                              : (kPlanePadding >> (geometry.ss_x ? 1 : 0));
-    const int pitch = g.plane_w[p] + pad;
+    /* The stride follows the *display* width: the buffer holds the coded
+     * picture and then the upscaled one, and both have to address their rows
+     * the way a job does. */
+    const int pitch = g.out_w[p] + pad;
     g.stride[p] = (pitch + stride_align - 1) & ~(stride_align - 1);
     g.plane_off[p] = static_cast<int>(size);
     /* Rows below the picture are padding as well: the flat buffer simply holds
      * them, and nothing reads them back. */
-    size += static_cast<size_t>(g.stride[p]) * (g.plane_h[p] + pad);
+    size += static_cast<size_t>(g.stride[p]) * (g.out_h[p] + pad);
   }
   g.buffer_size = size;
   return g;

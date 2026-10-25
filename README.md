@@ -140,8 +140,8 @@ pool is also what reference frame ids are checked against, and what
 `frame_refs_short_signaling` derives the five uncoded references from
 (`set_frame_refs()`, 7.8): see `docs/ACCURACY.md`.
 
-What is *refused with a message* instead of being misparsed: superres,
-restoration filters and film grain data.
+What is *refused with a message* instead of being misparsed: restoration
+filters and film grain data.
 
 The tile payload is coded with AV1's boolean range decoder, which
 `src/frontend/range_decoder.hpp` implements: adaptive Q15 symbol CDFs, boolean
@@ -276,9 +276,10 @@ coded blocks (`tests/data/palette_sc.ivf`), inter/intra compound
 (`tests/data/inter_intra.ivf`), intra block copy (`tests/data/intrabc.ivf`) and
 skip mode, which the `lw_t2`/`lw_t3`/`inter_intra` fixtures code thousands of
 times, and segmentation (`tests/data/seg_altq.ivf`, a different quantiser per
-segment). Superres is refused by name; film grain uses a synthetic template
-instead of the specification's synthesis filter (see `docs/ROADMAP.md`, sections
-3 and 4).
+segment) and superres, where a frame is coded narrower than it is displayed and
+upscaled after CDEF (`tests/data/superres.ivf`). Film grain uses a synthetic
+template instead of the specification's synthesis filter (see `docs/ROADMAP.md`,
+section 4).
 `av1gpu::synthetic_encode` is a small closed loop test encoder that produces
 valid syntax from a generated clip and does not need any of those.
 

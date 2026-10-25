@@ -21,9 +21,8 @@ through `found_ref` (`frame_size_with_refs`) and skip mode are derived, not
 guessed. That pool carries each slot's order hint and
 frame id, which is what `frame_refs_short_signaling` (7.8) and the frame id
 checks of 5.9.2 - including `mark_ref_frames` and the order hints an error
-resilient frame re-states - work on. Features that are not implemented (superres,
-restoration, film grain data) are reported with a message instead of being
-misparsed.
+resilient frame re-states - work on. Features that are not implemented (restoration,
+film grain data) are reported with a message instead of being misparsed.
 `av1gpu_probe` shows what it found in a real file, and
 `tests/data/svt_av1_320x240.ivf` keeps the parser honest against bytes from a
 real encoder.
@@ -285,9 +284,14 @@ schedule has to wait for a rectangle of samples rather than for the neighbouring
 edges: the block's vector is clipped to the part of the tile that already exists
 (7.11.5), and the scheduler turns that rectangle into wave dependencies.
 
-Of the tools AV1 defines, what is left is superres - refused by name rather
-than misparsed - plus a film grain synthesis filter (section 4). Every inter and
-intra prediction tool decodes bit exactly, and so does segmentation, which is
+Superres is done too: a frame that is coded narrower than it is displayed
+reconstructs and filters at the coded width, is upscaled after CDEF (7.16), and
+is stored as a reference at the displayed width, so the frames after it predict
+from it with the per sample step of 7.11.3.2 (`tests/data/superres.ivf`,
+bit exact against dav1d through both backends - see `docs/ACCURACY.md`). Of the
+tools AV1 defines, what is left is a film grain synthesis filter (section 4).
+Every inter and intra prediction tool decodes bit exactly, and so does
+segmentation, which is
 not a prediction tool but a per block quantiser and loop filter override with
 three forced decisions attached (`tests/data/seg_altq.ivf`, see
 `docs/ACCURACY.md`). The reference machinery is complete: short signalling,

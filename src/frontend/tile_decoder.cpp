@@ -340,7 +340,7 @@ class TileParser {
   const std::vector<int8_t>& cdef_index() const { return cdef_idx_; }
 
  private:
-  int mi_cols() const { return (frame_.frame_width + 3) >> 2; }
+  int mi_cols() const { return (frame_.width + 3) >> 2; }
   int mi_rows() const { return (frame_.height + 3) >> 2; }
   int index(int row, int col) const { return row * mi_cols() + col; }
 
@@ -762,7 +762,7 @@ class TileParser {
    * (`mfmv_ref2ref_`). `pocdiff_` is this frame's distance to each of its own
    * seven references, which is the numerator of every projection. */
   void setup_temporal_mvs() {
-    const int iw8 = (frame_.frame_width + 7) >> 3;
+    const int iw8 = (frame_.width + 7) >> 3;
     const int ih8 = (frame_.height + 7) >> 3;
     proj_cols_ = iw8;
     proj_.assign(static_cast<size_t>(iw8) * ih8, TemporalMv());
@@ -1037,7 +1037,7 @@ class TileParser {
    * later frame) and that is small enough to be a real prediction rather than a
    * scroll; the whole width of the block is filled with the same record. */
   void save_temporal_mvs(RefMvs* out) const {
-    const int iw8 = (frame_.frame_width + 7) >> 3;
+    const int iw8 = (frame_.width + 7) >> 3;
     const int ih8 = (frame_.height + 7) >> 3;
     out->resize(iw8, ih8);
     for (int y = 0; y < ih8; ++y) {
@@ -2612,8 +2612,32 @@ class TileParser {
       uint64_t masks[2] = {0, 0};
       find_matching_ref(row, col, bw4, bh4, std::min(bw4, 16), std::min(bh4, 16), left_avail,
                         top_avail, ref0, masks);
+      /* is_scaled( RefFrame[0] ): a reference of a different size is not
+       * warped, and the block codes the plain use_obmc symbol instead of a
+       * motion mode - which is a different number of symbols, so it has to be
+       * decided the way the specification decides it (7.11.3.8). A superres
+       * stream always has scaled references: they are stored upscaled while the
+       * frame being decoded is coded narrow. */
+      bool ref_scaled = false;
+      if (refs_ && ref0 >= 0 && ref0 < kRefFrameTypeCount) {
+        const int slot_index = frame_.ref_frame_idx[ref0 - 1];
+        if (slot_index >= 0 && slot_index < 8) {
+          const RefSlot& slot = refs_->slots[slot_index];
+          if (slot.valid) {
+            /* the specification compares xScale and yScale against 1 << 14,
+             * and xScale is the reference's *upscaled* width over this frame's
+             * coded width - so a superres frame always reads a scaled
+             * reference, even when the two pictures are displayed at the same
+             * size */
+            const int upscaled_w = slot.upscaled_width > 0 ? slot.upscaled_width : slot.width;
+            const int scaled_x = ((upscaled_w << 14) + (frame_.width / 2)) / frame_.width;
+            const int scaled_y = ((slot.height << 14) + (frame_.height / 2)) / frame_.height;
+            ref_scaled = scaled_x != (1 << 14) || scaled_y != (1 << 14);
+          }
+        }
+      }
       const bool allow_warp = !frame_.force_integer_mv && frame_.allow_warped_motion &&
-                              (masks[0] | masks[1]);
+                              !ref_scaled && (masks[0] | masks[1]);
       if (trace_enabled()) {
         const RangeDecoder::State mm_state = decoder_.state();
         std::fprintf(stderr, "MM %d %d bs=%d bw4=%d bh4=%d warp=%d mask=%llx,%llx obmc_cdf=%u,%u dif=%llu rng=%u cnt=%d\n", col,

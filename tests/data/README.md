@@ -207,6 +207,38 @@ for f in range(N):
 open('seg_src.yuv', 'wb').write(bytes(out))
 ```
 
+`superres.ivf` is the superres fixture: 30 frames, 320 columns coded and 480
+displayed (1.5x), 30 KB. No encoder reachable from here signals superres -
+ffmpeg's `libaom-av1` wrapper does not pass `superres-mode` through and the aom
+sources are not downloadable in this sandbox - so the fixture is an ordinary
+stream whose *headers* are patched: the sequence header is told the picture is
+displayed wider than it is coded and that superres is allowed, and every frame
+header gains the four bits of `superres_params()` (`use_superres` plus the three
+bit denominator) that then say 480/12. Nothing else changes, and the result is a
+valid stream because the coded width the base encoder chose is exactly the
+`FrameWidth` that `UpscaledWidth = 480` and `SuperresDenom = 12` work out to:
+`FrameWidth = (UpscaledWidth * 8 + SuperresDenom / 2) / SuperresDenom = 320`.
+
+One field is *dropped* rather than added. `allow_intrabc` is only coded when
+`UpscaledWidth == FrameWidth`, so a frame that uses superres has no such bit: a
+decoder that reads one consumes the first bit of the next field instead and the
+header ends up in the wrong place. `make_superres.py` deletes it and realigns
+the patched header to the byte boundary the tile data starts on.
+
+```
+python3 tests/data/make_superres.py plain.ivf superres.ivf --width 480
+```
+
+The base is any 30 frame 320x240 stream (this one is an encode of the
+`seg_altq` clip below); the script reads the field positions out of
+`av1gpu_probe`'s `AV1GPU_HDRPOS` trace instead of keeping a second copy of the
+header syntax, so it stays right when the parser changes. `superres.hash` holds
+the per frame hashes of *this* copy and `stream_superres` checks them, while
+`opencl_superres` replays the same frames through the device kernels. Every frame
+is bit exact against dav1d, and the decode is a real superres decode: the tiles
+reconstruct 320 columns, CDEF runs on those, and the upscale kernel then produces
+the 480 column picture (see `docs/ACCURACY.md`).
+
 `svt_av1_320x240.ivf` is a real AV1 stream, not a hand written header: six frames
 of a 320x240 gradient at 8 bit 4:2:0, encoded with SVT-AV1 (crf 40, preset 10)
 and muxed into IVF. The front-end tests parse it end to end, so the parser is

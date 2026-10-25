@@ -119,6 +119,20 @@ __kernel void av1g_k_grain(__global const Av1gGrainJob *jobs,
   av1g_grain_px(&job, dst, grain, lut, elem % job.w, elem / job.w, maxv);
 }
 
+/* Superres: one work item per output sample. The source and the target are two
+ * different buffers (the coded picture and the upscaled one), so every sample
+ * can be resampled independently. */
+__kernel void av1g_k_upscale(__global const Av1gUpscaleJob *jobs,
+                             __global const int *joff, int njobs, int total,
+                             __global const av1g_px *src,
+                             __global av1g_px *dst,
+                             __global const int *filters, int maxv) {
+  AV1G_JOB_LOOKUP(job_idx, elem);
+  Av1gUpscaleJob job = jobs[job_idx];
+  av1g_upscale_px(&job, src, dst, filters, elem % job.upscaled_w,
+                  elem / job.upscaled_w, maxv);
+}
+
 /* ------------------------------------------------------------------- output */
 __kernel void av1g_k_color(__global const Av1gColorJob *jobs,
                            __global const int *joff, int njobs, int total,

@@ -48,8 +48,9 @@ inline bool write_plan(const std::string& path, const av1gpu::internal::FramePla
   const av1gpu::internal::PlanLayout& g = plan.layout;
 
   const char magic[8] = {'A', 'V', '1', 'G', 'P', 'L', 'A', 'N'};
-  /* 3: tmp_size joins the header, 2 added the palette colour map */
-  const int32_t version = 3;
+  /* 4: the display geometry and the upscale jobs join, 3 added tmp_size, 2 the
+   * palette colour map */
+  const int32_t version = 4;
   const int32_t geom[5] = {g.frame.width, g.frame.height, g.frame.bit_depth,
                            g.frame.ss_x, g.frame.ss_y};
   bool ok = write_all(file, magic, sizeof(magic)) &&
@@ -60,7 +61,14 @@ inline bool write_plan(const std::string& path, const av1gpu::internal::FramePla
             write_all(file, g.plane_w, sizeof(g.plane_w)) &&
             write_all(file, g.plane_h, sizeof(g.plane_h)) &&
             write_all(file, g.stride, sizeof(g.stride)) &&
-            write_all(file, g.plane_off, sizeof(g.plane_off));
+            write_all(file, g.plane_off, sizeof(g.plane_off)) &&
+            /* the display geometry: a superres frame is coded narrower than it
+             * is displayed, and the output frame and the reference pool hold the
+             * displayed one, so a replay has to know both sizes */
+            write_all(file, &g.out_width, sizeof(g.out_width)) &&
+            write_all(file, &g.out_height, sizeof(g.out_height)) &&
+            write_all(file, g.out_w, sizeof(g.out_w)) &&
+            write_all(file, g.out_h, sizeof(g.out_h));
   const int64_t buffer_size = static_cast<int64_t>(g.buffer_size);
   /* the inverse transform scratch buffer is indexed by Av1gItxJob::tmp_off and
    * a job needs w * h ints there, which is more than its coefficient area, so
@@ -87,7 +95,8 @@ inline bool write_plan(const std::string& path, const av1gpu::internal::FramePla
          write_vector(file, wave.itx) && write_vector(file, wave.residual);
   }
   ok = ok && write_vector(file, plan.deblock_v) && write_vector(file, plan.deblock_h) &&
-       write_vector(file, plan.cdef) && write_vector(file, plan.grain);
+       write_vector(file, plan.cdef) && write_vector(file, plan.upscale) &&
+       write_vector(file, plan.grain);
 
   if (ok && !plan.coefficients.empty())
     ok = write_all(file, plan.coefficients.data(),

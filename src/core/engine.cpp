@@ -85,7 +85,8 @@ class EngineDecoder final : public av1gpu::Decoder {
     }
 
     FramePlan plan;
-    if (!build_frame_plan(syntax, backend_->prepare(geom), options_,
+    const int coded_width = syntax.coded_width > 0 ? syntax.coded_width : syntax.width;
+    if (!build_frame_plan(syntax, backend_->prepare(geom, coded_width), options_,
                           backend_->reference_capacity(), &plan, error))
       return -1;
 
@@ -137,6 +138,12 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     plan->layout = layout;
     const PlanLayout& g = plan->layout;
     plan->maxv = (1 << geom.bit_depth) - 1;
+    /* The tile data codes the *coded* size; the display size the layout was
+     * built from is what the upscaling process produces. Everything below that
+     * clamps to the frame edge clamps to the coded size, because that is the
+     * picture a block is predicted in. */
+    const int frame_w = g.plane_w[0];
+    const int frame_h = g.plane_h[0];
 
     auto at = [&](int plane, int x, int y) {
       return g.plane_off[plane] + y * g.stride[plane] + x;
@@ -313,6 +320,27 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     }
     plan->waves.assign(static_cast<size_t>(max_wave) + 1, WaveJobs());
 
+    /* ---- reference scaling ------------------------------------------------ */
+    /* A superres frame is coded narrower than the pictures it predicts from, so
+     * a motion vector addresses a *larger* reference frame: 7.11.3.3 scales the
+     * sampling position by RefUpscaledWidth / FrameWidth. The references all
+     * have to be the same display size as this frame for one pair of scales to
+     * serve the whole frame, which is the geometry this decoder supports (a
+     * stream that changes its picture size mid-stream already needs the pool
+     * to hold mixed sizes, which it does not). */
+    int scale_x = AV1G_SCALE_ONE, scale_y = AV1G_SCALE_ONE;
+    for (int i = 0; i < 7; ++i) {
+      const int rw = syntax.reference_width[i] > 0 ? syntax.reference_width[i] : syntax.width;
+      const int rh = syntax.reference_height[i] > 0 ? syntax.reference_height[i] : syntax.height;
+      if (rw == syntax.width && rh == syntax.height) continue;
+      *error = "engine: reference scaling between pictures of different sizes is not supported";
+      return false;
+    }
+    if (g.upscaled()) {
+      scale_x = ((syntax.width << AV1G_REF_SCALE_SHIFT) + (frame_w / 2)) / frame_w;
+      scale_y = ((syntax.height << AV1G_REF_SCALE_SHIFT) + (frame_h / 2)) / frame_h;
+    }
+
     /* ---- jobs ------------------------------------------------------------- */
     /* The transform scratch is handed out in job order, one w * h block per
      * job. Two jobs never share a region, so the passes of a wave stay
@@ -361,8 +389,8 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.ss_y = geom.ss_y;
         /* maxX/maxY are derived from the frame size rounded up to a multiple
          * of 8 (MiCols * MI_SIZE), not from the visible size. */
-        job.max_x = (((geom.width + 7) & ~7) >> (plane ? geom.ss_x : 0)) - 1;
-        job.max_y = (((geom.height + 7) & ~7) >> (plane ? geom.ss_y : 0)) - 1;
+        job.max_x = (((frame_w + 7) & ~7) >> (plane ? geom.ss_x : 0)) - 1;
+        job.max_y = (((frame_h + 7) & ~7) >> (plane ? geom.ss_y : 0)) - 1;
         if (b.use_palette) {
           job.palette = 1;
           job.palette_size = b.palette_size;
@@ -380,8 +408,12 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.h = b.h;
         job.ref_x = b.x; /* patch origin, in plane samples */
         job.ref_y = b.y;
-        job.ref_w = g.plane_w[plane];
-        job.ref_h = g.plane_h[plane];
+        /* The reference pool holds the *upscaled* picture, so a prediction
+         * clamps to the display size even when this frame is coded narrower. */
+        job.ref_w = g.out_w[plane];
+        job.ref_h = g.out_h[plane];
+        job.scale_x = scale_x;
+        job.scale_y = scale_y;
         if (b.intrabc) {
           /* 7.11.4 step 11: a block copy's "reference frame" is the picture
            * being decoded, sized MiCols * MI_SIZE - the 4x4 grid rounded up,
@@ -389,8 +421,11 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
            * multiple of four. The plane padding covers the difference. */
           const int sub_x = plane > 0 && geom.ss_x ? 1 : 0;
           const int sub_y = plane > 0 && geom.ss_y ? 1 : 0;
-          job.ref_w = ((geom.width + 3) & ~3) >> sub_x;
-          job.ref_h = ((geom.height + 3) & ~3) >> sub_y;
+          job.ref_w = ((frame_w + 3) & ~3) >> sub_x;
+          job.ref_h = ((frame_h + 3) & ~3) >> sub_y;
+          /* a block copy reads this frame, which is coded, not upscaled */
+          job.scale_x = AV1G_SCALE_ONE;
+          job.scale_y = AV1G_SCALE_ONE;
         }
         job.border = 0;
         job.mv0_x = b.mv[0][0];
@@ -434,8 +469,8 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
             job.luma_stride = g.stride[0];
             job.luma_x = b.x << geom.ss_x;
             job.luma_y = b.y << geom.ss_y;
-            job.luma_ref_w = g.plane_w[0];
-            job.luma_ref_h = g.plane_h[0];
+            job.luma_ref_w = g.out_w[0];
+            job.luma_ref_h = g.out_h[0];
           }
         }
         /* Inter/intra compound (7.11.4). The intra half is predicted from the
@@ -447,8 +482,8 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.interintra_mode = b.interintra_mode;
         job.have_left = b.have_left && b.x > 0;
         job.have_above = b.have_above && b.y > 0;
-        job.max_x = (((geom.width + 7) & ~7) >> (plane ? geom.ss_x : 0)) - 1;
-        job.max_y = (((geom.height + 7) & ~7) >> (plane ? geom.ss_y : 0)) - 1;
+        job.max_x = (((frame_w + 7) & ~7) >> (plane ? geom.ss_x : 0)) - 1;
+        job.max_y = (((frame_h + 7) & ~7) >> (plane ? geom.ss_y : 0)) - 1;
         if (b.interintra && b.interintra_wedge) {
           const int luma_w = b.w << (plane > 0 ? geom.ss_x : 0);
           const int luma_h = b.h << (plane > 0 ? geom.ss_y : 0);
@@ -597,6 +632,39 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
       plan->cdef.push_back(job);
     }
 
+    /* ---- superres ---------------------------------------------------------- */
+    /* The upscaling process (7.15) runs on the CDEF output and before the loop
+     * restoration and the film grain, so both the output and the reference
+     * store are in the display domain. One job per plane: the backend splits it
+     * into rows (CPU) or samples (the GPU ones). */
+    if (g.upscaled()) {
+      for (int plane = 0; plane < 3; ++plane) {
+        Av1gUpscaleJob job;
+        std::memset(&job, 0, sizeof(job));
+        const int sub_x = plane > 0 ? geom.ss_x : 0;
+        job.src_off = g.plane_off[plane];
+        job.dst_off = g.plane_off[plane];
+        job.src_stride = g.stride[plane];
+        job.dst_stride = g.stride[plane];
+        job.y0 = 0;
+        job.rows = g.out_h[plane];
+        job.upscaled_w = g.out_w[plane];
+        /* The last coded sample of the plane. The specification clamps to
+         * miW * MI_SIZE - 1 (the block grid, rounded up to eight luma
+         * samples), which for a width that is a multiple of eight - every
+         * width an encoder produces - is the visible width. A decoder with a
+         * padded plane clamps to the visible width, and that is what the
+         * reference decoders do, so the two only differ for a width no encoder
+         * writes. */
+        job.max_x = g.plane_w[plane] - 1;
+        (void)sub_x;
+        av1g_superres_params(g.plane_w[plane], g.out_w[plane], &job.step_x,
+                             &job.initial_subpel_x);
+        job.bitdepth = geom.bit_depth;
+        plan->upscale.push_back(job);
+      }
+    }
+
     /* ---- film grain -------------------------------------------------------- */
     if (syntax.apply_grain && syntax.grain.template_size > 0) {
       plan->grain_stride = std::max(64, syntax.grain.template_size);
@@ -609,8 +677,9 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
       }
       const int tile = 128;
       for (int plane = 0; plane < 3; ++plane) {
-        const int pw = g.plane_w[plane];
-        const int ph = g.plane_h[plane];
+        /* film grain is added to the *output* frame, i.e. after the upscaling */
+        const int pw = g.out_w[plane];
+        const int ph = g.out_h[plane];
         for (int y = 0; y < ph; y += tile) {
           for (int x = 0; x < pw; x += tile) {
             Av1gGrainJob job;

@@ -1813,7 +1813,7 @@ void test_tile_group() {
   std::printf("tile group\n");
   FrameHeader h;
   h.type = FrameType::Key;
-  h.frame_width = 640;
+  h.upscaled_width = 640;
   h.width = 640;
   h.height = 240;
   h.tiles.cols = 2;
@@ -2262,7 +2262,7 @@ void test_intrabc_frame() {
     /* inside the tile ... */
     CHECK(src_col >= 0);
     CHECK(src_row >= 0);
-    CHECK(src_col + bw4 <= (header.frame_width + 3) >> 2);
+    CHECK(src_col + bw4 <= (header.width + 3) >> 2);
     CHECK(src_row + bh4 <= (header.height + 3) >> 2);
     /* ... and clear of the superblock the block is in, one way or the other */
     const int sb4 = seq.use_128x128_superblock ? 32 : 16;

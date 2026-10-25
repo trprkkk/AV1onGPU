@@ -226,7 +226,8 @@ int main() {
   F(Av1gInterJob, mv0_x); F(Av1gInterJob, mv0_y); F(Av1gInterJob, mv1_x);
   F(Av1gInterJob, mv1_y); F(Av1gInterJob, filt); F(Av1gInterJob, compound);
   F(Av1gInterJob, w0); F(Av1gInterJob, w1); F(Av1gInterJob, bitdepth);
-  F(Av1gInterJob, sub_x); F(Av1gInterJob, sub_y); F(Av1gInterJob, filt_v);
+  F(Av1gInterJob, sub_x); F(Av1gInterJob, sub_y); F(Av1gInterJob, scale_x);
+  F(Av1gInterJob, scale_y); F(Av1gInterJob, filt_v);
   F(Av1gInterJob, mask_kind); F(Av1gInterJob, mask_sign);
   F(Av1gInterJob, wedge_dir); F(Av1gInterJob, wedge_xoff); F(Av1gInterJob, wedge_yoff);
   F(Av1gInterJob, wedge_flip);
@@ -255,6 +256,13 @@ int main() {
   F(Av1gCdefJob, damping); F(Av1gCdefJob, dir); F(Av1gCdefJob, uv);
   F(Av1gCdefJob, ss_x); F(Av1gCdefJob, ss_y); F(Av1gCdefJob, bitdepth);
   F(Av1gCdefJob, plane_w); F(Av1gCdefJob, plane_h);
+  S(Av1gUpscaleJob);
+  F(Av1gUpscaleJob, src_off); F(Av1gUpscaleJob, dst_off);
+  F(Av1gUpscaleJob, src_stride); F(Av1gUpscaleJob, dst_stride);
+  F(Av1gUpscaleJob, y0); F(Av1gUpscaleJob, rows);
+  F(Av1gUpscaleJob, upscaled_w); F(Av1gUpscaleJob, max_x);
+  F(Av1gUpscaleJob, step_x); F(Av1gUpscaleJob, initial_subpel_x);
+  F(Av1gUpscaleJob, bitdepth);
   S(Av1gGrainJob);
   F(Av1gGrainJob, dst_off); F(Av1gGrainJob, dst_stride); F(Av1gGrainJob, x);
   F(Av1gGrainJob, y); F(Av1gGrainJob, w); F(Av1gGrainJob, h);

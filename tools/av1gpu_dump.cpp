@@ -20,6 +20,7 @@
  *     int32 width, height, bit_depth, ss_x, ss_y
  *     int32 maxv, blocks
  *     int32 plane_w[3], plane_h[3], stride[3], plane_off[3]
+ *     int32 out_width, out_height, out_w[3], out_h[3]
  *     int64 buffer_size
  *     int64 tmp_size
  *     int32 ref_slot[2]
@@ -31,6 +32,7 @@
  *     int32 n_deblock_v, n_deblock_h
  *     then the deblock arrays
  *     int32 n_cdef, then the cdef array
+ *     int32 n_upscale, then the upscale array
  *     int32 n_grain, then the grain array
  *     coefficients[], residual[], grain_template[]
  *     palette_map[]           (palette_count bytes)
@@ -39,6 +41,13 @@
  * plane per palette coded block, concatenated at the offsets the intra jobs
  * carry in `palette_off`; without it a palette block cannot be replayed at all,
  * which is the whole reason it is in the file.
+ *
+ * Version 4 added the display geometry (out_width, out_height, out_w, out_h)
+ * and the superres upscale jobs. A frame that is coded narrower than it is
+ * displayed has both a coded and a displayed size: the reconstruction jobs and
+ * the loop filters work on the coded one, and the upscale jobs, the film grain
+ * and the output are in the displayed one. Without them a superres plan cannot
+ * be replayed at all.
  *
  * Version 3 added tmp_size, the size in ints of the inverse transform scratch
  * buffer that `Av1gItxJob::tmp_off` indexes. A job needs w * h ints of scratch,
@@ -159,7 +168,10 @@ int main(int argc, char** argv) {
     geom.ss_x = syntax.ss_x;
     geom.ss_y = syntax.ss_y;
     internal::FramePlan plan;
-    if (!internal::build_frame_plan(syntax, backend->prepare(geom), options,
+    if (!internal::build_frame_plan(
+            syntax,
+            backend->prepare(geom, syntax.coded_width > 0 ? syntax.coded_width : syntax.width),
+            options,
                                     backend->reference_capacity(), &plan, &error)) {
       std::fprintf(stderr, "av1gpu_dump: plan failed: %s\n", error.c_str());
       return 1;

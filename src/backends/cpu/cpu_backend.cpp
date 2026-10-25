@@ -73,8 +73,8 @@ class CpuBackend final : public Backend {
   const DeviceInfo& info() const override { return info_; }
   const BackendOptions& options() const override { return options_; }
 
-  PlanLayout prepare(const FrameGeometry& geometry) override {
-    const PlanLayout g = make_plan_layout(geometry, 32);
+  PlanLayout prepare(const FrameGeometry& geometry, int coded_width) override {
+    const PlanLayout g = make_plan_layout(geometry, coded_width, 32);
     const size_t size = g.buffer_size;
     if (frame_.size() < size) frame_.resize(size, 0);
     if (scratch_.size() < size) scratch_.resize(size, 0);
@@ -102,8 +102,8 @@ class CpuBackend final : public Backend {
     uint16_t* base = ref_pool_.data() + static_cast<size_t>(slot) * g.buffer_size;
     std::fill(base, base + g.buffer_size, 0);
     for (int p = 0; p < 3; ++p) {
-      const int w = g.plane_w[p];
-      const int h = g.plane_h[p];
+      const int w = g.out_w[p];
+      const int h = g.out_h[p];
       for (int y = 0; y < h; ++y)
         std::memcpy(base + g.plane_off[p] + static_cast<size_t>(y) * g.stride[p],
                     frame.plane(p) + static_cast<size_t>(y) * frame.stride[p],
@@ -334,6 +334,24 @@ class CpuBackend final : public Backend {
         av1g_cdef_block(&job, scratch_.data(), frame, scratch_.data(), maxv);
       }
     }
+    /* ---- superres ---------------------------------------------------------- */
+    /* The upscaling process resamples the coded picture into the display one.
+     * Source and target are two buffers because a row's output reads samples a
+     * few columns ahead of the ones it writes, so the snapshot of the frame is
+     * the source and the frame itself the target - the same trick CDEF uses. */
+    if (!plan.upscale.empty()) {
+      std::memcpy(scratch_.data(), frame, g.buffer_size * sizeof(uint16_t));
+      for (const Av1gUpscaleJob& job : plan.upscale) {
+        const int rows = job.rows;
+#if defined(AV1GPU_HAVE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+        for (int y = 0; y < rows; ++y)
+          for (int x = 0; x < job.upscaled_w; ++x)
+            av1g_upscale_px(&job, scratch_.data(), frame, filters, x, y, maxv);
+      }
+    }
+
     {
       const int n = static_cast<int>(plan.grain.size());
 #if defined(AV1GPU_HAVE_OPENMP)
@@ -357,8 +375,8 @@ class CpuBackend final : public Backend {
     if (dump_coded) {
       if (FILE* df = std::fopen(dump_coded, "ab")) {
         for (int p = 0; p < 3; ++p) {
-          const int w = g.plane_w[p];
-          const int h = g.plane_h[p];
+          const int w = g.out_w[p];
+          const int h = g.out_h[p];
           for (int y = 0; y < h; ++y) {
             const uint16_t* row = frame + g.plane_off[p] + static_cast<size_t>(y) * g.stride[p];
             if (g.frame.bit_depth > 8) {
@@ -383,8 +401,8 @@ class CpuBackend final : public Backend {
         out->allocate(g.frame.width, g.frame.height, g.frame.bit_depth, g.frame.ss_x,
                       g.frame.ss_y);
       for (int p = 0; p < 3; ++p) {
-        const int w = g.plane_w[p];
-        const int h = g.plane_h[p];
+        const int w = g.out_w[p];
+        const int h = g.out_h[p];
         for (int y = 0; y < h; ++y)
           std::memcpy(out->plane(p) + static_cast<size_t>(y) * out->stride[p],
                       frame + g.plane_off[p] + static_cast<size_t>(y) * g.stride[p],
