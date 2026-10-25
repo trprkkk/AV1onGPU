@@ -18,8 +18,8 @@ the tile data starts: tile grid, quantiser, segmentation, delta Q / delta LF,
 deblock levels, CDEF strengths, reference and skip mode decisions, transform set.
 Inter frames read a `RefPool` the caller keeps up to date, so reference sizes and
 skip mode are derived, not guessed. Features that are not implemented (superres,
-intra block copy, restoration, global motion, short reference signalling, frame
-ids, film grain data) are reported with a message instead of being misparsed.
+restoration, short reference signalling, frame ids, film grain data) are reported
+with a message instead of being misparsed.
 `av1gpu_probe` shows what it found in a real file, and
 `tests/data/svt_av1_320x240.ivf` keeps the parser honest against bytes from a
 real encoder.
@@ -269,10 +269,15 @@ a sign of zero. `tests/data/inter_intra.ivf` pins it: 23 such blocks over 110
 frames, the taper and the wedge, every frame bit exact against dav1d and through
 the device kernels (see `docs/ACCURACY.md`).
 
-Of the intra tools only intrabc is left - palette is decoded and reconstructed
-(see `tests/data/palette_sc.ivf` and `docs/ACCURACY.md`), and intrabc blocks are
-refused by name because they are the one syntax that predicts from inside the
-frame the decoder is still building.
+The intra tools are complete: palette (see `tests/data/palette_sc.ivf`) and
+intra block copy (see `tests/data/intrabc.ivf`), both bit exact against dav1d and
+through the device kernels. Intrabc is the tool that predicts from inside the
+frame the decoder is still building, so it is the one place where the wavefront
+schedule has to wait for a rectangle of samples rather than for the neighbouring
+edges: the block's vector is clipped to the part of the tile that already exists
+(7.11.5), and the scheduler turns that rectangle into wave dependencies.
+
+What is left of the *whole* decoder is skip mode, which is parsed and refused.
 
 ## 4. Spec-conformant film grain
 

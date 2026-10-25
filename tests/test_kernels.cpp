@@ -676,6 +676,93 @@ void test_inter() {
   CHECK(worst2 <= 1);
 }
 
+/* Intra block copy (7.11.5). The block predicts from the frame it belongs to,
+ * which a job reaches with a negative reference slot: ref0_slot < 0 means "read
+ * the current picture" and the vector is then an offset inside it. The syntax
+ * fixes the filter to bilinear and the vector to whole samples, so the copy is
+ * exact - the only thing that can go wrong is the offset, and this checks it for
+ * both directions of a negative vector and for a chroma plane, whose offset is
+ * the luma vector shifted one bit further. */
+void test_intrabc() {
+  std::printf("intra block copy\n");
+  const int stride = 64;
+  /* a source that is distinct per sample, so a one sample slip shows up */
+  std::vector<uint16_t> frame(static_cast<size_t>(stride) * 64);
+  for (int y = 0; y < 64; ++y)
+    for (int x = 0; x < 64; ++x)
+      frame[static_cast<size_t>(y) * stride + x] = static_cast<uint16_t>((x * 7 + y * 11) & 0xff);
+
+  /* a 16x16 block at (32, 32) copied from (16, 8): the vector is negative in
+   * both components and whole samples at the bilinear phase 0, which is the
+   * only phase an intra block copy can produce for luma. */
+  Av1gInterJob job;
+  std::memset(&job, 0, sizeof(job));
+  job.w = 16;
+  job.h = 16;
+  job.dst_off = 32 * stride + 32;
+  job.dst_stride = stride;
+  job.ref_x = 32;
+  job.ref_y = 32;
+  job.ref_w = 64;
+  job.ref_h = 64;
+  job.ref0_stride = stride;
+  job.ref1_stride = stride;
+  job.ref0_slot = -1; /* the current picture */
+  job.ref1_slot = -1;
+  job.filt = AV1G_FILT_BILINEAR;
+  job.filt_v = AV1G_FILT_BILINEAR;
+  job.mv0_x = (16 - 32) * 8;
+  job.mv0_y = (8 - 32) * 8;
+  job.bitdepth = 8;
+  std::vector<uint16_t> dst(frame);
+  av1g_inter_block(&job, dst.data(), frame.data(), frame.data(), tables::filters().data(), 255);
+  int wrong = 0;
+  for (int y = 0; y < 16; ++y)
+    for (int x = 0; x < 16; ++x)
+      if (dst[static_cast<size_t>(32 + y) * stride + 32 + x] !=
+          frame[static_cast<size_t>(8 + y) * stride + 16 + x])
+        ++wrong;
+  CHECK_EQ(wrong, 0);
+  /* and nothing outside the block moved */
+  CHECK_EQ(dst[static_cast<size_t>(32 - 1) * stride + 32], frame[static_cast<size_t>(31) * stride + 32]);
+
+  /* a chroma block: half the samples, the same luma vector, and the integer
+   * offset is the luma one halved - a shift, not a scaling of the luma sample
+   * position, which is what makes an odd luma vector land on the same chroma
+   * sample in this decoder as in the specification. */
+  Av1gInterJob chroma;
+  std::memset(&chroma, 0, sizeof(chroma));
+  chroma.w = 8;
+  chroma.h = 8;
+  chroma.dst_off = 16 * stride + 16;
+  chroma.dst_stride = stride;
+  chroma.ref_x = 16;
+  chroma.ref_y = 16;
+  chroma.ref_w = 32;
+  chroma.ref_h = 32;
+  chroma.ref0_stride = stride;
+  chroma.ref1_stride = stride;
+  chroma.ref0_slot = -1;
+  chroma.ref1_slot = -1;
+  chroma.sub_x = 1;
+  chroma.sub_y = 1;
+  chroma.filt = AV1G_FILT_BILINEAR;
+  chroma.filt_v = AV1G_FILT_BILINEAR;
+  /* whole chroma samples are 1/16 luma samples on a subsampled axis */
+  chroma.mv0_x = (8 - 16) * 16;
+  chroma.mv0_y = (4 - 16) * 16;
+  chroma.bitdepth = 8;
+  av1g_inter_block(&chroma, dst.data(), frame.data(), frame.data(), tables::filters().data(),
+                   255);
+  int chroma_wrong = 0;
+  for (int y = 0; y < 8; ++y)
+    for (int x = 0; x < 8; ++x)
+      if (dst[static_cast<size_t>(16 + y) * stride + 16 + x] !=
+          frame[static_cast<size_t>(4 + y) * stride + 8 + x])
+        ++chroma_wrong;
+  CHECK_EQ(chroma_wrong, 0);
+}
+
 /* Inter/intra compound (7.11.4). The inter half is a flat reference with a zero
  * vector, so it predicts its own value exactly and the only thing under test is
  * the intra half and the blend: the mask is the specification's Ii_Weights_1d
@@ -908,6 +995,7 @@ int main() {
   test_transform();
   test_intra();
   test_inter();
+  test_intrabc();
   test_inter_intra();
   test_filters();
   test_color();

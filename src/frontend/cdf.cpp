@@ -98,15 +98,20 @@ void init_default_cdf(CdfContext* cdf, int base_q_idx) {
   copy_table(cdf->inter.use_obmc, it::use_obmc);
   copy_table(cdf->inter.motion_mode, it::motion_mode);
   copy_table(cdf->inter.interp_filter, it::interp_filter);
-  copy_table(cdf->inter.mv_joint, it::mv_joint);
-  broadcast_table<2>(cdf->inter.mv_sign, it::mv_sign);
-  copy_table(cdf->inter.mv_class, it::mv_class);
-  broadcast_table<2>(cdf->inter.mv_class0_bit, it::mv_class0_bit);
-  copy_table(cdf->inter.mv_class0_fr, it::mv_class0_fr);
-  broadcast_table<2>(cdf->inter.mv_class0_hp, it::mv_class0_hp);
-  broadcast_table<2>(cdf->inter.mv_hp, it::mv_hp);
-  broadcast_table<2>(cdf->inter.mv_bit, it::mv_bit);
-  copy_table(cdf->inter.mv_fr, it::mv_fr);
+  /* every motion vector table is copied once per component and once per
+   * context: both copies of both contexts start from the same default, which
+   * the frame then adapts independently */
+  for (int ctx = 0; ctx < kMvContexts; ++ctx) {
+    copy_table(cdf->inter.mv_joint[ctx], it::mv_joint);
+    broadcast_table<2>(cdf->inter.mv_sign[ctx], it::mv_sign);
+    copy_table(cdf->inter.mv_class[ctx], it::mv_class);
+    broadcast_table<2>(cdf->inter.mv_class0_bit[ctx], it::mv_class0_bit);
+    copy_table(cdf->inter.mv_class0_fr[ctx], it::mv_class0_fr);
+    broadcast_table<2>(cdf->inter.mv_class0_hp[ctx], it::mv_class0_hp);
+    broadcast_table<2>(cdf->inter.mv_hp[ctx], it::mv_hp);
+    broadcast_table<2>(cdf->inter.mv_bit[ctx], it::mv_bit);
+    copy_table(cdf->inter.mv_fr[ctx], it::mv_fr);
+  }
   copy_table(cdf->inter.new_mv, it::new_mv);
   copy_table(cdf->inter.zero_mv, it::zero_mv);
   copy_table(cdf->inter.ref_mv, it::ref_mv);
@@ -241,15 +246,17 @@ void reset_cdf_counts(CdfContext* cdf) {
   reset_2d(in.use_obmc, 1);
   reset_2d(in.motion_mode, 2);
   reset_2d(in.interp_filter, 2);
-  reset_row(in.mv_joint, 3);
-  reset_2d(in.mv_sign, 1);
-  reset_2d(in.mv_class, 10);
-  reset_2d(in.mv_class0_bit, 1);
-  reset_3d(in.mv_class0_fr, 3);
-  reset_2d(in.mv_class0_hp, 1);
-  reset_2d(in.mv_hp, 1);
-  reset_3d(in.mv_bit, 1);
-  reset_2d(in.mv_fr, 3);
+  for (int ctx = 0; ctx < kMvContexts; ++ctx) {
+    reset_row(in.mv_joint[ctx], 3);
+    reset_2d(in.mv_sign[ctx], 1);
+    reset_2d(in.mv_class[ctx], 10);
+    reset_2d(in.mv_class0_bit[ctx], 1);
+    reset_3d(in.mv_class0_fr[ctx], 3);
+    reset_2d(in.mv_class0_hp[ctx], 1);
+    reset_2d(in.mv_hp[ctx], 1);
+    reset_3d(in.mv_bit[ctx], 1);
+    reset_2d(in.mv_fr[ctx], 3);
+  }
   reset_2d(in.new_mv, 1);
   reset_2d(in.zero_mv, 1);
   reset_2d(in.ref_mv, 1);

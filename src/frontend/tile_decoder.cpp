@@ -817,7 +817,9 @@ class TileParser {
   int temporal_candidates(MvCand* stack, int* count, int ref0, int ref1, int bw4, int bh4, int w4,
                           int h4, int mi_row, int mi_col, int gmv_x, int gmv_y) {
     int globalmv_ctx = frame_.use_ref_frame_mvs ? 1 : 0;
-    if (mfmv_count_ == 0) return globalmv_ctx;
+    /* use_ref_frame_mvs is 0 on an intra frame, and an intra block copy block
+     * asks for the INTRA reference: neither has anything to project. */
+    if (mfmv_count_ == 0 || ref0 <= kRefIntra) return globalmv_ctx;
 
     const int bx8 = mi_col >> 1, by8 = mi_row >> 1;
     const int step_h = bw4 >= 16 ? 2 : 1, step_v = bh4 >= 16 ? 2 : 1;
@@ -1151,6 +1153,17 @@ class TileParser {
     scan.ref[0] = ref0;
     scan.ref[1] = ref1;
     for (int n = 0; n < (compound ? 2 : 1); ++n) {
+      /* An intra block copy block's reference is INTRA_FRAME, whose global
+       * motion vector is zero by definition (7.10.2.1: "if ref == INTRA_FRAME ||
+       * typ == IDENTITY, mv = 0"). It matters: the stack is padded up to two
+       * entries with this vector, and a zero prediction is exactly what sends
+       * assign_mv to its superblock-sized fallback. */
+      if (scan.ref[n] <= kRefIntra) {
+        scan.gmv[n][0] = 0;
+        scan.gmv[n][1] = 0;
+        scan.gmv_valid[n] = false;
+        continue;
+      }
       const GlobalMotion& gm = global_motion_of(scan.ref[n]);
       global_mv(gm, mi_row, mi_col, bw4, bh4, &scan.gmv[n][0], &scan.gmv[n][1]);
       /* the model's vector only stands in for a neighbour's when the model is
@@ -1429,40 +1442,43 @@ class TileParser {
 
   /* read_mv_residual: the difference from the predicted vector, coded as a
    * joint symbol then one component diff per coded component. */
-  void read_mv_residual(int* x, int* y, int mv_prec) {
-    const int joint = static_cast<int>(decoder_.read_symbol(cdf_.inter.mv_joint, 3));
+  void read_mv_residual(int* x, int* y, int mv_prec, int mv_ctx = 0) {
+    const int joint = static_cast<int>(decoder_.read_symbol(cdf_.inter.mv_joint[mv_ctx], 3));
     if (trace_) {
       const RangeDecoder::State state = decoder_.state();
       std::fprintf(stderr, "R joint=%d prec=%d dif=%llu rng=%u cnt=%d\n", joint, mv_prec,
                    static_cast<unsigned long long>(state.window), state.range, state.count);
     }
     /* vertical first: that is the order the specification's tables assume */
-    if (joint & 2) *y += read_mv_component(kMvVertical, mv_prec);
-    if (joint & 1) *x += read_mv_component(kMvHorizontal, mv_prec);
+    if (joint & 2) *y += read_mv_component(kMvVertical, mv_prec, mv_ctx);
+    if (joint & 1) *x += read_mv_component(kMvHorizontal, mv_prec, mv_ctx);
   }
 
   /* read_mv_component_diff: one component of a coded motion vector
    * difference. `comp` selects the tables (the two components have their own,
    * because their statistics differ); `mv_prec` is 1 with high precision
    * motion vectors, 0 without and -1 when the frame forces integer vectors. */
-  int read_mv_component(int comp, int mv_prec) {
-    const int sign = decoder_.read_symbol(cdf_.inter.mv_sign[comp], 1) != 0;
-    const int cls = static_cast<int>(decoder_.read_symbol(cdf_.inter.mv_class[comp], 10));
+  int read_mv_component(int comp, int mv_prec, int mv_ctx = 0) {
+    const int sign = decoder_.read_symbol(cdf_.inter.mv_sign[mv_ctx][comp], 1) != 0;
+    const int cls =
+        static_cast<int>(decoder_.read_symbol(cdf_.inter.mv_class[mv_ctx][comp], 10));
     int up = 0, fp = 3, hp = 1;
     if (cls == 0) {
-      up = decoder_.read_symbol(cdf_.inter.mv_class0_bit[comp], 1) != 0;
+      up = decoder_.read_symbol(cdf_.inter.mv_class0_bit[mv_ctx][comp], 1) != 0;
       if (mv_prec >= 0) {
-        fp = static_cast<int>(decoder_.read_symbol(cdf_.inter.mv_class0_fr[comp][up], 3));
-        if (mv_prec > 0) hp = decoder_.read_symbol(cdf_.inter.mv_class0_hp[comp], 1) != 0;
+        fp = static_cast<int>(
+            decoder_.read_symbol(cdf_.inter.mv_class0_fr[mv_ctx][comp][up], 3));
+        if (mv_prec > 0)
+          hp = decoder_.read_symbol(cdf_.inter.mv_class0_hp[mv_ctx][comp], 1) != 0;
       }
     } else {
       up = 1 << cls;
       for (int n = 0; n < cls; ++n) {
-        up |= (decoder_.read_symbol(cdf_.inter.mv_bit[n][comp], 1) != 0) << n;
+        up |= (decoder_.read_symbol(cdf_.inter.mv_bit[mv_ctx][n][comp], 1) != 0) << n;
       }
       if (mv_prec >= 0) {
-        fp = static_cast<int>(decoder_.read_symbol(cdf_.inter.mv_fr[comp], 3));
-        if (mv_prec > 0) hp = decoder_.read_symbol(cdf_.inter.mv_hp[comp], 1) != 0;
+        fp = static_cast<int>(decoder_.read_symbol(cdf_.inter.mv_fr[mv_ctx][comp], 3));
+        if (mv_prec > 0) hp = decoder_.read_symbol(cdf_.inter.mv_hp[mv_ctx][comp], 1) != 0;
       }
     }
     const int diff = ((up << 3) | (fp << 1) | hp) + 1;
@@ -2000,6 +2016,125 @@ class TileParser {
    * A skip mode block is the special case the frame header sets up: it is always
    * inter, always compound, takes both references from the header, uses the
    * nearest candidate pair and codes nothing but its presence. */
+  /* read_intrabc_block: intra block copy (6.10.8, 7.11.5). The block is an
+   * inter block in the syntax but predicts from the frame it is part of, so it
+   * codes no intra mode, no filter and no motion mode: only a motion vector,
+   * against the second motion vector context, and then a residual.
+   *
+   * The vector is predicted from the neighbouring blocks that are themselves
+   * intra block copies - the candidate scan looks for neighbours whose
+   * RefFrame[0] is INTRA_FRAME *and* that carry a vector, which is exactly what
+   * a block copy block is. Failing that it falls back to an offset that reaches
+   * back a whole superblock (and a further 256 samples when there is no row of
+   * superblocks above, in which case the offset is horizontal).
+   *
+   * The coded vector may point anywhere, so it is clipped to the part of the
+   * tile that is already reconstructed: a block copy may only read samples that
+   * exist, and 7.11.5 makes "exists" mean "above this superblock row or left of
+   * this superblock, inside the tile, and shifted by the same amount as a whole
+   * block when it does not fit". */
+  ParseStatus read_intrabc_block(TileBlock* block, BlockSize size, int row, int col,
+                                 bool has_chroma) {
+    const int bw4 = block_width4(size), bh4 = block_height4(size);
+    block->is_inter = true;
+    block->intrabc = true;
+    block->y_mode = kModeDc;
+    block->uv_mode = kModeDc;
+    block->motion_mode = kMotionTranslation;
+    block->compound_type = kCompoundNone;
+    /* BILINEAR is the one thing the syntax fixes about the prediction, and it
+     * only matters for the +-1/8 pel cases the clipping leaves alone: a block
+     * copy is an integer copy. */
+    block->interp_filter[0] = block->interp_filter[1] = 3;
+    block->ref_frame[0] = kRefIntra;
+    block->ref_frame[1] = kRefIntra;
+    block->palette_size[0] = block->palette_size[1] = 0;
+    block->inter_mode = kModeNewMv;
+    block->drl_index = 0;
+
+    MvCand stack[8];
+    int count = 0, ctx = 0;
+    find_ref_mvs(stack, &count, &ctx, kRefIntra, kRefIntra, size, row, col);
+    int mvx, mvy;
+    if (stack[0].mv[0][0] != 0 || stack[0].mv[0][1] != 0) {
+      mvx = stack[0].mv[0][0];
+      mvy = stack[0].mv[0][1];
+    } else if (stack[1].mv[0][0] != 0 || stack[1].mv[0][1] != 0) {
+      mvx = stack[1].mv[0][0];
+      mvy = stack[1].mv[0][1];
+    } else {
+      const int sb4 = seq_.use_128x128_superblock ? 32 : 16;
+      const int sb_pixels = sb4 * 4;
+      if (row - sb4 < tile_row_start_) {
+        /* no superblock row above this one: reach left instead */
+        mvx = -(sb_pixels + kIntrabcDelayPixels) * 8;
+        mvy = 0;
+      } else {
+        mvx = 0;
+        mvy = -sb_pixels * 8;
+      }
+    }
+
+    /* assign_mv with compMode = NEWMV and MvCtx = MV_INTRABC_CONTEXT: the
+     * residual always follows, and the precision is forced to whole samples. */
+    read_mv_residual(&mvx, &mvy, -1, 1);
+
+    /* 7.11.5: clip the vector to the reconstructed part of the tile */
+    int border_left = tile_col_start_ * 4;
+    int border_top = tile_row_start_ * 4;
+    if (has_chroma) {
+      if (bw4 < 2 && sub_x()) border_left += 4;
+      if (bh4 < 2 && sub_y()) border_top += 4;
+    }
+    int src_left = col * 4 + (mvx >> 3);
+    int src_top = row * 4 + (mvy >> 3);
+    int src_right = src_left + bw4 * 4;
+    int src_bottom = src_top + bh4 * 4;
+    const int border_right = ((tile_col_end_ + (bw4 - 1)) & ~(bw4 - 1)) * 4;
+    if (src_left < border_left) {
+      src_right += border_left - src_left;
+      src_left += border_left - src_left;
+    } else if (src_right > border_right) {
+      src_left -= src_right - border_right;
+      src_right -= src_right - border_right;
+    }
+    if (src_top < border_top) {
+      src_bottom += border_top - src_top;
+      src_top += border_top - src_top;
+    }
+    const int sb_shift = 4 + (seq_.use_128x128_superblock ? 1 : 0);
+    const int sbx = (col >> sb_shift) << (sb_shift + 2);
+    const int sby = (row >> sb_shift) << (sb_shift + 2);
+    const int sb_size = sb_shift == 4 ? 64 : 128;
+    /* a source that overlaps the superblock being decoded would read samples
+     * that do not exist yet: move it up, else left, by the overlap */
+    if (src_bottom > sby && src_right > sbx) {
+      if (src_top - border_top >= src_bottom - sby) {
+        src_top -= src_bottom - sby;
+        src_bottom -= src_bottom - sby;
+      } else if (src_left - border_left >= src_right - sbx) {
+        src_left -= src_right - sbx;
+        src_right -= src_right - sbx;
+      }
+    }
+    if (src_bottom > sby + sb_size) {
+      src_top -= src_bottom - (sby + sb_size);
+      src_bottom -= src_bottom - (sby + sb_size);
+    }
+    if (src_bottom > sby && src_right > sbx) {
+      return fail(error_, "tile: an intra block copy source inside the current superblock");
+    }
+    mvx = (src_left - col * 4) * 8;
+    mvy = (src_top - row * 4) * 8;
+    block->mv[0][0] = mvx;
+    block->mv[0][1] = mvy;
+    if (trace_) {
+      std::fprintf(stderr, "IB %d %d w4=%d h4=%d n=%d mv=%d,%d src=%d,%d\n", col, row, bw4, bh4,
+                   count, mvx, mvy, src_left, src_top);
+    }
+    return ParseStatus::Ok;
+  }
+
   ParseStatus read_inter_block_mode(TileBlock* block, BlockSize size, int row, int col,
                                     bool has_chroma) {
     const int bw4 = block_width4(size), bh4 = block_height4(size);
@@ -2742,13 +2877,13 @@ class TileParser {
     }
 
     /* use_intrabc: a frame that allows intra block copy codes this flag for
-     * every block. The block then predicts from a position inside the frame it
-     * is decoding, which this decoder does not implement - but the flag has to
-     * be read for the frame to stay in sync, so a stream that sets it is
-     * refused by name instead of being misparsed from here on. */
+     * every block. A block that sets it predicts from the frame it is part of
+     * and codes no modes at all, so it takes the inter path with everything
+     * fixed by the syntax (see read_intrabc_block). */
     if (intra_frame && frame_.allow_intrabc) {
-      if (decoder_.read_symbol(cdf_.mode.intrabc, 1) != 0) {
-        return stop_at_residual(block, "tile: intra block copy is not implemented");
+      block.intrabc = decoder_.read_symbol(cdf_.mode.intrabc, 1) != 0;
+      if (trace_enabled()) {
+        std::fprintf(stderr, "IBC %d %d %d\n", col, row, block.intrabc ? 1 : 0);
       }
     }
 
@@ -2761,7 +2896,10 @@ class TileParser {
      * an intra block, an inter frame codes whether this block is intra and then
      * either the intra modes or the reference, motion vector and filter. */
     const int log2_w = kBlockWidthLog2[size], log2_h = kBlockHeightLog2[size];
-    if (intra_frame) {
+    if (block.intrabc) {
+      const ParseStatus status = read_intrabc_block(&block, size, row, col, has_chroma);
+      if (status != ParseStatus::Ok) return status;
+    } else if (intra_frame) {
       const ParseStatus mode_status = read_intra_block_mode(&block, size, row, col, true);
       if (mode_status != ParseStatus::Ok) return mode_status;
       const ParseStatus chroma_status = read_chroma_mode(&block, size, has_chroma);
@@ -2852,12 +2990,18 @@ class TileParser {
 
     for (int i = 0; i < 4; ++i) block.delta_lf[i] = delta_lf_[i];
 
+    /* A block copy block records DC_PRED where an intra block records its mode,
+     * because that is what the syntax leaves YMode at - the next block's intra
+     * mode context reads it. */
     mark_block(row, col, bw4, bh4, size, block.skip,
-               block.is_inter ? block.inter_mode : block.y_mode);
+               (block.is_inter && !block.intrabc) ? block.inter_mode : block.y_mode);
     mark_tx(row, col, bw4, bh4, tx);
     if (block.skip_mode) mi_skip_mode_set(row, col, bw4, bh4);
-    if (!intra_frame) mark_inter(row, col, size, block, block.interp_filter[0],
-                                 block.interp_filter[1]);
+    /* a block copy block is an intra frame's *only* inter block, and the next
+     * block copy's candidate scan reads it: its vector and its RefFrame (INTRA)
+     * go into the same map a normal inter block fills */
+    if (!intra_frame || block.intrabc)
+      mark_inter(row, col, size, block, block.interp_filter[0], block.interp_filter[1]);
     if (block.is_inter) {
       /* the uv mode of an inter block is not coded: the specification sets it
        * to DC for the purposes of the neighbour contexts */

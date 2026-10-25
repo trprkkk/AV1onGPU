@@ -446,6 +446,15 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
        * predicts from. The plane loop below carries it into every region. */
       const bool two_refs = block.compound_type != kCompoundNone;
       for (int i = 0; i < (two_refs ? 2 : 1); ++i) {
+        /* An intra block copy block has no reference frame at all: it predicts
+         * from the frame being decoded, which the backends reach with a
+         * negative slot (the same mechanism an inter/intra block's intra half
+         * uses). The parser has already clipped its vector to the part of the
+         * frame that exists, so there is nothing to validate here. */
+        if (block.intrabc) {
+          ref_index[i] = -1;
+          continue;
+        }
         const int type = block.ref_frame[i] - 1; /* kRefLast (1) -> index 0 */
         if (type < 0 || type >= 7) {
           *error = "reconstruct: inter block has no reference frame";
@@ -492,6 +501,10 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
         bs.h = ((bh4 + sub_y) >> sub_y) * 4;
         bs.bit_depth = seq.bit_depth;
         bs.is_intra = false;
+        /* an intra block copy block is an inter block whose reference is this
+         * frame: the plan schedules it after the samples it reads (engine.cpp),
+         * and the backends reach them through the negative slot below */
+        bs.intrabc = block.intrabc;
         bs.lossless = lossless;
         bs.ref[0] = ref_index[0];
         bs.ref[1] = ref_index[1];
@@ -604,12 +617,19 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
         const int cell_row = (block.mi_row >> sub_y) << sub_y;
         const int span_cols = (bs.w >> 2) << sub_x;
         const int span_rows = (bs.h >> 2) << sub_y;
-        bool split = plane > 0 && (pred_w < bs.w || pred_h < bs.h);
+        /* An intra block copy block predicts its whole chroma block from its own
+         * vector: compute_prediction()'s someUseIntra is set for it, because the
+         * cells of its chroma footprint carry INTRA_FRAME as their reference. */
+        bool split = plane > 0 && !block.intrabc && (pred_w < bs.w || pred_h < bs.h);
         if (split) {
           for (int r = 0; r < span_rows && split; ++r) {
             for (int c = 0; c < span_cols; ++c) {
               const TileBlock* cell = mi_block(cell_row + r, cell_col + c);
-              if (!cell || !cell->is_inter) {
+              /* compute_prediction()'s someUseIntra: a cell whose RefFrame is
+               * INTRA_FRAME - an intra block, or a block copy block, which keeps
+               * that reference - makes the whole chroma block one prediction
+               * region with this block's own vector. */
+              if (!cell || !cell->is_inter || cell->intrabc) {
                 split = false;
                 break;
               }

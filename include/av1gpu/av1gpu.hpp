@@ -221,6 +221,12 @@ struct BlockSyntax {
   int bit_depth = 8;
 
   bool is_intra = true;
+  /* Intra block copy (7.11.5): an `is_inter` block that predicts from the frame
+   * being decoded, at an integer offset. It has no reference frame at all
+   * (`ref[0]` is -1, i.e. the frame itself), always uses the bilinear filter,
+   * and its intra neighbours are the ones its *source* rectangle has - so it is
+   * scheduled like an intra block and reads whole reconstructed samples. */
+  bool intrabc = false;
 
   /* intra */
   PredictionMode mode = PredictionMode::Dc;

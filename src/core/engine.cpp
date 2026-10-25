@@ -274,6 +274,26 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
           const int o = sample_owner(p, left_x, above_y);
           if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
         }
+        /* An intra block copy block reads a rectangle of *this* frame, so it
+         * has to run after every block owning a sample of that rectangle - and
+         * after their residual, which is what a strictly earlier wave gives. */
+        if (b.intrabc) {
+          /* the vector is coded in 1/8 luma samples, so a chroma plane shifts
+           * it one bit further; both shifts are arithmetic, which is what puts
+           * a negative vector below the sample rather than above it */
+          const int mv_shift_x = 3 + (p > 0 && geom.ss_x ? 1 : 0);
+          const int mv_shift_y = 3 + (p > 0 && geom.ss_y ? 1 : 0);
+          const int sx = b.x + (b.mv[0][0] >> mv_shift_x);
+          const int sy = b.y + (b.mv[0][1] >> mv_shift_y);
+          const int x1 = std::min(sx + b.w, g.plane_w[p]);
+          const int y1 = std::min(sy + b.h, g.plane_h[p]);
+          for (int y = std::max(sy, 0); y < y1; ++y) {
+            for (int x = std::max(sx, 0); x < x1; ++x) {
+              const int o = sample_owner(p, x, y);
+              if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+            }
+          }
+        }
         if (b.mode == PredictionMode::ChromaFromLuma) {
           /* the co-located luma samples, one per chroma sample */
           for (int y = 0; y < b.h; ++y) {
@@ -362,6 +382,16 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.ref_y = b.y;
         job.ref_w = g.plane_w[plane];
         job.ref_h = g.plane_h[plane];
+        if (b.intrabc) {
+          /* 7.11.4 step 11: a block copy's "reference frame" is the picture
+           * being decoded, sized MiCols * MI_SIZE - the 4x4 grid rounded up,
+           * which is wider than the visible picture when the width is not a
+           * multiple of four. The plane padding covers the difference. */
+          const int sub_x = plane > 0 && geom.ss_x ? 1 : 0;
+          const int sub_y = plane > 0 && geom.ss_y ? 1 : 0;
+          job.ref_w = ((geom.width + 3) & ~3) >> sub_x;
+          job.ref_h = ((geom.height + 3) & ~3) >> sub_y;
+        }
         job.border = 0;
         job.mv0_x = b.mv[0][0];
         job.mv0_y = b.mv[0][1];

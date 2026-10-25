@@ -29,10 +29,11 @@ encoded with libaom at `-cpu-used 4 -crf 30 --lag-in-frames 0 -g 10` and
 `-aom-params "tune-content=screen:enable-restoration=0:tile-columns=0:tile-rows=0:enable-intrabc=0"`.
 Every intra block that wants a palette codes one, on one or both planes, with 2,
 3 and 4 colours and reuse of the neighbour palette cache; intrabc is switched off
-because intrabc blocks are refused by name. `palette_sc.hash` holds the per frame
-hashes and `stream_palette_sc` checks them, so it is the only fixture that
-exercises the palette syntax - without it the palette code could be arbitrarily
-wrong and nothing would fail.
+there so that the encoder spends its screen content tools on palettes. The
+`intrabc.ivf` fixture below is the one that codes block copies.
+`palette_sc.hash` holds the per frame hashes and `stream_palette_sc` checks them,
+so it is the only fixture that exercises the palette syntax - without it the
+palette code could be arbitrarily wrong and nothing would fail.
 
 The clip itself is generated, so it can be rebuilt from nothing:
 
@@ -65,6 +66,57 @@ for f in range(N):
     v[:, :W // 4] = 200
     out += y.tobytes() + u.tobytes() + v.tobytes()
 open('src.yuv', 'wb').write(bytes(out))
+```
+
+`intrabc.ivf` is the intra block copy fixture: 16 frames of 320x240, 6.0 KB,
+encoded with libaom at `-cpu-used 2 -crf 24 --lag-in-frames 0 -g 1` and
+`-aom-params "tune-content=screen:enable-intrabc=1:enable-restoration=0:tile-columns=0:tile-rows=0:enable-palette=1:enable-cdef=1"`.
+`-g 1` makes every frame a key frame, because a block copy block only exists in an
+intra frame - with a longer key frame interval the stream had exactly one block
+copy in twelve frames. All intra, it codes **239** of them: 204 whose vector comes
+off a neighbour's candidate stack and 35 that fall back to the "one superblock up"
+offset, on blocks from 8x32 to 32x32, ending up on four distinct displacements so
+the residual and the 7.11.5 clipping both run. It also codes palettes, which is
+fine - this stream is about the block copies. Note that a block copy is an *inter*
+block in an *intra* frame, so `--enable-cdef=1` here is deliberate: the encoder
+signals CDEF off for a frame that uses block copy, and that is the header path
+`allow_intrabc` takes.
+
+`intrabc.hash` holds the per frame hashes, `stream_intrabc` checks them and
+`opencl_intrabc` replays the same frames through the device kernels, where the
+block copy's job has a negative reference slot and therefore reads the picture
+being decoded rather than a pool slot.
+
+The clip is generated, so it can be rebuilt from nothing (the moving widget and
+the scrolling stripes are what make a block copy cheaper than intra prediction):
+
+```python
+import numpy as np
+
+W, H, N = 320, 240, 16
+def make(t):
+    img = np.full((H, W), 40, np.uint8)
+    img[16:112, 16:144] = 200                    # flat panels
+    img[128:224, 16:144] = 120
+    img[16:112, 160:304] = 90
+    img[128:224, 160:304] = 230
+    off = (t * 4) % 64                           # text-like stripes that scroll
+    for i in range(8):
+        y = 24 + i * 8
+        for x in range(160 + off, 304, 12):
+            img[y:y + 4, x:x + 6] = 250
+    wx = 32 + (t * 3) % 80                       # a widget that slides
+    img[160:200, wx:wx + 40] = 20
+    img[168:192, wx + 8:wx + 32] = 255
+    img[232:240, 300:320] = 255                  # a static corner marker
+    return img
+with open('sc2.yuv', 'wb') as f:
+    for t in range(N):
+        luma = make(t)
+        chroma = luma.reshape(120, 2, 160, 2).mean(axis=(1, 3)).astype(np.uint8)
+        f.write(luma.tobytes())
+        f.write(chroma.tobytes())
+        f.write(chroma.tobytes())
 ```
 
 `inter_intra.ivf` is the inter/intra compound fixture: 110 frames of 320x240

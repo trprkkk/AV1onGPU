@@ -356,11 +356,56 @@ areas) encoded with libaom `tune-content=screen --enable-intrabc=0`, so every
 intra block that wants one codes a *palette* instead of a prediction mode. It is
 10 frames of 320x240, 6.7 KB, and it codes palettes on both planes: luma-only,
 luma+chroma, and 2, 3 and 4 colour palettes with cache reuse from the block
-above and to the left. Intra block copy is switched off because intrabc blocks
-are out of scope (the parser reads the flag and stops with a named error); the
-stream is otherwise the shortest thing that walks the whole palette syntax -
-`palette_mode_info`, `palette_tokens`, the colour map's three neighbour
-contexts, and the neighbour palette cache.
+above and to the left. Intra block copy is switched off there on purpose - it
+would take blocks away from the palette - and the intrabc fixture below is the
+one that codes it; the palette stream is the shortest thing that walks the whole
+palette syntax - `palette_mode_info`, `palette_tokens`, the colour map's three
+neighbour contexts, and the neighbour palette cache.
+
+`tests/data/intrabc.ivf` is the intra block copy fixture: 16 frames of 320x240,
+6 KB, all intra (`-g 1`) and encoded with libaom `tune-content=screen
+--enable-intrabc=1 --enable-restoration=0 --enable-cdef=1`, so every frame is a
+key frame and intrabc is available on all of them. It codes **239 intra block
+copy blocks** over the 16 frames, from 8x32 to 32x32: 204 take a neighbour's
+vector off the candidate stack and 35 fall back to the "one superblock up"
+offset, and the coded vectors end up on four distinct displacements (-40, -32,
+-65/-64 and -49/-64 samples), so both the residual path and the clip path run.
+Every frame is bit exact against dav1d and through the device kernels.
+
+What makes intrabc unlike every other tool is that it is an *inter* block in an
+*intra* frame:
+
+* **Its motion vector context is its own.** 7.11.3.7 codes the vector against
+  `mv_ctx = 1` for an intra block copy block and 0 for everything else, and the
+  two contexts adapt separately. Both start from the same default table, so a
+  stream that codes no block copy decodes identically either way - and a stream
+  that codes one desynchronises at its very first vector if the second context is
+  missing. `tests/test_entropy.cpp` pins both halves: the tables start equal, and
+  reading a symbol through one context leaves the other untouched.
+* **`force_integer_mv` is forced on.** `FrameIsIntra` sets it, which also means
+  `allow_high_precision_mv` is never read, so the vector has no fractional or
+  half pel symbols: `read_mv_component` is called with `mv_prec = -1` and reads
+  the sign, the class, `class0_bit` and either `class0_fr` or the class N bits -
+  never `class0_hp` or `hp`.
+* **The vector is clipped, not trusted.** 7.11.5 moves the source rectangle until
+  it lies inside the decoded part of the tile and outside the superblock being
+  decoded, which is what lets a decoder read whole samples of the picture it is
+  still building. The clipping is the interesting part: it is what the wavefront
+  scheduler has to reproduce as a dependency, and the reference decoder errors
+  out rather than clipping when the rectangle cannot be moved.
+* **The block reads the frame it belongs to.** In the plan a block copy job has a
+  negative reference slot, and both the CPU and the device kernels already read
+  the current picture for that case (the same path an inter/intra block's intra
+  half uses). The chroma planes shift the vector one bit further, because the
+  same luma vector is a half sample offset on a subsampled axis - a bug here
+  shows up as a chroma block copied from the wrong place while luma is exact.
+
+The `MvCtx` dimension is the trap here: a single set of vector tables keeps a
+stream without block copies in sync indefinitely, and desynchronises on the first
+vector of the first block copy block - one symbol, then everything after it is
+noise. The tables are compared with dav1d's `cdf.mv` row by row in
+`tests/test_entropy.cpp`, together with the check that the two contexts adapt
+independently and that a reset restores both.
 
 Two bugs came out of this fixture and neither is visible without pixels:
 

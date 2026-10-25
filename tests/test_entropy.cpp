@@ -515,21 +515,26 @@ void test_inter_cdf() {
 
   /* motion vectors: dav1d's `.mv.joint`, `.mv.comp.classes` and the fractional
    * parts */
-  CHECK_EQ(in.mv_joint[0], 28672u);
-  CHECK_EQ(in.mv_joint[2], 13440u);
-  CHECK_EQ(in.mv_class[0][0], 4096u);
-  CHECK_EQ(in.mv_class[0][9], 1u);
-  CHECK_EQ(in.mv_class0_fr[0][0][0], 16384u);
-  CHECK_EQ(in.mv_class0_fr[0][1][2], 8640u);
-  CHECK_EQ(in.mv_fr[0][0], 24576u);
+  CHECK_EQ(in.mv_joint[0][0], 28672u);
+  CHECK_EQ(in.mv_joint[0][2], 13440u);
+  CHECK_EQ(in.mv_class[0][0][0], 4096u);
+  CHECK_EQ(in.mv_class[0][0][9], 1u);
+  CHECK_EQ(in.mv_class0_fr[0][0][0][0], 16384u);
+  CHECK_EQ(in.mv_class0_fr[0][0][1][2], 8640u);
+  CHECK_EQ(in.mv_fr[0][0][0], 24576u);
   /* the binary vector tables are per component: two copies of the default row,
    * which adapt independently once a vector is coded */
-  CHECK_EQ(in.mv_bit[0][0][0], 15360u);
-  CHECK_EQ(in.mv_bit[9][1][0], 2048u);
-  CHECK_EQ(in.mv_sign[1][0], in.mv_sign[0][0]);
-  CHECK_EQ(in.mv_hp[1][0], in.mv_hp[0][0]);
-  CHECK_EQ(in.mv_class0_hp[1][0], in.mv_class0_hp[0][0]);
-  CHECK_EQ(in.mv_class0_bit[1][0], in.mv_class0_bit[0][0]);
+  CHECK_EQ(in.mv_bit[0][0][0][0], 15360u);
+  CHECK_EQ(in.mv_bit[0][9][1][0], 2048u);
+  CHECK_EQ(in.mv_sign[0][1][0], in.mv_sign[0][0][0]);
+  CHECK_EQ(in.mv_hp[0][1][0], in.mv_hp[0][0][0]);
+  CHECK_EQ(in.mv_class0_hp[0][1][0], in.mv_class0_hp[0][0][0]);
+  CHECK_EQ(in.mv_class0_bit[0][1][0], in.mv_class0_bit[0][0][0]);
+  /* and per motion vector context: an intra block copy block codes its vector
+   * against its own copy, which starts equal to the inter one */
+  CHECK_EQ(in.mv_joint[1][0], in.mv_joint[0][0]);
+  CHECK_EQ(in.mv_class[1][1][10], in.mv_class[0][1][10]);
+  CHECK_EQ(in.mv_bit[1][4][0][0], in.mv_bit[0][4][0][0]);
 
   /* new, zero or a predicted motion vector, and how far down the list */
   CHECK_EQ(in.new_mv[0][0], 8733u);
@@ -571,15 +576,17 @@ void test_inter_cdf() {
   rows(&in.use_obmc[0][0], kBlockSizeCount, 2, 2, "use_obmc");
   rows(&in.motion_mode[0][0], kBlockSizeCount, 3, 3, "motion_mode");
   rows(&in.interp_filter[0][0], 16, 3, 3, "interp_filter");
-  check_row(in.mv_joint, 4, "mv_joint");
-  rows(&in.mv_sign[0][0], 2, 2, 2, "mv_sign");
-  rows(&in.mv_class[0][0], 2, 11, 16, "mv_class");
-  rows(&in.mv_class0_bit[0][0], 2, 2, 2, "mv_class0_bit");
-  rows(&in.mv_class0_fr[0][0][0], 4, 4, 4, "mv_class0_fr");
-  rows(&in.mv_class0_hp[0][0], 2, 2, 2, "mv_class0_hp");
-  rows(&in.mv_hp[0][0], 2, 2, 2, "mv_hp");
-  rows(&in.mv_bit[0][0][0], 20, 2, 2, "mv_bit");
-  rows(&in.mv_fr[0][0], 2, 4, 4, "mv_fr");
+  for (int ctx = 0; ctx < kMvContexts; ++ctx) {
+    check_row(in.mv_joint[ctx], 4, "mv_joint");
+    rows(&in.mv_sign[ctx][0][0], 2, 2, 2, "mv_sign");
+    rows(&in.mv_class[ctx][0][0], 2, 11, 16, "mv_class");
+    rows(&in.mv_class0_bit[ctx][0][0], 2, 2, 2, "mv_class0_bit");
+    rows(&in.mv_class0_fr[ctx][0][0][0], 4, 4, 4, "mv_class0_fr");
+    rows(&in.mv_class0_hp[ctx][0][0], 2, 2, 2, "mv_class0_hp");
+    rows(&in.mv_hp[ctx][0][0], 2, 2, 2, "mv_hp");
+    rows(&in.mv_bit[ctx][0][0][0], 20, 2, 2, "mv_bit");
+    rows(&in.mv_fr[ctx][0][0], 2, 4, 4, "mv_fr");
+  }
   rows(&in.new_mv[0][0], 6, 2, 2, "new_mv");
   rows(&in.zero_mv[0][0], 2, 2, 2, "zero_mv");
   rows(&in.ref_mv[0][0], 6, 2, 2, "ref_mv");
@@ -587,6 +594,37 @@ void test_inter_cdf() {
   rows(&in.txtp_inter1[0][0], 2, 16, 16, "txtp_inter1");
   check_row(in.txtp_inter2, 12, "txtp_inter2");
   rows(&in.txtp_inter3[0][0], 4, 2, 2, "txtp_inter3");
+}
+
+/* The two motion vector contexts (7.11.3.7's MvCtx) are separate copies of
+ * every vector table: an inter block codes its vector against context 0 and an
+ * intra block copy block against context 1. Decoding the same payload through
+ * each must give the same symbol - the copies start equal - while only the
+ * table that was actually read may move. A single flat table would fail the
+ * second half of this, and would desynchronise the first intra block copy block
+ * of any stream that codes one. */
+void test_mv_contexts() {
+  using namespace av1gpu::frontend;
+  using namespace entropy_vectors;
+  CdfContext initial;
+  init_default_cdf(&initial, 100);
+  CdfContext first = initial, second = initial;
+
+  RangeDecoder a, b;
+  a.init(case2_payload, sizeof(case2_payload), true);
+  b.init(case2_payload, sizeof(case2_payload), true);
+  const unsigned s0 = a.read_symbol(first.inter.mv_joint[0], 3);
+  const unsigned s1 = b.read_symbol(second.inter.mv_joint[1], 3);
+  CHECK_EQ(s0, s1);
+
+  CHECK(std::memcmp(first.inter.mv_joint[0], initial.inter.mv_joint[0],
+                    sizeof(initial.inter.mv_joint[0])) != 0);
+  CHECK_EQ(std::memcmp(first.inter.mv_joint[1], initial.inter.mv_joint[1],
+                       sizeof(initial.inter.mv_joint[1])), 0);
+  CHECK_EQ(std::memcmp(second.inter.mv_joint[0], initial.inter.mv_joint[0],
+                       sizeof(initial.inter.mv_joint[0])), 0);
+  CHECK(std::memcmp(second.inter.mv_joint[1], initial.inter.mv_joint[1],
+                    sizeof(initial.inter.mv_joint[1])) != 0);
 }
 
 } /* namespace */
@@ -604,6 +642,7 @@ int main() {
   test_corrupt_table();
   test_default_cdf();
   test_inter_cdf();
+  test_mv_contexts();
   test_real_tile_trace();
   return testing::finish("test_entropy");
 }

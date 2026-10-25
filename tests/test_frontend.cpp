@@ -1169,8 +1169,8 @@ void test_cdf_inheritance() {
   cdf.mode.txsz[0][0][1] = 9;
   cdf.mode.txsz[3][0][2] = 9;
   cdf.partition.table[4][0][3] = 9;
-  cdf.inter.mv_class0_fr[1][1][3] = 9;
-  cdf.inter.mv_joint[3] = 9;
+  cdf.inter.mv_class0_fr[0][1][1][3] = 9;
+  cdf.inter.mv_joint[0][3] = 9;
   reset_cdf_counts(&cdf);
   CHECK_EQ(cdf.coef.base_tok[0][0][0][3], 0);
   CHECK_EQ(cdf.coef.eob_bin_64[1][0][6], 0);
@@ -1179,8 +1179,8 @@ void test_cdf_inheritance() {
   CHECK_EQ(cdf.mode.txsz[0][0][1], 0);
   CHECK_EQ(cdf.mode.txsz[3][0][2], 0);
   CHECK_EQ(cdf.partition.table[4][0][3], 0);
-  CHECK_EQ(cdf.inter.mv_class0_fr[1][1][3], 0);
-  CHECK_EQ(cdf.inter.mv_joint[3], 0);
+  CHECK_EQ(cdf.inter.mv_class0_fr[0][1][1][3], 0);
+  CHECK_EQ(cdf.inter.mv_joint[0][3], 0);
 }
 
 /* The first block of a real key frame, symbol for symbol. dav1d's trace of this
@@ -1197,6 +1197,126 @@ void test_cdf_inheritance() {
  * and then the block's coefficients. This checks that the block tree and mode
  * info layer produces exactly that, and that it stops where the coefficient
  * syntax starts instead of guessing at it. */
+/* Reads one whole IVF frame record, for the tests that inspect a stream. */
+bool read_ivf_frame(const std::string& path, size_t index, std::vector<uint8_t>* payload) {
+  std::vector<uint8_t> data;
+  std::FILE* file = std::fopen(path.c_str(), "rb");
+  if (!file) return false;
+  uint8_t chunk[16384];
+  size_t got = 0;
+  while ((got = std::fread(chunk, 1, sizeof(chunk), file)) > 0)
+    data.insert(data.end(), chunk, chunk + got);
+  std::fclose(file);
+  IvfReader reader;
+  std::string error;
+  if (!reader.open(data, &error)) return false;
+  IvfFrame frame;
+  for (size_t i = 0; i <= index; ++i) {
+    if (!reader.next(&frame, &error)) return false;
+  }
+  *payload = frame.payload;
+  return true;
+}
+
+/* Intra block copy in a real stream (tests/data/intrabc.ivf). The tool is an
+ * inter block inside an intra frame, so both halves of that sentence are worth
+ * checking without pixels: the frame header has to say allow_intrabc, a block
+ * has to set use_intrabc and end up `is_inter` with everything the syntax fixes
+ * (DC_PRED, SIMPLE, bilinear, no palette), and the vector it ends up with has to
+ * obey 7.11.5 - a whole number of samples, pointing at a rectangle that is
+ * inside the tile and, since the picture is still being decoded, clear of the
+ * superblock the block itself is in. */
+void test_intrabc_frame() {
+  std::printf("intra block copy (real key frame)\n");
+  const std::string path = std::string(AV1GPU_TEST_DATA_DIR) + "/intrabc.ivf";
+  std::vector<uint8_t> payload;
+  CHECK(read_ivf_frame(path, 0, &payload));
+  if (payload.empty()) return;
+
+  SequenceHeader seq;
+  FrameHeader header;
+  TileGroup group;
+  const uint8_t* tile = nullptr;
+  size_t tile_size = 0;
+  std::string error;
+  std::vector<Obu> obus;
+  CHECK(split_obus(payload.data(), payload.size(), &obus, &error));
+  for (const Obu& obu : obus) {
+    if (obu.type == ObuType::SequenceHeader) {
+      CHECK(parse_sequence_header(obu.data, obu.size, &seq, &error) == ParseStatus::Ok);
+    } else if (obu.type == ObuType::Frame || obu.type == ObuType::FrameHeader) {
+      CHECK(parse_frame_header(seq, obu.data, obu.size, &header, &error) == ParseStatus::Ok);
+      CHECK(parse_tile_group(seq, header, obu.data, obu.size, &group, &error) ==
+            ParseStatus::Ok);
+      if (group.tiles.size() == 1) {
+        tile = obu.data + group.tiles[0].offset;
+        tile_size = group.tiles[0].size;
+      }
+    }
+  }
+  CHECK(tile != nullptr);
+  if (!tile) return;
+
+  /* the frame is all intra, and it allows the tool - otherwise no block could
+   * code one and the rest of this test would be vacuous */
+  CHECK(header.type == FrameType::Key);
+  CHECK(header.allow_screen_content_tools);
+  CHECK(header.allow_intrabc);
+  /* 7.11.5 needs whole sample vectors, and allow_intrabc implies it */
+  CHECK(header.force_integer_mv);
+
+  TileDecodeResult result;
+  CHECK(decode_intra_tile(seq, header, tile, tile_size, &result, &error) == ParseStatus::Ok);
+  CHECK(result.complete);
+
+  int copies = 0;
+  for (const TileBlock& block : result.blocks) {
+    if (!block.intrabc) {
+      /* every other block of this frame is an ordinary intra block */
+      CHECK(!block.is_inter);
+      continue;
+    }
+    ++copies;
+    CHECK(block.is_inter);
+    CHECK(block.y_mode == kModeDc);
+    CHECK(block.uv_mode == kModeDc);
+    CHECK(block.motion_mode == kMotionTranslation);
+    CHECK(block.compound_type == kCompoundNone);
+    CHECK_EQ(block.palette_size[0], 0);
+    CHECK_EQ(block.palette_size[1], 0);
+    CHECK_EQ(block.interp_filter[0], 3); /* BILINEAR */
+    CHECK_EQ(block.interp_filter[1], 3);
+    CHECK_EQ(block.ref_frame[0], kRefIntra);
+
+    const int bw4 = block_width4(block.size), bh4 = block_height4(block.size);
+    /* a whole sample vector: the lowest three bits are the fractional part */
+    CHECK_EQ(block.mv[0][0] & 7, 0);
+    CHECK_EQ(block.mv[0][1] & 7, 0);
+    CHECK(block.mv[0][0] != 0 || block.mv[0][1] != 0);
+    const int src_col = (block.mi_col * 4 + (block.mv[0][0] >> 3)) / 4;
+    const int src_row = (block.mi_row * 4 + (block.mv[0][1] >> 3)) / 4;
+    /* inside the tile ... */
+    CHECK(src_col >= 0);
+    CHECK(src_row >= 0);
+    CHECK(src_col + bw4 <= (header.frame_width + 3) >> 2);
+    CHECK(src_row + bh4 <= (header.height + 3) >> 2);
+    /* ... and clear of the superblock the block is in, one way or the other */
+    const int sb4 = seq.use_128x128_superblock ? 32 : 16;
+    const int sb_col = (block.mi_col / sb4) * sb4;
+    const int sb_row = (block.mi_row / sb4) * sb4;
+    const bool above = src_row + bh4 <= sb_row;
+    const bool left = src_col + bw4 <= sb_col;
+    if (!above && !left) {
+      std::printf("  block %d,%d copies from %d,%d (superblock %d,%d)\n", block.mi_col,
+                  block.mi_row, src_col, src_row, sb_col, sb_row);
+      CHECK(false);
+    }
+  }
+  /* the fixture codes 239 of them over 16 frames; frame 0 alone has a handful,
+   * so anything close to zero means the flag was not read at all */
+  CHECK(copies > 3);
+}
+
 void test_tile_decoder() {
   std::printf("tile decoder (real key frame)\n");
   const std::string path = std::string(AV1GPU_TEST_DATA_DIR) + "/svt_av1_320x240.ivf";
@@ -1593,6 +1713,7 @@ int main() {
   test_cdf_inheritance();
   test_tile_group();
   test_tile_decoder();
+  test_intrabc_frame();
   test_real_stream();
   return testing::finish("test_frontend");
 }

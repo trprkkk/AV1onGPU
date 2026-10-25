@@ -585,6 +585,14 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
       h.force_integer_mv = seq.seq_force_integer_mv == 1;
     }
   }
+  /* 5.9.2 sets it again right after: "if (FrameIsIntra) force_integer_mv = 1".
+   * An intra frame has no reference frame to interpolate, and its one motion
+   * vector syntax - intra block copy - is defined in whole samples, so the flag
+   * is not so much read as overridden. It changes no syntax element on an intra
+   * frame (allow_high_precision_mv, the only other reader, is coded on inter
+   * frames only), but it is the frame property the reconstruction and the
+   * vector precision rules look at. */
+  if (key_or_intra) h.force_integer_mv = true;
 
   if (seq.frame_id_numbers_present) {
     h.frame_id_present = true;
@@ -686,12 +694,10 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
   }
   /* allow_intrabc only says the *frame* may use intra block copy: the flag is
    * per block (use_intrabc), and an encoder sets it for the whole frame as soon
-   * as it wants the option, whether or not a block takes it. So the header is
-   * accepted here; the tile parser refuses a block that actually copies from
-   * the frame it is decoding, which is the syntax this decoder cannot
-   * reconstruct. A frame that allows it also codes no CDEF, no restoration and
-   * no loop filter levels (see below) - all of which follow from this flag
-   * rather than from the blocks. */
+   * as it wants the option, whether or not a block takes it. A frame that
+   * allows it also codes no CDEF, no restoration and no restore/delta LF
+   * levels (see below) - all of which follow from this flag rather than from
+   * the blocks, so it changes the header even when no block copies. */
 
   if (!key_or_intra) {
     h.allow_high_precision_mv = h.force_integer_mv ? false : r.read_bit();

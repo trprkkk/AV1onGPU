@@ -136,9 +136,8 @@ from a reference, or that is allowed to use skip mode, depends on the frames the
 decoder has already stored - so the parser takes the `RefPool` the caller
 maintains (`refresh_ref_pool()` applies a parsed frame's refresh flags).
 
-What is *refused with a message* instead of being misparsed: superres, intra
-block copy, restoration filters, film grain data, global motion parameters,
-short reference signalling and frame ids.
+What is *refused with a message* instead of being misparsed: superres,
+restoration filters, film grain data, short reference signalling and frame ids.
 
 The tile payload is coded with AV1's boolean range decoder, which
 `src/frontend/range_decoder.hpp` implements: adaptive Q15 symbol CDFs, boolean

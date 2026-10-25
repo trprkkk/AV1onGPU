@@ -84,6 +84,10 @@ enum RefFrameType {
   kRefFrameTypeCount,
 };
 
+/* INTRABC_DELAY_PIXELS: how far past the last superblock an intra block copy
+ * may reach when there is no superblock row above it (7.11.5). */
+constexpr int kIntrabcDelayPixels = 256;
+
 /* The seven entries of `ref_frame_idx`, in specification order: they name the
  * reference *slot* each reference type points at for this frame. */
 constexpr int kRefIdxLast = 0;
@@ -228,6 +232,11 @@ struct TileBlock {
    * direction (a frame with dual filters codes one per list). */
   bool is_inter = false;
   bool skip_mode = false;
+  /* Intra block copy (6.10.8's use_intrabc): the block is `is_inter` in the
+   * syntax but predicts from the frame it is part of, at an integer offset. Its
+   * RefFrame stays INTRA and it codes no mode, no filter and no motion mode -
+   * only its vector, against the second motion vector context. */
+  bool intrabc = false;
   int ref_frame[2] = {kRefIntra, kRefIntra};
   int mv[2][2] = {{0, 0}, {0, 0}};
   int inter_mode = kModeNearestMv;

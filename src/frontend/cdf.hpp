@@ -172,6 +172,10 @@ struct ModeCdf {
  * selection rules in section 8.3 of the specification; where a dimension is not
  * a context but the decoded value itself (the compound reference tree, the
  * motion vector class) the note says so. */
+/* The specification's MV_CONTEXTS: an inter block and an intra block copy
+ * block code their motion vector against separate copies of every table. */
+constexpr int kMvContexts = 2;
+
 struct InterCdf {
   /* [size group][13]: the intra mode of an intra block inside an inter frame
    * (a key frame codes the same symbol with its own neighbour contexts) */
@@ -216,16 +220,23 @@ struct InterCdf {
    * vector table, because adapting one must not change the other: the
    * specification initialises both from the same default rows, so the tables
    * start equal but drift apart as soon as a vector is coded. The defaults are
-   * one row per symbol, so the copies below are broadcast at init time. */
-  uint16_t mv_joint[4];
-  uint16_t mv_sign[2][2];
-  uint16_t mv_class[2][16];
-  uint16_t mv_class0_bit[2][2];
-  uint16_t mv_class0_fr[2][2][4];
-  uint16_t mv_class0_hp[2][2];
-  uint16_t mv_hp[2][2];
-  uint16_t mv_bit[10][2][2];
-  uint16_t mv_fr[2][4];
+   * one row per symbol, so the copies below are broadcast at init time.
+   *
+   * The leading index is the motion vector *context* (MvCtx): 0 for an inter
+   * block, 1 for an intra block copy block, whose vector is coded against its
+   * own copy of the tables (7.11.3.7's MvCtx). Both start from the same
+   * defaults, which is why a frame that only ever codes one of the two
+   * contexts decodes identically either way - and why forgetting the second
+   * context desynchronises the very first intra block copy block. */
+  uint16_t mv_joint[kMvContexts][4];
+  uint16_t mv_sign[kMvContexts][2][2];
+  uint16_t mv_class[kMvContexts][2][16];
+  uint16_t mv_class0_bit[kMvContexts][2][2];
+  uint16_t mv_class0_fr[kMvContexts][2][2][4];
+  uint16_t mv_class0_hp[kMvContexts][2][2];
+  uint16_t mv_hp[kMvContexts][2][2];
+  uint16_t mv_bit[kMvContexts][10][2][2];
+  uint16_t mv_fr[kMvContexts][2][4];
   /* the dynamic reference list: new or predicted motion vector */
   uint16_t new_mv[6][2];
   uint16_t zero_mv[2][2];
