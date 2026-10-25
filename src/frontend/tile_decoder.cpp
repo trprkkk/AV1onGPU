@@ -8,6 +8,7 @@
 #include "frontend/coef_model.hpp"
 #include "frontend/coef_tables.hpp"
 #include "frontend/range_decoder.hpp"
+#include "frontend/warp.hpp"
 
 namespace av1gpu {
 namespace frontend {
@@ -1787,6 +1788,117 @@ class TileParser {
     }
   }
 
+  /* find_warp_samples (7.11.3.8): the neighbours the local warp is fitted to.
+   * A neighbour counts when it uses this block's reference frame, is not
+   * compound, and was decoded in this frame - a block's grid entry is written
+   * when its mode info is read, so an entry still marked intra is either an
+   * intra block or a block this frame has not reached, and neither is a usable
+   * sample.
+   *
+   * Each sample is the centre of the neighbour's block and that centre moved by
+   * the neighbour's vector, both at 1/8 luma sample precision, which is the
+   * form the fit consumes. The scan walks the top edge and then the left edge,
+   * one neighbour block at a time rather than one 4x4 at a time: a neighbour
+   * wider (or taller) than this block contributes a single sample, a narrower
+   * one contributes one per block along the edge.
+   *
+   * The vector distance gate is what makes the fit robust: a neighbour whose
+   * vector disagrees with this block's by more than the block's size allows is
+   * not part of the same motion, so it is left out of the fit. It does not end
+   * the scan - the specification only stops looking once
+   * LEAST_SQUARES_SAMPLES_MAX candidates have been seen. A block with no usable
+   * neighbour at all still uses the first candidate scanned: the fit then has a
+   * single point and produces a translation.
+   *
+   * Returns NumSamples. */
+  int find_warp_samples(int row, int col, BlockSize size, int ref, int mv_x, int mv_y, bool avail_u,
+                        bool avail_l, int cand[kWarpSamplesMax][4]) {
+    const int w4 = block_width4(size), h4 = block_height4(size);
+    const int threshold = clip3_local(16, std::max(w4, h4) * 4, 112);
+    int samples = 0;
+    int scanned = 0;
+    int first[4] = {0, 0, 0, 0};
+    bool have_first = false;
+
+    const auto add_sample = [&](int delta_row, int delta_col) {
+      if (scanned >= kWarpSamplesMax) return;
+      const int mv_row = row + delta_row;
+      const int mv_col = col + delta_col;
+      if (mv_row < 0 || mv_row >= mi_rows() || mv_col < 0 || mv_col >= mi_cols()) return;
+      const MiRef& edge = mi_at(mv_row, mv_col);
+      if (edge.intra || edge.ref[0] != ref || edge.ref[1] != kRefIntra) return;
+      const BlockSize cand_size = block_size_at(mv_row, mv_col);
+      const int cand_w4 = block_width4(cand_size), cand_h4 = block_height4(cand_size);
+      /* the candidate's own top left: when the neighbour is larger than this
+       * block, the cell the scan reached is not the start of it */
+      const int cand_row = mv_row & ~(cand_h4 - 1);
+      const int cand_col = mv_col & ~(cand_w4 - 1);
+      const int mid_y = cand_row * 4 + cand_h4 * 2 - 1;
+      const int mid_x = cand_col * 4 + cand_w4 * 2 - 1;
+      const MiRef& cand_ref = mi_at(cand_row, cand_col);
+      const int mv_diff_row = std::abs(static_cast<int>(cand_ref.mv[0][1]) - mv_y);
+      const int mv_diff_col = std::abs(static_cast<int>(cand_ref.mv[0][0]) - mv_x);
+      const bool valid = (mv_diff_row + mv_diff_col) <= threshold;
+      const int sample[4] = {mid_y * 8, mid_x * 8, mid_y * 8 + cand_ref.mv[0][1],
+                             mid_x * 8 + cand_ref.mv[0][0]};
+      ++scanned;
+      if (!have_first) {
+        for (int j = 0; j < 4; ++j) first[j] = sample[j];
+        have_first = true;
+      }
+      if (!valid) return;
+      for (int j = 0; j < 4; ++j) cand[samples][j] = sample[j];
+      ++samples;
+    };
+
+    /* doTopLeft/doTopRight: whether the top left and the top right corner of
+     * this block is a whole neighbour block's corner as well. A neighbour that
+     * straddles the corner is already sampled above or to the left, so its
+     * vector must not be counted twice. */
+    bool do_top_left = true;
+    bool do_top_right = true;
+    if (avail_u) {
+      const int src_w = block_width4(block_size_at(row - 1, col));
+      if (w4 <= src_w) {
+        const int col_offset = -(col & (src_w - 1));
+        if (col_offset < 0) do_top_left = false;
+        if (col_offset + src_w > w4) do_top_right = false;
+        add_sample(-1, 0);
+      } else {
+        const int limit = std::min(w4, mi_cols() - col);
+        for (int i = 0; i < limit && scanned < kWarpSamplesMax;) {
+          const int src_w2 = block_width4(block_size_at(row - 1, col + i));
+          add_sample(-1, i);
+          i += std::min(w4, src_w2);
+        }
+      }
+    }
+    if (avail_l) {
+      const int src_h = block_height4(block_size_at(row, col - 1));
+      if (h4 <= src_h) {
+        const int row_offset = -(row & (src_h - 1));
+        if (row_offset < 0) do_top_left = false;
+        add_sample(0, -1);
+      } else {
+        const int limit = std::min(h4, mi_rows() - row);
+        for (int i = 0; i < limit && scanned < kWarpSamplesMax;) {
+          const int src_h2 = block_height4(block_size_at(row + i, col - 1));
+          add_sample(i, -1);
+          i += std::min(h4, src_h2);
+        }
+      }
+    }
+    if (do_top_left) add_sample(-1, -1);
+    /* the neighbour past the top right corner is only reachable when the block
+     * is small enough for one block to cover its right edge */
+    if (do_top_right && std::max(w4, h4) <= 16) add_sample(-1, w4);
+    if (samples == 0 && have_first) {
+      for (int j = 0; j < 4; ++j) cand[0][j] = first[j];
+      samples = 1;
+    }
+    return samples;
+  }
+
   /* The rest of intra mode info that an intra block of an *inter* frame shares
    * with a key frame: the chroma mode, its angle and chroma from luma. */
   ParseStatus read_chroma_mode(TileBlock* block, BlockSize size, bool has_chroma) {
@@ -2171,7 +2283,27 @@ class TileParser {
        * the reconstruction stage predicts it as plain translation until it
        * implements them, which is why the counter exists. */
       if (block->motion_mode == kMotionObmc) ++out_->obmc_blocks;
-      if (block->motion_mode == kMotionWarped) ++out_->warped_blocks;
+      if (block->motion_mode == kMotionWarped) {
+        ++out_->warped_blocks;
+        /* Local warped motion (7.11.3.8): the model is fitted to the neighbours
+         * of this block, so it is derived here, while the motion vector grid is
+         * still the one the block saw. A block with no usable neighbour leaves
+         * the fit unsolvable, which is the specification's LocalValid = 0: the
+         * block is then predicted by its own vector. */
+        const int mid_x = col * 4 + bw4 * 2 - 1;
+        const int mid_y = row * 4 + bh4 * 2 - 1;
+        int cand[kWarpSamplesMax][4] = {};
+        const int samples = find_warp_samples(row, col, size, ref0, mv0x, mv0y, top_avail,
+                                              left_avail, cand);
+        block->local_warp_valid = samples > 0 && warp_estimation(cand, samples, mid_x, mid_y, mv0x,
+                                                                 mv0y, block->local_warp);
+        if (trace_enabled()) {
+          std::fprintf(stderr, "LW %d %d n=%d valid=%d p=%d,%d,%d,%d,%d,%d\n", col, row, samples,
+                       block->local_warp_valid ? 1 : 0, block->local_warp[0], block->local_warp[1],
+                       block->local_warp[2], block->local_warp[3], block->local_warp[4],
+                       block->local_warp[5]);
+        }
+      }
     }
 
     /* read_compound_type: nothing to code for a single reference block, and a

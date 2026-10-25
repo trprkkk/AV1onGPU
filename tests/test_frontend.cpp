@@ -9,6 +9,7 @@
  */
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -25,6 +26,7 @@
 #include "frontend/reconstruct.hpp"
 #include "frontend/tile_decoder.hpp"
 #include "frontend/tiles.hpp"
+#include "frontend/warp.hpp"
 #include "test_common.hpp"
 
 namespace {
@@ -1050,6 +1052,78 @@ void test_projected_motion_vectors() {
   CHECK(pool.slots[0].cdf == nullptr);
 }
 
+/* Local warped motion: the least squares fit of 7.11.3.8.
+ *
+ * The samples are pinned here rather than in a stream because a stream can only
+ * show that a model disagrees, not which of the fit's steps did it: the
+ * positions are in 1/8 luma samples, scaled by 2^-2 inside the normal
+ * equations, and the divisor is resolved at 64 bit. What the fit must at least
+ * do is reproduce a translation exactly when every neighbour agrees on one, and
+ * refuse a configuration with no solution at all.
+ */
+void test_local_warp() {
+  std::printf("local warp\n");
+
+  /* the divisor, as 7.11.3.7 defines it: a power of two is the table's first
+   * entry, and the sign rides on the factor */
+  int shift = 0;
+  int64_t factor = 0;
+  resolve_divisor_64(1 << 20, &shift, &factor);
+  CHECK_EQ(shift, 20 + kDivLutPrecBits);
+  CHECK_EQ(factor, static_cast<int64_t>(kDivLut[0]));
+  resolve_divisor_64(-(1 << 20), &shift, &factor);
+  CHECK_EQ(factor, -static_cast<int64_t>(kDivLut[0]));
+  /* Round2Signed rounds a negative input towards zero, and a shift of zero has
+   * no rounding term */
+  CHECK_EQ(round2s_64(static_cast<int64_t>(1) << 34, 34), 1);
+  CHECK_EQ(round2s_64(-(static_cast<int64_t>(1) << 34), 34), -1);
+  CHECK_EQ(round2s_64(static_cast<int64_t>(1) << 33, 34), 1);
+  CHECK_EQ(round2s_64(-(static_cast<int64_t>(1) << 33), 34), -1);
+  CHECK_EQ(round2s_64(-7, 0), -7);
+
+  /* A 16x16 block at mi (8, 4): its centre is (39, 23) luma samples. Three
+   * neighbours above and to the left carry the same vector, (16, -8) in 1/8
+   * samples, so the model that fits them is that translation and no shear. */
+  const int w4 = 4, h4 = 4;
+  const int row = 4, col = 8;
+  const int mid_x = col * 4 + w4 * 2 - 1;
+  const int mid_y = row * 4 + h4 * 2 - 1;
+  const int mv_x = 16, mv_y = -8;
+  int cand[kWarpSamplesMax][4] = {};
+  const int nx[3] = {mid_x - 40, mid_x - 8, mid_x + 24};
+  const int ny[3] = {mid_y - 16, mid_y - 40, mid_y - 16};
+  for (int i = 0; i < 3; ++i) {
+    cand[i][0] = ny[i] * 8;
+    cand[i][1] = nx[i] * 8;
+    cand[i][2] = ny[i] * 8 + mv_y;
+    cand[i][3] = nx[i] * 8 + mv_x;
+  }
+  int params[6] = {0, 0, 0, 0, 0, 0};
+  CHECK(warp_estimation(cand, 3, mid_x, mid_y, mv_x, mv_y, params));
+  /* The linear part is the identity: the divisor keeps eight bits of mantissa,
+   * so the fit lands within a fraction of a percent of it rather than on it. */
+  CHECK(std::abs(params[2] - kGmIdentityParam) <= 128);
+  CHECK(std::abs(params[5] - kGmIdentityParam) <= 128);
+  CHECK(std::abs(params[3]) <= 128);
+  CHECK(std::abs(params[4]) <= 128);
+  /* What must hold exactly is that the block's own centre lands on its own
+   * vector: the translation is derived from the linear part rather than
+   * fitted, so a slightly wrong scale is compensated instead of showing up as a
+   * shift. The model takes luma positions and produces them at
+   * WARPEDMODEL_PREC_BITS of a luma sample, so the centre in 1/8 samples is
+   * (mid_x * 8 + mv_x) * 2^(PREC_BITS - 3) before the shift. */
+  CHECK_EQ(params[2] * mid_x + params[3] * mid_y + params[0],
+           (mid_x * 8 + mv_x) * (1 << (kWarpmodelPrecBits - 3)));
+  CHECK_EQ(params[4] * mid_x + params[5] * mid_y + params[1],
+           (mid_y * 8 + mv_y) * (1 << (kWarpmodelPrecBits - 3)));
+
+  /* No sample at all leaves the normal equations empty, and their determinant
+   * zero: the specification's LocalValid = 0, the block is predicted by its
+   * vector. This is the only way the fit itself can fail - the rounding of the
+   * diagonal terms keeps the determinant non-zero for any single sample. */
+  CHECK(!warp_estimation(cand, 0, mid_x, mid_y, mv_x, mv_y, params));
+}
+
 /* The two halves of handing a probability context to a later frame: the tables
  * travel with the reference slot, and what a later frame starts from is those
  * tables with every adaptation counter back at zero - the probabilities the
@@ -1515,6 +1589,7 @@ int main() {
   test_segmentation();
   test_block_geometry();
   test_projected_motion_vectors();
+  test_local_warp();
   test_cdf_inheritance();
   test_tile_group();
   test_tile_decoder();

@@ -90,10 +90,12 @@ not disagreements between backends.
   applies the specification's flipSign rule, the difference mask is
   `Clip3(0, 64, 38 + Round2(abs(pred0 - pred1), (BitDepth - 8) + InterPostRound)
   / 16)`, and both are evaluated on the luma grid and averaged down for chroma
-  samples. Global warped motion (`useWarp` per reference list, 7.11.3.5-7) rides
-  the same blend: each reference is predicted through its own affine model
-  when the frame's model is steeper than a translation and the region is at
-  least 8x8.
+  samples. Warped motion rides the same blend: global (`useWarp` per reference
+  list, 7.11.3.5-7) when the frame's model is steeper than a translation, and
+  local (7.11.3.8, the least squares fit to the neighbours, in
+  `src/frontend/warp.hpp`) when the block's `motion_mode` says so - in both
+  cases only for a prediction region of at least 8x8, and in both cases through
+  the same setup shear and kernel.
 
 ## Closed loop invariant
 
@@ -232,6 +234,14 @@ was built for.)
 | `wg` | 15 | the chroma of sub-8x8 blocks |
 | `w_cu4` | 30 | global motion, sub-8x8 chroma |
 | `w_cu2` | 30 | ROTZOOM global motion, a difference mask on chroma |
+| `lwn2`, `lwn3` | 30 each | local warped motion (`motion_mode = LOCALWARP`) |
+
+The two local-warp streams are the ROTZOOM clip re-encoded with libaom at
+`--cpu-used=2` and `--cpu-used=3`, `--crf=30`, `--lag-in-frames=25`,
+`--enable-restoration=0 --enable-obmc=0 --tiles=1x1`: they code about 60 and 140
+local-warp blocks respectively. They are the only streams in the set that do -
+`motion_mode` is `SIMPLE` in every other one - which is why the feature went
+unimplemented for so long without anything failing.
 
 A single sample of drift is worth chasing rather than tolerating: the last three
 differences on `w_cu2` were one level on four chroma samples spread over three

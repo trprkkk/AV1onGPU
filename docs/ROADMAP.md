@@ -191,16 +191,54 @@ appended to the same table the subpel path uploads, so a backend still transfers
 one table. Every fixture whose global motion is TRANSLATION or absent decodes
 bit exactly, and so do the ROTZOOM ones (`w_cu2`, `w_cu4`) now.
 
-OBMC is implemented (mask table, per-strip prediction, the above-then-left pass
-order) but none of the fixtures code `motion_mode` as anything but `SIMPLE`, so
-the only thing proven about it today is that it costs nothing when unused. A
-fixture that actually uses OBMC needs libaom's speed settings raised until the
-encoder picks it.
+Local warped motion (7.11.3.8) is the other half of the warp story: instead of a
+model the frame header codes, the model is fitted to the block's *neighbours*, so
+it has to be derived while the frame is parsed. `find_warp_samples` walks the top
+and then the left edge of the block and collects up to
+`LEAST_SQUARES_SAMPLES_MAX` (8) neighbours that use the block's reference frame
+and are not compound, each as the centre of its block and that centre moved by
+its vector, in 1/8 luma samples. A neighbour whose vector disagrees with the
+block's by more than `Clip3(16, 112, max(Block_Width, Block_Height))` is not part
+of the same motion, so it is left out of the fit; if none at all qualifies, the
+first one scanned is used on its own and the fit degenerates to a translation.
+The fit itself (`frontend/warp.hpp`) is the specification's 2x2 normal equations
+solve over `ls_product(a, b) = ((a * b) >> 2) + (a + b)`, including the +8/+4
+bias terms that absorb the model's constant column. Its determinant is a product
+of two squared sums and does not fit 32 bits, so the divisor of 7.11.3.7 is
+resolved at 64 and the divisions use 64 bit products. The result takes exactly
+the same road a global model does - setup shear, then the same kernel - and a
+model that fails the shear check is `LocalValid = 0`: the block is then predicted
+by its vector.
 
-Still missing from the inter path: **local warped motion** (`motion_mode =
-LOCALWARP`, the least squares warp estimation of 7.11.3.8) and inter/intra
-compound. Intrabc and palette are the remaining intra tools, and they only
-appear on screen content streams.
+Three traps, one of which cost a hunt:
+
+* Motion vector components are stored **x first** everywhere in this decoder,
+  while the specification writes the row component first. Both the sample
+  positions and the fit must use the specification's order.
+* `useWarp` is decided **per plane**; only the fit is luma only. A chroma region
+  of the same block is warped with the same parameters whenever it is at least
+  8x8. Leaving chroma translational is a one-level error on a few dozen chroma
+  samples per frame - invisible in PSNR, and exactly what the first stream built
+  for this showed.
+* The "vector too far from the block's" test skips a sample, it does not end the
+  scan: the specification only stops after eight candidates.
+
+No fixture in this repository codes LOCALWARP (`motion_mode` is `SIMPLE` in all
+of them), so this was developed against streams from libaom: 320x240, 30 frames,
+`--cpu-used=2 --crf=30 --lag-in-frames=25 --enable-restoration=0 --tiles=1x1`,
+which codes about 60 local-warp blocks over those 30 frames. Two such streams
+(the ROTZOOM clip behind `w_cu2`, and the same clip at `--cpu-used=3`) decode bit
+exactly against dav1d, 30 of 30 frames each.
+
+OBMC is implemented (mask table, per-strip prediction, the above-then-left pass
+order) but none of the repository's fixtures code `motion_mode` as anything but
+`SIMPLE`. The streams above, encoded with OBMC left enabled, do: they differ from
+dav1d on a handful of samples per frame (about 9k samples over 30 frames, against
+output where every frame has 76 800 luma samples), so OBMC still needs a fixture
+and a hunt of its own.
+
+Still missing from the inter path: inter/intra compound. Intrabc and palette are
+the remaining intra tools, and they only appear on screen content streams.
 
 ## 4. Spec-conformant film grain
 

@@ -217,6 +217,13 @@ struct TileBlock {
   int mv[2][2] = {{0, 0}, {0, 0}};
   int inter_mode = kModeNearestMv;
   int motion_mode = kMotionTranslation;
+  /* Local warped motion (7.11.3.8): the six LocalWarpParams the fit produced,
+   * and whether the fit was solvable at all. The model is derived from the
+   * neighbours the parser had at this block, so it is computed while the frame
+   * is parsed; the setup shear check is left to the reconstructor, which runs
+   * the same code for a global model. */
+  int local_warp[6] = {0, 0, 0, 0, 0, 0};
+  bool local_warp_valid = false;
   int interp_filter[2] = {0, 0};
   bool interintra = false;
   int interintra_mode = 0;

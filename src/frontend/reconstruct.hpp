@@ -444,10 +444,6 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
         *error = "reconstruct: inter/intra compound prediction is not implemented";
         return false;
       }
-      if (block.motion_mode == kMotionWarped) {
-        *error = "reconstruct: warped motion is not implemented";
-        return false;
-      }
       const bool two_refs = block.compound_type != kCompoundNone;
       for (int i = 0; i < (two_refs ? 2 : 1); ++i) {
         const int type = block.ref_frame[i] - 1; /* kRefLast (1) -> index 0 */
@@ -628,9 +624,23 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
             if (region->w >= 8 && region->h >= 8) region->warp[i] = true;
           }
         };
+        /* Local warped motion (predict_inter steps 2-3 and 7): the model the
+         * parser fitted to this block's neighbours takes the place of a global
+         * one. The fit is done at luma resolution and only for the luma plane,
+         * but useWarp is decided per plane - the same parameters are applied to
+         * a chroma region too, as long as that region is at least 8x8. The
+         * setup shear check is the engine's, the same one a global model gets,
+         * and a model that fails it falls back to the block's vector. */
+        auto apply_local_warp = [&](BlockSyntax* region) {
+          if (block.motion_mode != kMotionWarped || !block.local_warp_valid) return;
+          if (region->w < 8 || region->h < 8) return;
+          for (int j = 0; j < 6; ++j) region->warp_params[0][j] = block.local_warp[j];
+          region->warp[0] = true;
+        };
         if (!split) {
           BlockSyntax region = bs;
           apply_global_warp(&region);
+          apply_local_warp(&region);
           inter_regions[plane].push_back(region);
         } else {
           for (int y = 0; y < bs.h; y += pred_h) {
@@ -663,6 +673,7 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
                 region.filter_v = to_filter_type(cell->interp_filter[0]);
               }
               apply_global_warp(&region);
+              apply_local_warp(&region);
               inter_regions[plane].push_back(region);
             }
           }
