@@ -80,8 +80,34 @@ not disagreements between backends.
   tail that pads with one bits once the tile data runs out. There is no
   tolerance knob here on purpose: the tile payload is either decoded exactly
   like a reference decoder or it desynchronises within a few symbols.
-* **Scheduling.** The wavefront order is a scheduling detail only: the tests
-  require the output to be independent of `dependency_cell`, and it is.
+* **Scheduling.** The wavefront order is a scheduling detail only, and the
+  output must not depend on it: two decodes of the same syntax have to produce
+  the same picture (and the same number of waves). The schedule itself is exact
+  sample ownership rather than a grid: every sample is owned by the block that
+  writes it, over the coded extent, and a block waits for the owners of the
+  samples its prediction reads - the plain left column and above row always, the
+  second block of either only when the mode reads it (a directional block reads
+  above samples two blocks wide below 90 degrees and left samples that far above
+  180; DC, the smooths, Paeth, filter intra and chroma from luma read the plain
+  edges, and a palette block reads no edge at all). All three planes share one
+  dependency grid, so an intra frame costs the length of its diagonal instead of
+  one diagonal per plane. Measured on the fixtures, as the largest number of
+  waves in a frame:
+
+  | fixture | before | after |
+  | --- | --- | --- |
+  | `lossless` (160x120, 4 intra frames) | 201 | 77 |
+  | `lr` (320x240, one intra frame) | 250 | 118 |
+  | `odd_size` (130x100) | 96 | 47 |
+  | `inter_intra` (320x240) | 142 | 105 |
+  | `intrabc` | 89 | 38 |
+  | `palette_sc` | 102 | 31 |
+  | `lw_t2` | 209 | 125 |
+
+  Every fixture stays bit exact through the CPU backend and through the OpenCL
+  replay, which runs the jobs of a wave as separate dispatches with no ordering
+  between them - a dependency that was dropped by mistake shows up there as a
+  wrong sample, not as a slow frame.
 * **The chroma of a sub-8x8 block is predicted per luma cell.** In 4:2:0 the
   chroma block of a luma block that is one 4x4 wide (or high) covers two luma
   blocks in that direction, and each of them predicts its half with its own

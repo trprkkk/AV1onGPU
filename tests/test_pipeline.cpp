@@ -140,6 +140,7 @@ Clip without_restoration(const Clip& clip) {
 
 struct Run {
   std::vector<Frame> frames;
+  std::vector<int> waves; /* the schedule of each frame, as the plan counted it */
   double ms = 0;
   bool ok = false;
   std::string error;
@@ -154,6 +155,7 @@ Run decode_clip(const BackendOptions& options, const Clip& clip) {
     return run;
   }
   run.frames.resize(clip.syntax.size());
+  run.waves.resize(clip.syntax.size());
   int slot = -1;
   for (size_t f = 0; f < clip.syntax.size(); ++f) {
     FrameSyntax syntax = clip.syntax[f];
@@ -169,6 +171,7 @@ Run decode_clip(const BackendOptions& options, const Clip& clip) {
     if (slot >= 0) decoder->release_reference(slot);
     slot = next;
     run.ms += decoder->stats().total_ms;
+    run.waves[f] = decoder->stats().waves;
   }
   if (slot >= 0) decoder->release_reference(slot);
   run.ok = true;
@@ -312,7 +315,8 @@ int main() {
     }
     for (size_t f = 0; f < clip.source.size(); ++f) {
       const Psnr psnr = frame_psnr(cpu.frames[f], clip.recon[f]);
-      std::printf("  frame %zu: %.2f dB (vs encoder recon) %.2f ms\n", f, psnr.y, cpu.ms);
+      std::printf("  frame %zu: %.2f dB (vs encoder recon) %d wave(s) %.2f ms\n", f, psnr.y,
+                  cpu.waves[f], cpu.ms);
       CHECK(psnr.y > 40.0);
       /* the encoder's own reconstruction and the decoder must agree exactly */
       CHECK(identical(cpu.frames[f], clip.recon[f]));
@@ -336,8 +340,18 @@ int main() {
     const Run ra = decode_clip(options, clip);
     const Run rb = decode_clip(options, clip);
     CHECK(ra.ok && rb.ok);
-    if (ra.ok && rb.ok)
+    if (ra.ok && rb.ok) {
+      CHECK(ra.waves == rb.waves);
       for (size_t f = 0; f < clip.source.size(); ++f) CHECK(identical(ra.frames[f], rb.frames[f]));
+      /* The schedule waits for the samples a block's prediction reads, so an
+       * intra frame costs about the length of its block diagonal - (W + H) /
+       * block size, plus a wave or two where chroma from luma links a plane to
+       * the luma one. Waiting for edges the mode does not read, or giving every
+       * plane a diagonal of its own, doubles that. */
+      const int diagonal = clip.cfg.width / clip.cfg.block_size +
+                           clip.cfg.height / clip.cfg.block_size;
+      for (size_t f = 0; f < clip.source.size(); ++f) CHECK(ra.waves[f] <= diagonal + 2);
+    }
   }
 
   /* ---- 3. GPU backends, when present ------------------------------------ */

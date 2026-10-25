@@ -412,16 +412,25 @@ sample equal to dav1d's, on the CPU backend and through the OpenCL kernels
 
 ## 5. Faster scheduling for intra frames
 
-An intra frame currently needs a wave per block diagonal (~142 waves for
-640×360), which is a lot of kernel launches. Options, in increasing order of
-effort:
+**Done: the schedule is exact sample ownership, and it costs one diagonal.**
+The two cheap options are in. The grid was replaced by a per-sample owner map
+over the coded extent, so a block waits only for the blocks that own the samples
+its *prediction* reads, not for a cell or a region. Two things then shortened the
+chain by half: the three planes share one dependency grid (chroma used to add a
+diagonal of its own even where nothing crossed planes), and the edge extensions
+are gated by the mode - only a directional block with an angle below 90 degrees
+reads two blocks of above samples, only one above 180 reads two blocks of left
+samples, and a palette block reads no edge at all. Measured per frame, worst case
+in the clip: `lossless` 201 -> 77 waves, `lr` 250 -> 118, `odd_size` 96 -> 47,
+`inter_intra` 142 -> 105, `intrabc` 89 -> 38, `palette_sc` 102 -> 31, `lw_t2`
+209 -> 125. The numbers and the rule are in `docs/ACCURACY.md`; every fixture
+stays bit exact, through the CPU backend and through the OpenCL replay.
 
-* reduce the grid cell to the smallest block size in the frame (cheap, already
-  helps),
-* decode all three planes through one dependency grid so chroma does not add a
-  second diagonal pass (this is where most of the 142 comes from),
+What is left on this axis is the third option:
+
 * a persistent kernel that walks the wavefront on the device (needs an atomics
-  based scheduler; well worth it for 1080p+).
+  based scheduler; well worth it for 1080p+), which is the only way past one
+  dispatch per diagonal.
 
 ## 6. Zero-copy output, and being usable by a browser
 

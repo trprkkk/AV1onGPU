@@ -116,6 +116,15 @@ class EngineDecoder final : public av1gpu::Decoder {
 /* to replay exactly the jobs the real backends submit.                        */
 /* ------------------------------------------------------------------------- */
 
+/* Mode_To_Angle (the table the kernels use): the prediction angle of each intra
+ * mode in degrees, so the scheduler can tell which edge a block reads. */
+static int intra_mode_angle(PredictionMode mode) {
+  static const int angles[] = {0, 90, 180, 45, 135, 113, 157, 203, 67, 0, 0, 0, 0};
+  const int m = static_cast<int>(mode);
+  if (m < 0 || m >= static_cast<int>(sizeof(angles) / sizeof(angles[0]))) return 0;
+  return angles[m];
+}
+
 static int resolve_slot(const FrameSyntax& syntax, int ref_id) {
   if (ref_id < 0) return -1;
   if (ref_id >= static_cast<int>(syntax.reference_slots.size())) return -1;
@@ -281,21 +290,48 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
                     : (b.x > 0 && already_decoded(p, b.x - 1, b.x - 1, b.y + b.h,
                                                   b.y + 2 * b.h - 1, bi)));
           }
+          /* The predictor does not read every edge for every mode, and waiting
+           * for a sample nothing looks at costs a wave: a directional block
+           * reads two blocks of above samples only when its angle is below 90,
+           * two blocks of left samples only when it is above 180, and every
+           * other mode (DC, the smooths, Paeth, filter intra, chroma from luma)
+           * reads the plain edges. A palette block reads no edge at all - the
+           * colour map is coded, not predicted - so it waits for nothing here.
+           * The three planes are one dependency grid, so an intra frame costs
+           * the length of its diagonal, not one diagonal per plane. */
+          int left_y1 = b.y + b.h - 1;
+          int above_x1 = b.x + b.w - 1;
+          if (b.is_intra && !b.use_palette) {
+            const int mode = static_cast<int>(b.mode);
+            /* the directional modes are Vertical .. D67, the eight entries
+             * after Dc; anything else is not directional */
+            if (mode >= static_cast<int>(PredictionMode::Vertical) &&
+                mode <= static_cast<int>(PredictionMode::D67)) {
+              const int pangle = intra_mode_angle(b.mode) + 3 * b.angle_delta;
+              if (pangle < 90 && above_right[bi]) above_x1 = b.x + 2 * b.w - 1;
+              if (pangle > 180 && below_left[bi]) left_y1 = b.y + 2 * b.h - 1;
+            }
+          } else if (b.is_intra) {
+            /* a palette block: no edge samples are read */
+            above_x1 = b.x - 1;
+            left_y1 = b.y - 1;
+          }
           const int left_x = b.x - 1;
-          const int left_y1 = b.y + (below_left[bi] ? 2 * b.h : b.h) - 1;
           for (int y = b.y; y <= left_y1; ++y) {
             const int o = sample_owner(p, left_x, y);
             if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
           }
           const int above_y = b.y - 1;
-          const int above_x1 = b.x + (above_right[bi] ? 2 * b.w : b.w) - 1;
           for (int x = b.x; x <= above_x1; ++x) {
             const int o = sample_owner(p, x, above_y);
             if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
           }
-          /* the sample diagonally above-left, used as the corner */
-          const int o = sample_owner(p, left_x, above_y);
-          if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+          /* the sample diagonally above-left, used as the corner (and by the
+           * recursive filter, which reads its 2x2 neighbourhood) */
+          if (above_x1 >= b.x || left_y1 >= b.y) {
+            const int o = sample_owner(p, left_x, above_y);
+            if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+          }
         }
         /* An intra block copy block reads a rectangle of *this* frame, so it
          * has to run after every block owning a sample of that rectangle - and

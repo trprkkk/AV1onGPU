@@ -209,20 +209,27 @@ position (it found two bugs while it ran, see `docs/ACCURACY.md`).
 ## How a frame is scheduled
 
 Intra prediction reads reconstructed neighbours, so the blocks of a frame cannot
-all run at once. The engine records which block owns which part of the frame on
-a coarse grid and gives every block the earliest wave in which its neighbours
-are already reconstructed:
+all run at once. The engine records which block owns every sample of the coded
+picture — the frame rounded up to the block grid — and gives every block the
+earliest wave in which the samples its prediction reads are already
+reconstructed:
 
 ```
-wave(block) = 1 + max(wave(above), wave(left), wave(above-left),
-                      [wave(co-located luma) for chroma-from-luma])
+wave(block) = 1 + max(wave(owner(sample)) for every sample the block reads)
 ```
+
+The samples are the plain left column and above row, plus the second block of
+either when the mode actually reads it (a directional block reads above samples
+two blocks wide below 90 degrees, left samples that far above 180), plus the
+co-located luma block for chroma from luma. A palette block predicts nothing and
+reads nothing. All three planes share one dependency grid.
 
 Inter blocks only read reference frames, so they all land in wave 0 — an inter
 frame is typically **one** wave, i.e. a handful of kernel launches for the whole
 picture. Waves run in order; inside a wave the jobs are completely independent,
-which is what a GPU wants. `BackendOptions::dependency_cell` trades launch count
-against parallelism.
+which is what a GPU wants. An intra frame costs about the length of its block
+diagonal — 31 to 125 waves across the streams in `tests/data`, roughly half of
+what a coarser schedule gave (the numbers are in `docs/ACCURACY.md`).
 
 ## Tests
 
