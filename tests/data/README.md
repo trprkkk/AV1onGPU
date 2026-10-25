@@ -5,6 +5,25 @@ logged while decoding that stream's key frame, together with the CDFs it used
 and the range coder state it reached; `tests/test_entropy.cpp` replays them.
 See `docs/ACCURACY.md` for how it was captured.
 
+`lw_t2.ivf` and `lw_t3.ivf` are 30 frame 320x240 streams that code local warped
+motion (`motion_mode = LOCALWARP`) and OBMC, the two inter tools that no smaller
+fixture exercises. They were encoded with libaom at `--cpu-used=2` and `-3`,
+`--crf=30 --lag-in-frames=25 --enable-restoration=0 --tiles=1x1`, and are kept
+here rather than next to the other fixtures because they are checked for *pixels*
+and not only for syntax: `tests/data/lw_t?.hash` holds one FNV-1a 64 hash per
+shown frame of the reference decoder's output, and the `stream_lw_t2` /
+`stream_lw_t3` tests decode the streams with `av1gpu_decode --hash-check` and
+compare. A YUV reference would be 3.4 MB per stream; the hash lists are 2 KB.
+
+To regenerate a hash list, decode the stream, compare it with dav1d, and only
+then record our own output:
+
+```
+./build/bin/dav1d -i lw_t2.ivf --muxer yuv -o reference.yuv
+./build/bin/av1gpu_decode lw_t2.ivf -o ours.yuv --compare reference.yuv
+./build/bin/av1gpu_decode lw_t2.ivf --hash-out lw_t2.hash
+```
+
 `svt_av1_320x240.ivf` is a real AV1 stream, not a hand written header: six frames
 of a 320x240 gradient at 8 bit 4:2:0, encoded with SVT-AV1 (crf 40, preset 10)
 and muxed into IVF. The front-end tests parse it end to end, so the parser is

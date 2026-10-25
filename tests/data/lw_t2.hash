@@ -1,0 +1,32 @@
+# lw_t2.ivf: 30 frames of 320x240 8 bit 4:2:0, decoded by dav1d
+# one FNV-1a 64 hash per shown frame, in output order
+frame 0: 0x86bfc87ecefdcc7f
+frame 1: 0xa665e2aa57392283
+frame 2: 0x48d5841e5c27aad4
+frame 3: 0xa1200420b6696a3d
+frame 4: 0x6f9175b78bd60a8d
+frame 5: 0x7c35b4f7a88bafd8
+frame 6: 0x5eced705974052df
+frame 7: 0x7a7e605ebb47a4da
+frame 8: 0x5c4962a916039da1
+frame 9: 0x277215366a2d51f2
+frame 10: 0xaaf0cf92d67307bf
+frame 11: 0xe84308d7ea074935
+frame 12: 0x4db9c86581d533b7
+frame 13: 0x53e56a537f9548a9
+frame 14: 0xf9f05a45a22ee352
+frame 15: 0xfcb6b54549ec06b3
+frame 16: 0xea7e22202b8e0adc
+frame 17: 0x7dabfb82d1dad09a
+frame 18: 0xd1f92eb1b8d486bd
+frame 19: 0xbe293270ebd3b758
+frame 20: 0x06ddeeca7a19e931
+frame 21: 0xc1d73ce7631ee09b
+frame 22: 0xbc45e2b32d313815
+frame 23: 0x84ed28bd4be8ce1d
+frame 24: 0x0444ce5df88a8e30
+frame 25: 0xbcdcf5c5f31d1835
+frame 26: 0xba0ee6c277016876
+frame 27: 0xd688f628fc4295e8
+frame 28: 0x16b7da52abad5c6f
+frame 29: 0xe906292b4fd9f42b

@@ -16,6 +16,12 @@
  * That is the check that matters: the reference is dav1d with its loop filter
  * disabled (AV1GPU_NOLF), so a difference is a reconstruction difference and
  * not a filter difference.
+ *
+ * `--hash-out F` writes one FNV-1a 64 hash of each shown frame's 8 bit planar
+ * output, in output order; `--hash-check F` decodes and compares against such a
+ * file, naming the first frame that differs. A hash list is a couple of
+ * kilobytes per stream instead of a few megabytes of YUV, which is what makes a
+ * bit exactness regression test cheap enough to keep in the repository.
  */
 #include <cmath>
 #include <cstdio>
@@ -43,6 +49,8 @@ struct Options {
   std::string input;
   std::string output;
   std::string compare;
+  std::string hash_out;
+  std::string hash_check;
   std::string backend = "auto";
   int frames = -1;
   bool verbose = false;
@@ -54,6 +62,8 @@ void usage() {
       "  FILE              an .ivf file or a raw OBU stream\n"
       "  -o, --output F    write the decoded frames to F as planar 8 bit YUV\n"
       "  --compare F       compare against a planar 8 bit YUV file\n"
+      "  --hash-out F      write one hash per shown frame to F\n"
+      "  --hash-check F    compare the output against the hashes in F\n"
       "  --backend B       auto (default), cpu, opencl or cuda\n"
       "  --frames N        stop after N temporal units\n"
       "  -v, --verbose     print every OBU and every frame\n"
@@ -87,6 +97,38 @@ BackendKind parse_backend(const std::string& name, bool* ok) {
   if (name == "cuda") return BackendKind::CUDA;
   *ok = false;
   return BackendKind::Auto;
+}
+
+/* FNV-1a 64 over the frame's bytes. It is used on the 8 bit planar output, which
+ * is exactly what `--compare` reads, so a hash mismatch means a picture
+ * difference and not a bit depth or layout difference. */
+uint64_t frame_hash(const std::vector<uint8_t>& bytes) {
+  uint64_t hash = 0xcbf29ce484222325ull;
+  for (uint8_t byte : bytes) {
+    hash ^= byte;
+    hash *= 0x100000001b3ull;
+  }
+  return hash;
+}
+
+/* A hash list is one `frame N: 0x...` line per shown frame, in output order, as
+ * `--hash-out` writes it. `#` comments and blank lines are skipped, and the
+ * first field has to be `frame`, so a comment that happens to contain `0x` (a
+ * `320x240` resolution, say) is not read as a hash. */
+bool read_hashes(const std::string& path, std::vector<uint64_t>* hashes) {
+  std::FILE* file = std::fopen(path.c_str(), "r");
+  if (!file) return false;
+  char line[512];
+  while (std::fgets(line, sizeof(line), file)) {
+    const char* at = line;
+    while (*at == ' ' || *at == '\t') ++at;
+    if (*at == '#' || *at == '\n' || *at == '\0') continue;
+    unsigned long long index = 0, hash = 0;
+    if (std::sscanf(at, "frame %llu: 0x%llx", &index, &hash) != 2) continue;
+    hashes->push_back(static_cast<uint64_t>(hash));
+  }
+  std::fclose(file);
+  return true;
 }
 
 /* One plane of one frame, so the comparison can name the sample that differs
@@ -144,6 +186,14 @@ int main(int argc, char** argv) {
       opt.compare = argv[++i];
       continue;
     }
+    if (arg == "--hash-out" && i + 1 < argc) {
+      opt.hash_out = argv[++i];
+      continue;
+    }
+    if (arg == "--hash-check" && i + 1 < argc) {
+      opt.hash_check = argv[++i];
+      continue;
+    }
     if (arg == "--backend" && i + 1 < argc) {
       opt.backend = argv[++i];
       continue;
@@ -196,6 +246,20 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  std::vector<uint64_t> expected_hashes;
+  if (!opt.hash_check.empty() && !read_hashes(opt.hash_check, &expected_hashes)) {
+    std::fprintf(stderr, "av1gpu_decode: cannot read %s\n", opt.hash_check.c_str());
+    return 2;
+  }
+  std::FILE* hash_file = nullptr;
+  if (!opt.hash_out.empty()) {
+    hash_file = std::fopen(opt.hash_out.c_str(), "w");
+    if (!hash_file) {
+      std::fprintf(stderr, "av1gpu_decode: cannot write %s\n", opt.hash_out.c_str());
+      return 2;
+    }
+  }
+
   std::FILE* out_file = nullptr;
   if (!opt.output.empty()) {
     out_file = std::fopen(opt.output.c_str(), "wb");
@@ -234,6 +298,7 @@ int main(int argc, char** argv) {
   size_t decoded_frames = 0;
   size_t reference_offset = 0;
   int comparisons = 0, exact = 0;
+  size_t hashes_written = 0, hashes_checked = 0, hash_mismatches = 0;
 
   /* The decoder's own reference pool. AV1 has eight reference slots; each holds
    * a backend pool slot, and - because a show_existing_frame has to output a
@@ -258,6 +323,24 @@ int main(int argc, char** argv) {
   auto emit_picture = [&](const Frame& picture, int ss_x, int ss_y) {
     std::vector<uint8_t> yuv;
     frame_to_yuv8(picture, &yuv);
+    if (hash_file && !yuv.empty()) {
+      std::fprintf(hash_file, "frame %zu: 0x%016llx\n", hashes_written++,
+                   static_cast<unsigned long long>(frame_hash(yuv)));
+    }
+    if (!expected_hashes.empty() && !yuv.empty()) {
+      const size_t at = hashes_checked++;
+      const uint64_t got = frame_hash(yuv);
+      if (at >= expected_hashes.size()) {
+        std::printf("frame %zu: hash 0x%016llx, but the hash list ends at %zu frame(s)\n", at,
+                    static_cast<unsigned long long>(got), expected_hashes.size());
+        ++hash_mismatches;
+      } else if (expected_hashes[at] != got) {
+        std::printf("frame %zu: hash 0x%016llx, expected 0x%016llx\n", at,
+                    static_cast<unsigned long long>(got),
+                    static_cast<unsigned long long>(expected_hashes[at]));
+        ++hash_mismatches;
+      }
+    }
     if (out_file && !yuv.empty()) std::fwrite(yuv.data(), 1, yuv.size(), out_file);
     if (reference.empty()) return;
     Frame expected(picture.width, picture.height, picture.bit_depth, ss_x, ss_y);
@@ -503,8 +586,17 @@ int main(int argc, char** argv) {
   }
 
   if (out_file) std::fclose(out_file);
+  if (hash_file) std::fclose(hash_file);
   if (comparisons > 0)
     std::printf("%d of %d decoded frame(s) bit exact\n", exact, comparisons);
+  if (!expected_hashes.empty()) {
+    const size_t matched = hashes_checked - hash_mismatches;
+    std::printf("%zu of %zu decoded frame(s) match the recorded hashes\n", matched,
+                expected_hashes.size());
+    /* A short output is a difference too: a stream that stops early must not pass
+     * just because every frame it did produce matches. */
+    if (hash_mismatches != 0 || hashes_checked != expected_hashes.size()) status = 1;
+  }
   std::printf("%zu frame(s) decoded\n", decoded_frames);
   return status;
 }

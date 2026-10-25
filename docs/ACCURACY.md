@@ -235,13 +235,33 @@ was built for.)
 | `w_cu4` | 30 | global motion, sub-8x8 chroma |
 | `w_cu2` | 30 | ROTZOOM global motion, a difference mask on chroma |
 | `lwn2`, `lwn3` | 30 each | local warped motion (`motion_mode = LOCALWARP`) |
+| `lw_t2`, `lw_t3` | 30 each | local warped motion **and** OBMC (in `tests/data/`) |
 
-The two local-warp streams are the ROTZOOM clip re-encoded with libaom at
+The four local-warp streams are the ROTZOOM clip re-encoded with libaom at
 `--cpu-used=2` and `--cpu-used=3`, `--crf=30`, `--lag-in-frames=25`,
-`--enable-restoration=0 --enable-obmc=0 --tiles=1x1`: they code about 60 and 140
-local-warp blocks respectively. They are the only streams in the set that do -
-`motion_mode` is `SIMPLE` in every other one - which is why the feature went
+`--enable-restoration=0 --tiles=1x1`, the `lwn*` pair with `--enable-obmc=0` and
+the `lw_t*` pair with OBMC left on: they code about 60, 140, 64 and 139
+local-warp blocks respectively, and the `lw_t*` pair codes 4x4-unit-aligned OBMC
+neighbours on top of that. They are the only streams in the set that code
+`motion_mode` as anything but `SIMPLE` - which is why the feature went
 unimplemented for so long without anything failing.
+
+`tests/data/lw_t2.ivf` and `tests/data/lw_t3.ivf` are the first two streams that
+are kept in the repository for a *pixel* check rather than a parser check,
+because a full YUV reference would be 3.4 MB per stream for 30 frames of 320x240.
+`av1gpu_decode --hash-out F` writes one FNV-1a 64 hash of each shown frame's
+8 bit planar output in output order, and `--hash-check F` decodes and compares
+against such a list, naming the first frame that differs and exiting non zero;
+`ctest` runs exactly that (`stream_lw_t2`, `stream_lw_t3`). The recorded values
+come from dav1d's output for the same streams, so they are a reference decoder's
+pictures and not this decoder's. Regenerate one with
+
+```
+./build/bin/av1gpu_decode tests/data/lw_t2.ivf --hash-out lw_t2.hash
+```
+
+but only after checking the stream against dav1d, or the file would record our
+own mistakes.
 
 A single sample of drift is worth chasing rather than tolerating: the last three
 differences on `w_cu2` were one level on four chroma samples spread over three

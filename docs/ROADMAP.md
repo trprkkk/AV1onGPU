@@ -231,11 +231,26 @@ which codes about 60 local-warp blocks over those 30 frames. Two such streams
 exactly against dav1d, 30 of 30 frames each.
 
 OBMC is implemented (mask table, per-strip prediction, the above-then-left pass
-order) but none of the repository's fixtures code `motion_mode` as anything but
-`SIMPLE`. The streams above, encoded with OBMC left enabled, do: they differ from
-dav1d on a handful of samples per frame (about 9k samples over 30 frames, against
-output where every frame has 76 800 luma samples), so OBMC still needs a fixture
-and a hunt of its own.
+order) and verified on real streams: the two clips above re-encoded with OBMC
+left enabled decode bit exactly against dav1d, 30 of 30 frames each, and are now
+in `tests/data/` with a hash based regression test. Two things in the candidate
+scan had to be right for that, and both were wrong at first:
+
+* The block's job carries the strips to blend, and the array held four. The scan
+  takes at most `min(4, log2(size))` neighbours on the top edge and as many on
+  the left, and a strip advances by `Clip3(2, neighbour_size, 16)` 4x4 units, so
+  a 32x32 block legitimately produces three strips above and three from the left
+  - eight in total, which is what `Av1gInterJob.obmc[8]` holds. Four was enough
+  for the small blocks the synthetic tests use, which is why nothing caught it.
+* `Clip3(2, 16, W)` and `Clip3(2, W, 16)` are not the same function. The first
+  clamps the neighbour's width into 2..16, so every neighbour wider than 16 mi
+  advanced by 16 and every narrower one advanced by its width - accidentally
+  right for narrow neighbours, wrong for wide ones, and a wrong *step* also moves
+  the strip's origin, so the blend covered the wrong samples.
+
+Both mistakes produce a difference of a few dozen samples per frame, which reads
+like a rounding difference in the blend itself; that is the trap this took a hunt
+to get out of.
 
 Still missing from the inter path: inter/intra compound. Intrabc and palette are
 the remaining intra tools, and they only appear on screen content streams.

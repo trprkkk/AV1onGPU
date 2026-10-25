@@ -142,6 +142,19 @@ if(AV1GPU_BUILD_TESTS)
     add_test(NAME ${test} COMMAND ${test})
   endforeach()
 
+  # Bit exact streams: the whole front end plus the CPU backend against hashes
+  # of the reference decoder's output (see tests/data/README.md). These streams
+  # are the only fixtures in the repository that code local warped motion and
+  # OBMC, and every frame of them is bit exact.
+  if(TARGET av1gpu_decode)
+    foreach(stream lw_t2 lw_t3)
+      add_test(NAME stream_${stream}
+               COMMAND av1gpu_decode --backend cpu --frames 30
+                       ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/${stream}.ivf
+                       --hash-check ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/${stream}.hash)
+    endforeach()
+  endif()
+
   # Compiles the real OpenCL source with a real OpenCL compiler and runs a few
   # jobs. Needs pyopencl + a runtime; exits with 77 when unavailable, which ctest
   # reports as a skip.
