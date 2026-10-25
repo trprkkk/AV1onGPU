@@ -93,6 +93,19 @@ drops the device copy.
 Colour conversion has a device path too (`Decoder::to_rgb`), so the player is
 one upload and one readback per frame.
 
+`Decoder::to_nv12` is the same idea for the layout a video surface actually has:
+planar in, one buffer of interleaved Cb/Cr out, rows `pitch` bytes wide - a
+VA-API surface's pitch is not the picture width, which is why it is a parameter -
+so the pack that a compositor imports is done by the kernels and the planes never
+come back to the host. Bytes between the picture and the pitch are written as
+zero, NV12 is an 8 bit format so a deeper stream is shifted down like
+`frame_to_yuv8` does, and a frame that is not 4:2:0 is refused instead of being
+truncated. `av1gpu::frame_to_nv12` is the host function with the same output (the
+CPU backend and the tests use it as the reference). `av1gpu_decode --nv12` writes
+that layout at a pitch of the picture width, and its output is byte identical to
+`ffmpeg -i stream.ivf -pix_fmt nv12 -f rawvideo out.nv12` on the fixtures, which
+is a second opinion on the interleaving and the plane order.
+
 ## Layout
 
 ```

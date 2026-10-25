@@ -211,8 +211,18 @@ class Backend {
   virtual bool to_rgb(int slot, ColorMatrix matrix, ColorRange range,
                       std::vector<uint8_t>* rgb, std::string* error) = 0;
 
+  virtual bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
+                       std::string* error) = 0;
+
   virtual void reset() = 0;
 };
+
+/* Bytes an NV12 buffer with this pitch holds for a frame of this geometry, or 0
+ * when the frame cannot be packed: NV12 is 4:2:0, so `ss_x`/`ss_y` must be 1, and
+ * the pitch must be even and at least as wide as a chroma row (two bytes per
+ * chroma sample). Every backend validates with this, and frame_to_nv12 uses it as
+ * the size of its output. */
+size_t nv12_buffer_size(int width, int height, int ss_x, int ss_y, size_t pitch);
 
 std::unique_ptr<Backend> create_cpu_backend(const BackendOptions& options,
                                             std::string* error);

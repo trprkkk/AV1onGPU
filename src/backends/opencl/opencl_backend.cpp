@@ -645,6 +645,86 @@ class OpenCLBackend final : public Backend {
     return true;
   }
 
+  bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
+               std::string* error) override {
+    error->clear();
+    if (layout_.buffer_size == 0) {
+      *error = "prepare() has not been called";
+      return false;
+    }
+    const PlanLayout& g = layout_;
+    /* same source rule as to_rgb: the last decoded picture is frame_, an older
+     * slot comes from the reference pool */
+    cl_mem source = frame_;
+    int base = 0;
+    if (slot >= 0) {
+      if (slot >= kReferenceSlots || !slots_[slot]) {
+        *error = "invalid reference slot";
+        return false;
+      }
+      if (slot != last_slot_) {
+        source = ref_pool_;
+        base = slot * static_cast<int>(g.buffer_size);
+      }
+    }
+
+    const size_t bytes = nv12_buffer_size(g.frame.width, g.frame.height, g.frame.ss_x,
+                                          g.frame.ss_y, pitch);
+    if (bytes == 0) {
+      *error = "NV12 output needs a 4:2:0 frame and an even pitch at least as wide";
+      return false;
+    }
+
+    Av1gNv12Job job;
+    std::memset(&job, 0, sizeof(job));
+    job.y_off = base + g.plane_off[0];
+    job.y_stride = g.stride[0];
+    job.u_off = base + g.plane_off[1];
+    job.v_off = base + g.plane_off[2];
+    job.c_stride = g.stride[1];
+    job.w = g.frame.width;
+    job.h = g.frame.height;
+    job.pitch = static_cast<int>(pitch);
+    job.ss_x = g.frame.ss_x;
+    job.ss_y = g.frame.ss_y;
+    job.bitdepth = g.frame.bit_depth;
+
+    /* rgb_ is a byte buffer of the output size, so NV12 reuses it */
+    if (!ensure(&rgb_, &rgb_cap_, bytes)) {
+      *error = "out of device memory for NV12 output";
+      return false;
+    }
+    std::vector<Av1gNv12Job> jobs(1, job);
+    int total = 0;
+    cl_mem job_mem = 0, pref_mem = 0;
+    if (!upload_jobs(jobs, &job_mem, &pref_mem, &total, [](const Av1gNv12Job& j) {
+          return j.pitch * (j.h + ((j.h + (1 << j.ss_y) - 1) >> j.ss_y));
+        })) {
+      *error = "NV12 job upload failed";
+      return false;
+    }
+    cl_kernel k = kernel("av1g_k_nv12");
+    set_mem(k, 0, job_mem);
+    set_mem(k, 1, pref_mem);
+    set_int(k, 2, 1);
+    set_int(k, 3, total);
+    set_mem(k, 4, source);
+    set_mem(k, 5, source);
+    set_mem(k, 6, source);
+    set_mem(k, 7, rgb_);
+    if (!enqueue(k, total, 64)) {
+      *error = "av1g_k_nv12 failed";
+      return false;
+    }
+    nv12->resize(bytes);
+    if (api_.EnqueueReadBuffer(queue_, rgb_, opencl::CL_TRUE, 0, bytes, nv12->data(), 0, nullptr,
+                               nullptr) != opencl::CL_SUCCESS) {
+      *error = "NV12 read back failed";
+      return false;
+    }
+    return true;
+  }
+
   void reset() override {
     for (int i = 0; i < kReferenceSlots; ++i) slots_[i] = false;
     last_slot_ = -1;

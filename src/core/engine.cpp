@@ -101,6 +101,11 @@ class EngineDecoder final : public av1gpu::Decoder {
     return backend_->to_rgb(slot, matrix, range, rgb, error);
   }
 
+  bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
+               std::string* error) override {
+    return backend_->to_nv12(slot, pitch, nv12, error);
+  }
+
  private:
   std::unique_ptr<Backend> backend_;
   BackendOptions options_;

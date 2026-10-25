@@ -163,3 +163,17 @@ __kernel void av1g_k_color(__global const Av1gColorJob *jobs,
   av1g_color_px(&job, y_plane, u_plane, v_plane, rgb, elem % job.w,
                 elem / job.w);
 }
+
+/* One work item per output byte, so a job's element count is
+ * pitch * (h + ch) and the padding bytes of a row are written as well. */
+__kernel void av1g_k_nv12(__global const Av1gNv12Job *jobs,
+                          __global const int *joff, int njobs, int total,
+                          __global const av1g_px *y_plane,
+                          __global const av1g_px *u_plane,
+                          __global const av1g_px *v_plane,
+                          __global unsigned char *dst) {
+  AV1G_JOB_LOOKUP(job_idx, elem);
+  Av1gNv12Job job = jobs[job_idx];
+  dst[elem] = av1g_nv12_px(&job, y_plane, u_plane, v_plane, elem % job.pitch,
+                           elem / job.pitch);
+}

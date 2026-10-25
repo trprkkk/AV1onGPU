@@ -70,6 +70,19 @@ not disagreements between backends.
   clears them, i.e. a slot filled by a grained frame hands grain on and a slot
   filled by a plain frame hands nothing on. `tests/data/grain_inherit.ivf` pins
   that path: 10 frames, every sample equal to dav1d's.
+* **NV12 output.** The pack that turns the planar picture into one interleaved
+  buffer is the same scalar function everywhere (`av1g_nv12_px`, one output byte
+  per work item), so `Decoder::to_nv12` on a device and `frame_to_nv12` on the
+  host write the same bytes - padding included, and the padding of a row is
+  written as zero rather than left as whatever the surface held. The pitch is the
+  caller's (a VA surface's is not the picture width), a frame that is not 4:2:0
+  is refused instead of truncated, and a stream deeper than 8 bits is shifted
+  down because NV12 is 8 bit. `test_kernels` checks the interleaving, the
+  padding, the odd height (a 5 row frame has 3 chroma rows), the 10 bit shift and
+  the three refusals against hand computed bytes; `test_pipeline` decodes a frame
+  that carries film grain - so the pack has to read the picture *after* 7.20 -
+  and compares the backend's bytes with the host function's, on every backend
+  this machine has.
 * **Colour conversion.** One integer matrix per (matrix, range, bit depth),
   Q16 coefficients with the level/range offsets folded into the constant term,
   so limited-range black is (0,0,0) and limited-range white is 255.

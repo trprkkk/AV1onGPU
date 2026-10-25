@@ -153,3 +153,17 @@ extern "C" __global__ void av1g_k_color(const Av1gColorJob *jobs,
   av1g_color_px(&job, y_plane, u_plane, v_plane, rgb, elem % job.w,
                 elem / job.w);
 }
+
+/* One thread per output byte; the padding bytes of a row are written too, so a
+ * job owns pitch * (h + ch) of them. */
+extern "C" __global__ void av1g_k_nv12(const Av1gNv12Job *jobs,
+                                       const int *joff, int njobs, int total,
+                                       const av1g_px *y_plane,
+                                       const av1g_px *u_plane,
+                                       const av1g_px *v_plane,
+                                       unsigned char *dst) {
+  AV1G_JOB_LOOKUP(job_idx, elem);
+  Av1gNv12Job job = jobs[job_idx];
+  dst[elem] = av1g_nv12_px(&job, y_plane, u_plane, v_plane, elem % job.pitch,
+                           elem / job.pitch);
+}

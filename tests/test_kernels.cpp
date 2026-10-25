@@ -1452,6 +1452,116 @@ void test_color() {
   }
 }
 
+void test_nv12_pack() {
+  std::printf("NV12 output\n");
+  /* A 6x4 4:2:0 frame with a pitch of 8: two bytes of every row are padding, and
+   * they belong to the output - a VA surface is written as a whole, so the
+   * kernel has to fill them (with zero) instead of leaving whatever was there. */
+  Frame frame;
+  frame.allocate(6, 4, 8, 1, 1);
+  for (int y = 0; y < frame.plane_height(0); ++y)
+    for (int x = 0; x < frame.plane_width(0); ++x)
+      frame.plane(0)[static_cast<size_t>(y) * frame.stride[0] + x] =
+          static_cast<uint16_t>(10 + y * 6 + x);
+  for (int p = 1; p < 3; ++p)
+    for (int y = 0; y < frame.plane_height(p); ++y)
+      for (int x = 0; x < frame.plane_width(p); ++x)
+        frame.plane(p)[static_cast<size_t>(y) * frame.stride[p] + x] =
+            static_cast<uint16_t>((p == 1 ? 100 : 200) + y * 3 + x);
+
+  const size_t pitch = 8;
+  std::vector<uint8_t> nv12;
+  CHECK(frame_to_nv12(frame, pitch, &nv12));
+  CHECK(nv12.size() == pitch * (4 + 2));
+  if (nv12.size() == pitch * 6) {
+    bool luma_ok = true, chroma_ok = true, padding_ok = true;
+    for (int y = 0; y < 4; ++y)
+      for (int x = 0; x < static_cast<int>(pitch); ++x) {
+        const uint8_t got = nv12[static_cast<size_t>(y) * pitch + x];
+        if (x < 6) {
+          luma_ok = luma_ok && got == 10 + y * 6 + x;
+        } else {
+          padding_ok = padding_ok && got == 0;
+        }
+      }
+    CHECK(luma_ok);
+    CHECK(padding_ok);
+    for (int y = 0; y < 2; ++y)
+      for (int x = 0; x < 3; ++x) {
+        const size_t row = static_cast<size_t>(4 + y) * pitch;
+        /* even byte is Cb, odd byte is Cr, and one pair per chroma sample */
+        chroma_ok = chroma_ok && nv12[row + 2 * x] == 100 + y * 3 + x;
+        chroma_ok = chroma_ok && nv12[row + 2 * x + 1] == 200 + y * 3 + x;
+      }
+    CHECK(chroma_ok);
+    /* the last two bytes of a chroma row are padding too */
+    CHECK(nv12[static_cast<size_t>(4) * pitch + 6] == 0);
+    CHECK(nv12[static_cast<size_t>(5) * pitch + 6] == 0);
+    CHECK(nv12[static_cast<size_t>(5) * pitch + 7] == 0);
+  }
+
+  /* The whole kernel loop is the same scalar code the device runs, so the block
+   * helper and the per byte function have to agree byte for byte. */
+  {
+    Av1gNv12Job job;
+    std::memset(&job, 0, sizeof(job));
+    job.y_stride = frame.stride[0];
+    job.c_stride = frame.stride[1];
+    job.w = frame.width;
+    job.h = frame.height;
+    job.pitch = static_cast<int>(pitch);
+    job.ss_x = frame.ss_x;
+    job.ss_y = frame.ss_y;
+    job.bitdepth = frame.bit_depth;
+    std::vector<uint8_t> again(nv12.size(), 0xAB);
+    av1g_nv12_block(&job, frame.plane(0), frame.plane(1), frame.plane(2), again.data());
+    CHECK(again == nv12);
+  }
+
+  /* A pitch that is odd, or narrower than a chroma row, and a frame that is not
+   * 4:2:0: all three are refused instead of writing a truncated picture. */
+  CHECK(!frame_to_nv12(frame, 7, &nv12));
+  CHECK(!frame_to_nv12(frame, 4, &nv12));
+  {
+    Frame wide;
+    wide.allocate(6, 4, 8, 0, 0);
+    CHECK(!frame_to_nv12(wide, pitch, &nv12));
+  }
+
+  /* An odd height has a chroma plane of `(height + 1) >> 1` rows, and NV12 has
+   * one chroma row per two luma rows - so a 5 row frame writes 3 of them. */
+  {
+    Frame odd;
+    odd.allocate(4, 5, 8, 1, 1);
+    std::vector<uint8_t> out;
+    CHECK(frame_to_nv12(odd, 4, &out));
+    CHECK(out.size() == static_cast<size_t>(4) * (5 + 3));
+  }
+
+  /* Deeper than 8 bit: NV12 is an 8 bit format, so the samples are shifted down
+   * by (BitDepth - 8) - the same shift frame_to_yuv8 does. */
+  {
+    Frame deep;
+    deep.allocate(4, 2, 10, 1, 1);
+    for (int p = 0; p < 3; ++p)
+      for (int y = 0; y < deep.plane_height(p); ++y)
+        for (int x = 0; x < deep.plane_width(p); ++x)
+          deep.plane(p)[static_cast<size_t>(y) * deep.stride[p] + x] =
+              static_cast<uint16_t>((p == 0 ? 400 : 600) + 4 * x);
+    std::vector<uint8_t> out;
+    CHECK(frame_to_nv12(deep, 4, &out));
+    if (out.size() == static_cast<size_t>(4) * 3) {
+      CHECK(out[0] == 100);  /* 400 >> 2 */
+      CHECK(out[3] == 103);
+      /* two luma rows of four bytes each, then the one chroma row */
+      CHECK(out[8] == 150);   /* 600 >> 2, Cb of the first chroma sample */
+      CHECK(out[9] == 150);   /* Cr */
+      CHECK(out[10] == 151);  /* 604 >> 2 */
+      CHECK(out.size() == static_cast<size_t>(4) * 3);
+    }
+  }
+}
+
 } /* namespace */
 
 int main() {
@@ -1465,5 +1575,6 @@ int main() {
   test_filters();
   test_loop_restoration();
   test_color();
+  test_nv12_pack();
   return testing::finish("test_kernels");
 }

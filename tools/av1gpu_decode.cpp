@@ -64,6 +64,7 @@ struct Options {
   int frames = -1;
   bool verbose = false;
   bool out16 = false;
+  bool nv12 = false;
 };
 
 void usage() {
@@ -73,6 +74,8 @@ void usage() {
       "  -o, --output F    write the decoded frames to F as planar 8 bit YUV\n"
       "  --yuv16           write the samples as they are, little endian 16 bit, and\n"
       "                    hash those bytes (a 10 or 12 bit stream compared exactly)\n"
+      "  --nv12            write NV12 instead of planar YUV: rows `width` bytes wide,\n"
+      "                    one interleaved Cb/Cr row per two luma rows (4:2:0 only)\n"
       "  --compare F       compare against a planar 8 bit YUV file\n"
       "  --hash-out F      write one hash per shown frame to F\n"
       "  --hash-check F    compare the output against the hashes in F\n"
@@ -231,6 +234,10 @@ int main(int argc, char** argv) {
       opt.out16 = true;
       continue;
     }
+    if (arg == "--nv12") {
+      opt.nv12 = true;
+      continue;
+    }
     if (arg == "--frames" && i + 1 < argc) {
       opt.frames = std::atoi(argv[++i]);
       continue;
@@ -244,6 +251,12 @@ int main(int argc, char** argv) {
       return 2;
     }
     opt.input = arg;
+  }
+  if (opt.nv12 && (!opt.compare.empty() || !opt.hash_out.empty() || !opt.hash_check.empty())) {
+    std::fprintf(stderr,
+                 "av1gpu_decode: --nv12 writes a picture, so it cannot be combined with a "
+                 "planar comparison or a hash list\n");
+    return 2;
   }
   if (opt.input.empty()) {
     usage();
@@ -383,7 +396,12 @@ int main(int argc, char** argv) {
   const bool out16 = opt.out16;
   auto emit_picture = [&](const Frame& picture, int ss_x, int ss_y) {
     std::vector<uint8_t> yuv;
-    if (out16) {
+    if (opt.nv12) {
+      /* every row `width` bytes wide, chroma interleaved: the layout ffmpeg
+       * calls nv12, so a reference conversion can check the pack */
+      const size_t pitch = 2 * ((static_cast<size_t>(picture.width) + 1) / 2);
+      if (!frame_to_nv12(picture, pitch, &yuv)) yuv.clear();
+    } else if (out16) {
       frame_to_yuv16(picture, &yuv);
     } else {
       frame_to_yuv8(picture, &yuv);

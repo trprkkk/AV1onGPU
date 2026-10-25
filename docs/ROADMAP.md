@@ -449,10 +449,17 @@ decoder) already built for VA-API:
   `vaExportSurfaceHandle`), with `VAProfileAV1Profile0` in place of the VP9
   profiles. Chrome listed that driver as "hardware accelerated" even though the
   decode is compute shaders, which is exactly the effect we want.
-* **NV12 pack straight into the surface.** A VA surface is NV12 with a pitch of
-  its own, so the last step is planar YUV in, interleaved UV out, on the device.
-  That is a small kernel (their `vp9_nv12_pack.comp.glsl` is 59 lines) and it
-  removes the CPU copy that would otherwise give back the CPU time we saved.
+* **NV12 pack straight into the surface.** *Done.* A VA surface is NV12 with a
+  pitch of its own, so the last step is planar YUV in, interleaved UV out, on the
+  device. `av1g_nv12_px` (one output byte per work item, in the shared kernel
+  header) and `Decoder::to_nv12` do that now: the caller names the pitch, every
+  byte of a row is written (padding included, as zero), the samples come from the
+  picture after 7.20, and a frame that is not 4:2:0 is refused instead of being
+  truncated. NV12 is 8 bit, so a deeper stream is shifted down. The host function
+  `frame_to_nv12` runs the same scalar code, and `test_kernels` + `test_pipeline`
+  compare the two byte for byte - on the CPU backend always, on the GPU ones
+  wherever a device exists. That removes the CPU copy that would otherwise give
+  back the CPU time we saved.
 * **DMA-BUF export** (`VK_EXT_external_memory_dma_buf`; for us the OpenCL
   equivalents) so the compositor imports the frame with no copy at all.
 * **A pipelined decode API.** `compute-vp9` keeps three frames in flight and

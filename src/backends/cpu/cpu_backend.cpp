@@ -508,8 +508,9 @@ class CpuBackend final : public Backend {
     return true;
   }
 
-  bool to_rgb(int slot, ColorMatrix matrix, ColorRange range, std::vector<uint8_t>* rgb,
-              std::string* error) override {
+  /* Copies one of the held pictures into a host Frame: the source for every
+   * output conversion this backend does. */
+  bool gather(int slot, Frame* out, std::string* error) {
     /* The reference pool holds the picture *before* the film grain (7.20) and
      * frame_ the one after it, so a request for the frame that was just decoded
      * reads frame_ - the reference is only the fallback for an older slot. */
@@ -527,18 +528,35 @@ class CpuBackend final : public Backend {
       return false;
     }
 
-    Frame frame;
-    frame.allocate(layout_.frame.width, layout_.frame.height, layout_.frame.bit_depth,
-                   layout_.frame.ss_x, layout_.frame.ss_y);
+    out->allocate(layout_.frame.width, layout_.frame.height, layout_.frame.bit_depth,
+                  layout_.frame.ss_x, layout_.frame.ss_y);
     for (int p = 0; p < 3; ++p) {
       for (int y = 0; y < layout_.plane_h[p]; ++y)
-        std::memcpy(frame.plane(p) + static_cast<size_t>(y) * frame.stride[p],
+        std::memcpy(out->plane(p) + static_cast<size_t>(y) * out->stride[p],
                     samples + layout_.plane_off[p] +
                         static_cast<size_t>(y) * layout_.stride[p],
                     static_cast<size_t>(layout_.plane_w[p]) * sizeof(uint16_t));
     }
-    tables::frame_to_rgb(frame, matrix, range, rgb);
     if (error) error->clear();
+    return true;
+  }
+
+  bool to_rgb(int slot, ColorMatrix matrix, ColorRange range, std::vector<uint8_t>* rgb,
+              std::string* error) override {
+    Frame frame;
+    if (!gather(slot, &frame, error)) return false;
+    tables::frame_to_rgb(frame, matrix, range, rgb);
+    return true;
+  }
+
+  bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
+               std::string* error) override {
+    Frame frame;
+    if (!gather(slot, &frame, error)) return false;
+    if (!frame_to_nv12(frame, pitch, nv12)) {
+      if (error) *error = "NV12 output needs a 4:2:0 frame and an even pitch at least as wide";
+      return false;
+    }
     return true;
   }
 

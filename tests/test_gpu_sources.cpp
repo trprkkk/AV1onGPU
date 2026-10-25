@@ -2,7 +2,7 @@
  * AV1onGPU - the GPU launch ABI, checked without a GPU
  *
  * The two device backends are thin: they pack jobs into a buffer, build an
- * argument list by hand and launch one of nine kernels. Nothing in that path is
+ * argument list by hand and launch one of the twelve kernels. Nothing in that path is
  * type checked by the compiler - cuLaunchKernel takes `void**` and OpenCL takes
  * `clSetKernelArg(void*, size_t, size_t, const void*)` - so a missing argument,
  * a swapped pair or an argument set twice is a silent read of whatever was on

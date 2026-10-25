@@ -657,5 +657,59 @@ int main() {
     }
   }
 
+  /* ---- 7. NV12 output ----------------------------------------------------- */
+  std::printf("NV12 output\n");
+  {
+    /* A pitch a surface would use - 128 bytes wider than the picture - and a
+     * frame that carries film grain, because the pack reads the picture *after*
+     * 7.20, which is the one a compositor gets. The reference is the host
+     * function, so this compares the device pack against the same scalar code
+     * and not against a second implementation of it. */
+    const Clip clip = make_clip(1, 8, /*cdef=*/true, /*grain=*/true);
+    const size_t pitch = static_cast<size_t>((clip.cfg.width + 63) & ~63) + 128;
+    const BackendKind kinds[] = {BackendKind::Cpu, BackendKind::OpenCL, BackendKind::CUDA};
+    for (BackendKind kind : kinds) {
+      BackendOptions options;
+      options.kind = kind;
+      options.allow_cpu_fallback = false;
+      std::string error;
+      std::unique_ptr<Decoder> decoder = Decoder::create(options, &error);
+      if (!decoder || decoder->device().kind != kind) {
+        std::printf("  %s: not available (%s)\n", to_string(kind),
+                    error.empty() ? "fallback only" : error.c_str());
+        continue;
+      }
+      Frame frame;
+      const int slot = decoder->decode_reference(clip.syntax[0], &frame, &error);
+      CHECK(slot >= 0);
+      if (slot < 0) {
+        std::printf("  %s: decode failed: %s\n", to_string(kind), error.c_str());
+        continue;
+      }
+      std::vector<uint8_t> expected;
+      CHECK(frame_to_nv12(frame, pitch, &expected));
+      std::vector<uint8_t> nv12;
+      CHECK(decoder->to_nv12(slot, pitch, &nv12, &error));
+      int wrong = -1;
+      if (nv12.size() == expected.size()) {
+        wrong = 0;
+        for (size_t i = 0; i < nv12.size(); ++i) wrong += nv12[i] != expected[i];
+      }
+      std::printf("  %s: %zu bytes at pitch %zu, %d byte(s) different\n", to_string(kind),
+                  nv12.size(), pitch, wrong);
+      CHECK(wrong == 0);
+      CHECK(nv12.size() == pitch * (static_cast<size_t>(frame.height) +
+                                    static_cast<size_t>(frame.plane_height(1))));
+      /* the first bytes are the picture's own first row, so the pack is not
+       * writing somewhere else in the buffer */
+      CHECK(!nv12.empty() && nv12[0] == static_cast<uint8_t>(frame.plane(0)[0] >> (frame.bit_depth - 8)));
+      /* a pitch that cannot hold a chroma row, and an odd one, are refused */
+      std::vector<uint8_t> refused;
+      CHECK(!decoder->to_nv12(slot, pitch + 1, &refused, &error));
+      CHECK(!decoder->to_nv12(slot, 64, &refused, &error));
+      decoder->release_reference(slot);
+    }
+  }
+
   return testing::finish("test_pipeline");
 }

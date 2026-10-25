@@ -577,6 +577,16 @@ void frame_to_yuv8(const Frame& frame, std::vector<uint8_t>* out);
  * 10 or 12 bit stream can be compared bit for bit instead of after a shift. */
 void frame_to_yuv16(const Frame& frame, std::vector<uint8_t>* out);
 
+/* Packs a 4:2:0 frame into NV12: `height` rows of luma, then one row of
+ * interleaved Cb/Cr pairs per two luma rows, every row `pitch` bytes wide. That
+ * is the layout a VA-API surface has - its pitch is not the picture width, which
+ * is why it is a parameter - and it is what a compositor imports without a copy.
+ * Bytes between the picture and the pitch are written as zero. NV12 is an 8 bit
+ * format, so a deeper stream is shifted down like frame_to_yuv8 does. Returns
+ * false when the frame cannot be packed: it is not 4:2:0, `pitch` is odd, or
+ * `pitch` is narrower than a chroma row. */
+bool frame_to_nv12(const Frame& frame, size_t pitch, std::vector<uint8_t>* out);
+
 /* ------------------------------------------------------------------ decode */
 
 class Decoder {
@@ -611,6 +621,13 @@ class Decoder {
   /* YUV -> RGB24 with the same arithmetic the kernels use. */
   virtual bool to_rgb(int slot, ColorMatrix matrix, ColorRange range,
                       std::vector<uint8_t>* rgb, std::string* error = nullptr) = 0;
+
+  /* The same picture as NV12, packed *on the device*, into rows `pitch` bytes
+   * wide - the last step of a zero copy path, so the planes never come back to
+   * the host. Same buffer size and padding rules as frame_to_nv12, and the same
+   * refusal for a frame that is not 4:2:0. */
+  virtual bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
+                       std::string* error = nullptr) = 0;
 
   virtual void reset() = 0;
 

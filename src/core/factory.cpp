@@ -230,6 +230,43 @@ void frame_to_yuv8(const Frame& frame, std::vector<uint8_t>* out) {
   }
 }
 
+namespace internal {
+
+size_t nv12_buffer_size(int width, int height, int ss_x, int ss_y, size_t pitch) {
+  if (width <= 0 || height <= 0) return 0;
+  if (ss_x != 1 || ss_y != 1) return 0;          /* NV12 is 4:2:0 */
+  const size_t chroma_row = 2 * ((static_cast<size_t>(width) + 1) / 2);
+  if ((pitch & 1) != 0 || pitch < chroma_row) return 0;
+  const size_t chroma_rows = (static_cast<size_t>(height) + 1) / 2;
+  return pitch * (static_cast<size_t>(height) + chroma_rows);
+}
+
+}  // namespace internal
+
+bool frame_to_nv12(const Frame& frame, size_t pitch, std::vector<uint8_t>* out) {
+  const size_t bytes =
+      internal::nv12_buffer_size(frame.width, frame.height, frame.ss_x, frame.ss_y, pitch);
+  if (bytes == 0 || out == nullptr) return false;
+  Av1gNv12Job job;
+  std::memset(&job, 0, sizeof(job));
+  job.y_off = 0;
+  job.y_stride = frame.stride[0];
+  job.u_off = 0;
+  job.v_off = 0;
+  job.c_stride = frame.stride[1];
+  job.w = frame.width;
+  job.h = frame.height;
+  job.pitch = static_cast<int>(pitch);
+  job.ss_x = frame.ss_x;
+  job.ss_y = frame.ss_y;
+  job.bitdepth = frame.bit_depth;
+  out->assign(bytes, 0);
+  /* the same scalar kernel the device backends run, so the host and the device
+   * produce the same bytes - padding included */
+  av1g_nv12_block(&job, frame.plane(0), frame.plane(1), frame.plane(2), out->data());
+  return true;
+}
+
 Decoder::~Decoder() = default;
 
 } /* namespace av1gpu */

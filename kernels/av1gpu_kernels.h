@@ -335,6 +335,26 @@ typedef struct {
   int bitdepth;
 } Av1gColorJob;
 
+/* Planar YUV in, NV12 out: one interleaved buffer with the pitch the consumer
+ * wants. A VA-API surface is NV12 with a pitch of its own - not the picture
+ * width - so this is the last step of a zero copy path: the device writes the
+ * samples where the compositor will import them. NV12 is 4:2:0 and 8 bit, so a
+ * deeper frame is shifted down (the same `sample >> (BitDepth - 8)` that
+ * frame_to_yuv8 does) and the host rejects a frame that is not 4:2:0. The bytes
+ * past the visible width are written as zero; a row is `pitch` bytes, and there
+ * are `h + ch` of them (luma first, then one row of U,V pairs).
+ *
+ * One work item per *byte*, so the element count of the job is
+ * pitch * (h + ch) - the same shape av1g_k_color has, one item per sample. */
+typedef struct {
+  int y_off, y_stride;
+  int u_off, v_off, c_stride;
+  int w, h;     /* visible luma size                                     */
+  int pitch;    /* output bytes per row, at least w                      */
+  int ss_x, ss_y;
+  int bitdepth;
+} Av1gNv12Job;
+
 /* ------------------------------------------------------------------ */
 /* enums shared by host and device                                    */
 /* ------------------------------------------------------------------ */
@@ -3074,6 +3094,27 @@ AV1G_FN void av1g_color_px(const Av1gColorJob *job, AV1G_GLOBAL const av1g_px *y
   out[2] = (unsigned char)av1g_clip(b, 0, 255);
 }
 
+AV1G_FN unsigned char av1g_nv12_px(const Av1gNv12Job *job,
+                                  AV1G_GLOBAL const av1g_px *y_plane,
+                                  AV1G_GLOBAL const av1g_px *u_plane,
+                                  AV1G_GLOBAL const av1g_px *v_plane, int x, int row) {
+  const int shift = job->bitdepth - 8;
+  if (row < job->h) {
+    if (x >= job->w) return 0;
+    return (unsigned char)((int)y_plane[job->y_off + row * job->y_stride + x] >> shift);
+  }
+  const int c_row = row - job->h;
+  const int cw = (job->w + (1 << job->ss_x) - 1) >> job->ss_x;
+  const int ch = (job->h + (1 << job->ss_y) - 1) >> job->ss_y;
+  if (c_row >= ch || x >= 2 * cw) return 0;
+  /* even byte is Cb, odd is Cr: NV12 interleaves the two planes */
+  const int c = x >> 1;
+  const av1g_px sample = (x & 1)
+      ? v_plane[job->v_off + c_row * job->c_stride + c]
+      : u_plane[job->u_off + c_row * job->c_stride + c];
+  return (unsigned char)((int)sample >> shift);
+}
+
 #if !defined(AV1G_DEVICE)
 AV1G_HOST_FN void av1g_color_block(const Av1gColorJob *job, const av1g_px *y_plane,
                               const av1g_px *u_plane, const av1g_px *v_plane,
@@ -3082,6 +3123,19 @@ AV1G_HOST_FN void av1g_color_block(const Av1gColorJob *job, const av1g_px *y_pla
   for (y = 0; y < job->h; ++y)
     for (x = 0; x < job->w; ++x)
       av1g_color_px(job, y_plane, u_plane, v_plane, rgb, x, y);
+}
+
+/* The whole interleaved buffer, described by one job: `h + ch` rows of `pitch`
+ * bytes. The host path and the kernels therefore fill every byte, padding
+ * included. */
+AV1G_HOST_FN void av1g_nv12_block(const Av1gNv12Job *job, const av1g_px *y_plane,
+                                  const av1g_px *u_plane, const av1g_px *v_plane,
+                                  unsigned char *dst) {
+  const int ch = (job->h + (1 << job->ss_y) - 1) >> job->ss_y;
+  int row, x;
+  for (row = 0; row < job->h + ch; ++row)
+    for (x = 0; x < job->pitch; ++x)
+      dst[row * job->pitch + x] = av1g_nv12_px(job, y_plane, u_plane, v_plane, x, row);
 }
 
 #endif
