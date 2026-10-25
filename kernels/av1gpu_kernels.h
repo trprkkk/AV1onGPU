@@ -3072,7 +3072,10 @@ AV1G_FN void av1g_grain_px(const Av1gGrainJob *job, AV1G_GLOBAL av1g_px *dst,
       index = average;
     } else {
       const int combined = average * (luma_mult - 128) + orig * (mult - 128);
-      index = av1g_clip_px((combined >> 6) + ((offset - 256) << shift), maxv);
+      /* `offset - 256` is signed (an offset above 256 is positive), so the
+       * scaling is a multiplication: a left shift of a negative value is
+       * undefined in C++. 7.18.3.5 writes it as a shift. */
+      index = av1g_clip_px((combined >> 6) + (offset - 256) * (1 << shift), maxv);
     }
   }
   g = av1g_grain_round2(av1g_grain_scale_lut(lut + lut_off, index, bitdepth) * n,

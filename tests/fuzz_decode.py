@@ -11,6 +11,11 @@ under test, and requires that
   * it does not print a sanitizer report, and
   * it does not run past a timeout.
 
+Each mutation is decoded twice: once for the pixels, and once for the decode
+plan the backend builds (`--dump-plans`, one frame), because that second path
+reads the parsed block list through the block geometry, the job bounds and the
+wave schedule.
+
 With the sanitizer build (`-DAV1GPU_SANITIZE=ON`) the second condition is what
 catches memory errors; in a normal build this is a crash test. Neither is a
 conformance check: the mutated streams are not AV1, so whatever they decode to
@@ -26,6 +31,7 @@ one run of the decoder.
 import argparse
 import os
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,9 +46,9 @@ BAD_OUTPUT = ("AddressSanitizer", "LeakSanitizer", "runtime error:",
               "UndefinedBehaviorSanitizer", "SEGV")
 
 
-def decode(decoder, path, frames, env):
+def decode(decoder, path, frames, env, extra=()):
     command = [decoder, "--backend", "cpu", "--frames", str(frames),
-               "-o", os.devnull, path]
+               "-o", os.devnull, path] + list(extra)
     try:
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=env, timeout=120)
@@ -121,10 +127,21 @@ def main():
         with tempfile.NamedTemporaryFile(suffix=".ivf", delete=False) as handle:
             handle.write(data)
             mutated = handle.name
+        plan_dir = tempfile.mkdtemp(prefix="av1gpu-plans-")
         try:
             problem = decode(args.decoder, mutated, args.frames, env)
+            if problem is None:
+                # the plan the backend builds covers the picture a second time:
+                # block geometry, job bounds, the wave schedule and the writer
+                # all read the parsed block list, so a corrupt block list has to
+                # come out of that path too - with one frame, to stay quick.
+                problem = decode(args.decoder, mutated, 1, env,
+                                 ["--dump-plans", plan_dir])
+                if problem:
+                    problem = "dump-plans: " + problem
         finally:
             os.unlink(mutated)
+            shutil.rmtree(plan_dir, ignore_errors=True)
         if problem:
             failures.append((name, offset, old, value, why, problem))
             print("FAIL %s byte %d: 0x%02X -> 0x%02X (%s): %s"

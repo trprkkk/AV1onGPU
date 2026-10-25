@@ -1272,13 +1272,20 @@ allowed to assume the value was positive:
 * `src/core/synthetic.cpp`, the synthetic encoder's analysis transform (a pixel
   scaled into 64 bit before the separable pass) and the motion vectors it writes
   into a block.
+* `kernels/av1gpu_kernels.h`, the film grain chroma blend: `(offset - 256) <<
+  shift` scales a signed value, and 7.18.3.5's `offset` is nine bits - so half of
+  its range is below 256 and shifts a negative number. A *valid* stream reaches
+  this one; no fixture happened to (they all code an offset above 256). It came
+  out of the mutation sweep below, `test_kernels` blends a chroma sample with
+  `cr_offset = 200` twice now (once with a flat curve, once with a curve that
+  makes the index visible), and the sanitizer build is what says so.
 
 **A mutation sweep** is the other half: the decoder is the only place that reads
 bytes it did not produce, so the sanitizer build also decodes single byte
 mutations of every fixture. `tests/fuzz_decode.py` is the part of that which
-stays, and `ctest` runs it as `fuzz_mutations`. It found two things, neither of
-which any fixture (or any stream an encoder writes on purpose) would have
-reported:
+stays, and `ctest` runs it as `fuzz_mutations`. It found the film grain shift
+above, and two things that no fixture (or any stream an encoder writes on
+purpose) would have reported:
 
 * `read_palette_plane` merged the palettes above and to the left into an *eight*
   entry buffer on the stack. Sixteen is what that merge produces - 6.10.3's

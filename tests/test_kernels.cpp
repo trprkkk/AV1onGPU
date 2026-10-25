@@ -1015,6 +1015,60 @@ void test_filters() {
     CHECK(dst[static_cast<size_t>(4 * w + 4)] == 235);
   }
 
+  /* film grain offsets are nine bits, so a chroma offset below 256 is an
+   * ordinary one: 7.18.3.5 merges luma and chroma into
+   * `index = Clip3(0, 255, Round2(combined, 6) + (offset - 256) * 2^shift)`,
+   * and `offset - 256` is negative for every one of those. The scaling was a
+   * left shift, which is undefined for a negative value in C++ - the picture
+   * came out right because compilers emit the multiply anyway, but only the
+   * sanitizer build says so. These two samples pin the arithmetic and the value
+   * it produces. */
+  {
+    const int w = 32;
+    std::vector<uint16_t> dst(static_cast<size_t>(w) * w, 0);
+    std::vector<short> noise(64 * 64, 40);
+    std::vector<uint16_t> luma(64 * 64, 0);
+    int lut[AV1G_GRAIN_LUT_ENTRIES] = {0};
+    /* Cr's curve: a gain of one at index 0, a gain of two at index 144 */
+    lut[512 + 0] = 256;
+    lut[512 + 144] = 512;
+
+    Av1gGrainJob job;
+    std::memset(&job, 0, sizeof(job));
+    job.dst_off = 4 * w + 4;
+    job.dst_stride = w;
+    job.noise_stride = 64;
+    job.w = 8;
+    job.h = 8;
+    job.plane = 2;
+    job.ss_x = 1;
+    job.ss_y = 1;
+    job.bitdepth = 8;
+    job.scaling_shift = 8;
+    job.num_cr_points = 2;
+    job.min_value = 0;
+    job.max_value = 255;
+    job.cr_mult = 128;
+    job.cr_luma_mult = 128;
+    job.cr_offset = 200; /* below 256, so `offset - 256` is -56 */
+    job.luma_stride = 64;
+    job.luma_w = 8;
+
+    /* luma 0 and mult 128 make combined 0, the index clips to 0 and the curve
+     * there is a gain of one, so the sample takes the noise as it stands */
+    dst[static_cast<size_t>(4 * w + 4)] = 77;
+    av1g_grain_block(&job, dst.data(), luma.data(), noise.data(), lut, 255);
+    CHECK(dst[static_cast<size_t>(4 * w + 4)] == 117);
+
+    /* a chroma multiplier above 128 lands the merge on index 144:
+     * Round2(200 * 64, 6) - 56 = 144, where the curve is a gain of two */
+    std::fill(noise.begin(), noise.end(), static_cast<short>(10));
+    dst[static_cast<size_t>(4 * w + 4)] = 200;
+    job.cr_mult = 192;
+    av1g_grain_block(&job, dst.data(), luma.data(), noise.data(), lut, 255);
+    CHECK(dst[static_cast<size_t>(4 * w + 4)] == 220);
+  }
+
   /* film grain deeper than 8 bit: the grain range is +/-512 at 10 bit, so a
    * noise sample does not fit in a signed byte - the noise image is 16 bit and
    * a large sample has to survive the trip */

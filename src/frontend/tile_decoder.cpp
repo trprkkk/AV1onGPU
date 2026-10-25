@@ -4677,7 +4677,7 @@ ParseStatus decode_intra_tile(const SequenceHeader& seq, const FrameHeader& fram
     return ParseStatus::Unsupported;
   }
   if (frame.tiles.cols != 1 || frame.tiles.rows != 1) {
-    if (error) *error = "tile: multi-tile frames are not decoded so far";
+    if (error) *error = "tile: this entry point decodes one tile; decode_tiles() takes the whole group";
     return ParseStatus::Unsupported;
   }
 
@@ -4710,7 +4710,7 @@ ParseStatus decode_tile(const SequenceHeader& seq, const FrameHeader& frame,
     }
   }
   if (frame.tiles.cols != 1 || frame.tiles.rows != 1) {
-    if (error) *error = "tile: multi-tile frames are not decoded so far";
+    if (error) *error = "tile: this entry point decodes one tile; decode_tiles() takes the whole group";
     return ParseStatus::Unsupported;
   }
 

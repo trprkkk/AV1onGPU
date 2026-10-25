@@ -269,9 +269,13 @@ if(AV1GPU_BUILD_TESTS)
     # and it is the test that carries the palette cache overflow and the
     # transform's 64 bit multiplies (see docs/ACCURACY.md).
     if(TARGET av1gpu_decode)
+      # one mutation per fixture on top of the known one, two frames each: the
+      # sweep is a smoke test, not a fuzzing campaign, and it has to stay cheap
+      # enough to run with every build (about half a minute normally and three
+      # with the sanitizers)
       add_test(NAME fuzz_mutations
                COMMAND ${AV1GPU_TEST_PY} ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_decode.py
-                       --decoder $<TARGET_FILE:av1gpu_decode>)
+                       --decoder $<TARGET_FILE:av1gpu_decode> --per-file 1 --frames 2)
       set_tests_properties(fuzz_mutations PROPERTIES TIMEOUT 900)
     endif()
 
