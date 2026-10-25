@@ -895,14 +895,19 @@ express:
 
 * **7.17.6 chooses between two pictures.** A row inside the stripe comes from
   the CDEF output, a row outside it from the picture *before* CDEF, and the third
-  row outside is a copy of the second. The two references the test carries
-  (`wiener_sample_striped`, one picture per source) make that checkable: it
-  decodes the same clip twice, once with CDEF and once with the CDEF parameters
-  removed - the second decode *is* the deblocked picture - and builds the
-  expected sample from the right one, with the clamp at the border. CDEF on and
-  off also pins the second upscale (the pre-CDEF snapshot has to be brought into
-  the displayed geometry as well); with CDEF off the two pictures are equal and
-  only the clamp is exercised.
+  row outside is a copy of the second. The reference the test carries
+  (`wiener_sample_striped`) takes one picture per row, so both choices and the
+  clamp are checkable: the clip is decoded twice, once with CDEF and once with
+  the CDEF parameters removed - the second decode *is* the deblocked picture -
+  and the expected sample of a row is built from the right one. With CDEF on the
+  two pictures really differ (110 samples along the stripe borders of that clip,
+  and the test asserts that they do, because a wrong picture that no sample can
+  tell apart would not be caught); with CDEF off they are equal and only the
+  clamp is exercised. CDEF on also pins the second upscale, because the pre-CDEF
+  snapshot has to be brought into the displayed geometry as well.
+* **The two pictures are swapped.** Nothing else in the suite can see that
+  mistake: with CDEF off the two pictures are the same picture, so the swap is a
+  no-op - it is the CDEF-on decode that turns it into 1575 wrong samples.
 * **The unit grid, not just the filter.** Every unit carries *different*
   coefficients (`wiener[0][0] = 2 + 2*row`, `wiener[1][0] = 1 + 2*col`, so the
   vertical and horizontal sets differ too), and the reference picks them per
@@ -912,7 +917,7 @@ express:
   128x96 over superres 112, 128x100, 128x68, 120x68, 160x96 with one 128-sample
   unit, 96x72 with a 64-wide unit and a 32-wide last one, 32x24 and 16x16, i.e.
   smaller than one unit - and every case also asserts that the filter actually
-  changed samples (129 to 770 of them), because a case where nothing moves could
+  changed samples (196 to 1349 of them), because a case where nothing moves could
   not tell a wrong grid from a right one.
 * **A no-op has to be a no-op.** With an identity filter in every luma unit (taps
   `{0,0,0,128,0,0,0}`) and a self guided one on both chroma planes, which on this
@@ -924,14 +929,21 @@ one restoring the old numbers when reverted:
 
 | mutation | samples wrong |
 | --- | --- |
-| the stripe starts at the frame edge instead of eight rows above | 54 (section 6) |
+| the stripe starts at the frame edge instead of eight rows above | 225 / 158 / 30 / 26 / 37 / 35, and 227 across a border |
 | `unitRow` drops the `+ 8` of 7.17.1 | 572 / 561, and 558 across a border |
 | the last unit is not stretched to the plane edge | 315 (160x96) |
-| every row is taken from the CDEF picture | 11 + 5 |
-| rows below a stripe are never borrowed from the earlier picture | 26 + 26 |
-| the borrowed row is not clamped to `StripeStartY - 2` | 6 + 5 |
-| the two pictures are swapped | 1575 (section 6) |
+| every row is taken from the CDEF picture | 31 (the border case, CDEF on) |
+| rows below a stripe are never borrowed from the earlier picture | 26 / 2 / 32 / 19, and 26 across a border |
+| the borrowed row is not clamped to `StripeStartY - 2` | 6 / 11 / 9 / 1 / 2, and 5 across a border |
+| neither border of the borrowed rows is clamped | 32 / 2 / 11 / 9 / 33 / 21, and 31 across a border |
+| the two pictures are swapped | 1575 (the border case, CDEF on) |
+| the pre-CDEF snapshot is not upscaled | 120 / 324, and 319 across a border |
 | the identity filter's intermediate clip is removed | 0 - not observable |
+
+The geometry numbers are in the order the eight cases run (`128x96` over superres
+112, `128x100`, `128x68`, `120x68`, `160x96`, `96x72`, `32x24`, `16x16`), and the
+two that stay at 0 are the ones with no stripe border and no partial unit inside
+the block the mutation affects.
 
 The last row is worth writing down: `InterRound0` clips the horizontal pass to
 `[-(1 << (BitDepth + 7 - InterRound0)), (1 << (BitDepth + 8 + 7 - InterRound0)) -
@@ -984,6 +996,13 @@ What is left is smaller and narrower: when the loop filter runs *on the last row
 or column band* of such a frame, it reads samples just outside the picture, and
 those are defined only by the reconstruction. Practical example: a 130x66 clip at
 `-crf 45` differs in exactly one sample (row 65, column 65) and it is off by one.
+Low quantisers make it more visible: a two frame 160x116 clip at `-crf 18` with
+CDEF on differs in 25 and 36 samples, all of them by one and all of them in the
+chroma rows within three of the bottom of the plane - the rows whose 4x4 block
+extends two samples past the picture, so the taps that reach there read samples
+the reference decoder filled in its own way. 128x68 is the same story with one
+to three samples. The samples that are left are exactly the ones the
+specification derives from a padded picture whose padding it does not define.
 This is why `odd_size.ivf`'s frames code a zero luma level - the fixture pins the
 grid, the CDEF halo and the clamps, which are fully defined, and not the samples
 the specification leaves to the implementation's border handling.

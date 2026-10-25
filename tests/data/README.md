@@ -332,8 +332,11 @@ bit exact, against dav1d and through the kernels.
 
 `tests/data/make_lr_clip.py` is that generator with the encoder wrapped around
 it: run as `python3 tests/data/make_lr_clip.py tests/data/lr.ivf` it writes this
-stream back byte for byte, and `--pix-fmt 444` / `--pix-fmt 422` build the two
-fixtures below from the same content.
+stream back byte for byte, `--pix-fmt 444` / `--pix-fmt 422` build the two
+fixtures below from the same content, and `--bit-depth 10` / `--bit-depth 12`
+build the deeper ones - the generator's 8 bit samples shifted up, so the picture
+is the same picture at every depth. All five come out byte identical to the
+files here.
 
 `lr_444.ivf` and `lr_422.ivf` are that clip coded at 4:4:4 (196 KB, `-pix_fmt
 yuv444p`, profile 1) and 4:2:2 (105 KB, `-pix_fmt yuv422p`, profile 2), with the

@@ -12,15 +12,17 @@ for them as well.
     python3 tests/data/make_lr_clip.py tests/data/lr.ivf
     python3 tests/data/make_lr_clip.py tests/data/lr_444.ivf --pix-fmt 444
     python3 tests/data/make_lr_clip.py tests/data/lr_422.ivf --pix-fmt 422
+    python3 tests/data/make_lr_clip.py tests/data/lr_10bit.ivf --bit-depth 10
+    python3 tests/data/make_lr_clip.py tests/data/lr_12bit.ivf --bit-depth 12
 
 The three numbers in the name of a fixture are the only thing that changes
 between them: the 4:2:0 one is `lr.ivf`, the 4:4:4 and 4:2:2 ones exist because
 restoration on a plane that is not subsampled the way 4:2:0 is does not take the
 same code path (the chroma unit grid halves only for 4:2:0, and a chroma sample
 of a 4:4:4 frame still has to take its difference weighted mask from the *luma*
-prediction). The same clip is coded at 10 and 12 bit by
-`make_lr_depth.py` from the same generator, because the filters' bit depth
-shifts are a no-op at 8 bit.
+prediction). `--bit-depth` codes the same clip at 10 or 12 bit - the generator's
+8 bit samples shifted left, which is what keeps the picture the same picture -
+because the filters' bit depth shifts are a no-op at 8 bit.
 
 The encoder is the libaom build inside the ffmpeg binary that `imageio-ffmpeg`
 installs (`--ffmpeg` selects another), and encoding is deterministic for a given
@@ -45,7 +47,7 @@ FORMATS = {
 }
 
 
-def source_clip(ss_x, ss_y, frames=FRAMES):
+def source_clip(ss_x, ss_y, frames=FRAMES, bit_depth=8):
     """The clip as the bytes ffmpeg's rawvideo demuxer wants."""
     import numpy as np
 
@@ -78,7 +80,12 @@ def source_clip(ss_x, ss_y, frames=FRAMES):
         out += luma.astype(np.uint8).tobytes()
         for plane in (u, v):
             out += np.clip(plane[:, frame:frame + cw], 0, 255).astype(np.uint8).tobytes()
-    return bytes(out)
+    if bit_depth == 8:
+        return bytes(out)
+    # the deeper depths are this same picture with the samples shifted up, which
+    # is what makes the fixture at 10 and 12 bit the same picture as the 8 bit one
+    samples = np.frombuffer(bytes(out), dtype=np.uint8).astype("<u2") << (bit_depth - 8)
+    return samples.tobytes()
 
 
 def encode(ffmpeg, pix_fmt, raw_path, ivf_path, frames):
@@ -110,6 +117,9 @@ def main():
     parser.add_argument("--pix-fmt", default="420", choices=sorted(FORMATS),
                         help="default 420, the lr.ivf fixture")
     parser.add_argument("--frames", type=int, default=FRAMES)
+    parser.add_argument("--bit-depth", type=int, default=8, choices=(8, 10, 12),
+                        help="code the clip at this depth (the samples are the 8 bit "
+                             "ones shifted up): the lr_10bit and lr_12bit fixtures")
     parser.add_argument("--ffmpeg", default="")
     parser.add_argument("--probe", default=os.path.join("build", "bin", "av1gpu_probe"))
     parser.add_argument("--keep-raw", default="", help="keep the raw clip at this path")
@@ -123,10 +133,12 @@ def main():
         args.ffmpeg = get_ffmpeg_exe()
 
     ffmpeg_format, ss_x, ss_y = FORMATS[args.pix_fmt]
+    if args.bit_depth != 8:
+        ffmpeg_format += "%dle" % args.bit_depth
     raw_path = args.keep_raw or os.path.join(
         os.path.dirname(os.path.abspath(args.output)), ".lr_clip_source.yuv")
     with open(raw_path, "wb") as handle:
-        handle.write(source_clip(ss_x, ss_y, args.frames))
+        handle.write(source_clip(ss_x, ss_y, args.frames, args.bit_depth))
     try:
         encode(args.ffmpeg, ffmpeg_format, raw_path, args.output, args.frames)
     finally:
@@ -135,8 +147,9 @@ def main():
 
     lines = probe_restoration(args.probe, args.output)
     used = " ".join(lines)
-    print("%s: %s, %d frames, %d bytes" %
-          (args.output, ffmpeg_format, args.frames, os.path.getsize(args.output)))
+    print("%s: %s, %d bit, %d frames, %d bytes" %
+          (args.output, ffmpeg_format, args.bit_depth, args.frames,
+           os.path.getsize(args.output)))
     for line in lines[:2]:
         print("  %s" % line)
     for name in ("wiener", "sgrproj"):
