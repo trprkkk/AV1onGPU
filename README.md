@@ -222,13 +222,17 @@ cd build && ctest --output-on-failure
   compiler (pocl works) and checks a job of every kernel against values computed
   in Python. This is the test that catches kernel *source* errors, which the C++
   tests cannot see. It needs `pyopencl`; without it the test reports "skipped".
-* `opencl_pipeline.py` — the same, one level up: `av1gpu_dump` writes the real
-  decode plans of a clip, the test replays every job of every wave through the
-  actual OpenCL kernels in the order the backend submits them (waves, then
-  deblocking vertical/horizontal, CDEF, grain), and the whole frame has to match
-  the CPU reference decode bit for bit. It exercises job arrays, prefix tables,
-  launch counts, reference slots and loop filter scheduling together — the
-  things the per-kernel check cannot see. Also needs `pyopencl`.
+* `opencl_pipeline.py` — the same, one level up: `av1gpu_dump` (synthetic clip)
+  or `av1gpu_decode --dump-plans` (a real stream) writes the real decode plans,
+  the test replays every job of every wave through the actual OpenCL kernels in
+  the order the backend submits them (waves, then deblocking
+  vertical/horizontal, CDEF, grain), and the whole frame has to match the CPU
+  reference decode bit for bit. It exercises job arrays, prefix tables, launch
+  counts, reference slots, palette maps, OBMC candidates and loop filter
+  scheduling together — the things the per-kernel check cannot see. Also needs
+  `pyopencl`. Before it runs it checks every job against the pool it indexes, so
+  a plan that does not fit its buffers fails the test instead of corrupting
+  memory.
 
 * `gpu_verify.py` — the same question asked of a machine that really has a GPU:
   `av1gpu_bench` has to report a GPU result bit identical to the CPU reference,
@@ -240,6 +244,8 @@ cd build && ctest --output-on-failure
 pip install pyopencl          # or pyopencl + pocl-binary-distribution
 python3 tests/opencl_selftest.py
 python3 tests/opencl_pipeline.py --frames 4 --qstep 6
+python3 tests/opencl_pipeline.py --input tests/data/lw_t2.ivf --frames 30 \
+        --decoder build/bin/av1gpu_decode
 python3 tests/gpu_verify.py   # on the machine with the GPU
 ```
 

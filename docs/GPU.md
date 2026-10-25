@@ -4,7 +4,9 @@ This tree is built so that everything except the last mile can be checked withou
 a device: the kernels are one C source that the CPU, OpenCL and CUDA backends all
 compile, `tests/opencl_selftest.py` compiles that source with a real OpenCL
 compiler and checks a job of every kernel (palette prediction included), and
-`tests/opencl_pipeline.py` replays real decode plans through it. All of that
+`tests/opencl_pipeline.py` replays real decode plans through it - both the
+synthetic clip and the fixture streams (`--input tests/data/lw_t2.ivf`, local
+warped motion and OBMC), whole frames bit identical to the CPU reference. All of that
 passes on a machine with nothing but PoCL (an OpenCL implementation that runs on
 the CPU):
 

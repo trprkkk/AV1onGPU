@@ -120,7 +120,23 @@ three layers, all of them runnable on a machine with no GPU driver:
    clip, the test replays *every* job of *every* wave through the real kernels in
    backend order (waves, deblock vertical, deblock horizontal, CDEF, grain) and
    compares whole frames against the CPU reference decode. Four frames, intra
-   and inter, all filters on: **bit identical**.
+   and inter, all filters on: **bit identical**. With `--input` the plans come
+   from `av1gpu_decode --dump-plans` for a real stream instead, so the reference
+   pool slots are the decoder's own: `lw_t2` and `lw_t3` (local warped motion and
+   OBMC, 30 frames each), `palette_sc` (102 palette blocks, 10 frames) and
+   `svt_av1_320x240` (a different encoder, 6 frames) are all **bit identical**
+   too.
+
+   The replay sizes every buffer from the plan, and it checks the plan before it
+   starts: each inverse transform job needs `w * h` ints of scratch at its
+   `tmp_off`, which is *not* the size of its coefficient area (only the low
+   32x32 quarter of a 64 point transform is coded, so the coefficient raster is
+   clipped to `Min(32, w)` wide). Sizing the scratch buffer from the coefficient
+   pool therefore writes past the end of it, which on a CPU OpenCL
+   implementation is the host heap - that bug showed up as a malloc abort a
+   frame later, not as a mismatch. `plan_dump.hpp` writes the real `tmp_size`
+   (plan format 3) and `check_buffers()` fails the test if any job reaches past
+   its pool.
 
 To those a fourth layer can be added where a software OpenCL device exists: the
 C++ backend itself, not just the kernel source. PoCL (`pip install pyopencl

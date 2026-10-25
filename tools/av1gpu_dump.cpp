@@ -21,10 +21,11 @@
  *     int32 maxv, blocks
  *     int32 plane_w[3], plane_h[3], stride[3], plane_off[3]
  *     int64 buffer_size
+ *     int64 tmp_size
  *     int32 ref_slot[2]
  *     int32 grain_stride, grain_h
  *     int32 grain_lut[64]
- *     int32 coef_count, residual_count, grain_template_count
+ *     int32 coef_count, residual_count, grain_template_count, palette_count
  *     int32 nwaves
  *     for each wave: int32 n_intra, n_inter, n_itx, n_residual, then the arrays
  *     int32 n_deblock_v, n_deblock_h
@@ -32,6 +33,20 @@
  *     int32 n_cdef, then the cdef array
  *     int32 n_grain, then the grain array
  *     coefficients[], residual[], grain_template[]
+ *     palette_map[]           (palette_count bytes)
+ *
+ * Version 2 added the palette colour map. It is a byte per sample, one map per
+ * plane per palette coded block, concatenated at the offsets the intra jobs
+ * carry in `palette_off`; without it a palette block cannot be replayed at all,
+ * which is the whole reason it is in the file.
+ *
+ * Version 3 added tmp_size, the size in ints of the inverse transform scratch
+ * buffer that `Av1gItxJob::tmp_off` indexes. A job needs w * h ints of scratch,
+ * which is *not* the size of its coefficient area (that one is clipped to 32
+ * samples wide for a 64 point transform, and the scratch region is carved from
+ * one arena for the whole frame), so a replay that sizes the scratch buffer
+ * from the coefficient pool writes past the end of it. Take the size from here
+ * and check it against the jobs rather than guessing.
  *
  *   frame_<n>.yuv16
  *     three planes, 16 bit samples, rows of `plane_w` (stride is dropped)
@@ -53,87 +68,11 @@
 #include "av1gpu/av1gpu.hpp"
 #include "av1gpu/synthetic.hpp"
 #include "core/backend.hpp"
+#include "plan_dump.hpp"
 
 namespace {
 
 using namespace av1gpu;
-
-bool write_all(std::FILE* file, const void* data, size_t size) {
-  return std::fwrite(data, 1, size, file) == size;
-}
-
-template <typename T>
-bool write_vector(std::FILE* file, const std::vector<T>& values) {
-  const int32_t count = static_cast<int32_t>(values.size());
-  if (!write_all(file, &count, sizeof(count))) return false;
-  return values.empty() || write_all(file, values.data(), values.size() * sizeof(T));
-}
-
-bool write_plan(const std::string& path, const internal::FramePlan& plan) {
-  std::FILE* file = std::fopen(path.c_str(), "wb");
-  if (!file) return false;
-  const internal::PlanLayout& g = plan.layout;
-
-  const char magic[8] = {'A', 'V', '1', 'G', 'P', 'L', 'A', 'N'};
-  const int32_t version = 1;
-  const int32_t geom[5] = {g.frame.width, g.frame.height, g.frame.bit_depth,
-                           g.frame.ss_x, g.frame.ss_y};
-  bool ok = write_all(file, magic, sizeof(magic)) &&
-            write_all(file, &version, sizeof(version)) &&
-            write_all(file, geom, sizeof(geom)) &&
-            write_all(file, &plan.maxv, sizeof(plan.maxv)) &&
-            write_all(file, &plan.blocks, sizeof(plan.blocks)) &&
-            write_all(file, g.plane_w, sizeof(g.plane_w)) &&
-            write_all(file, g.plane_h, sizeof(g.plane_h)) &&
-            write_all(file, g.stride, sizeof(g.stride)) &&
-            write_all(file, g.plane_off, sizeof(g.plane_off));
-  const int64_t buffer_size = static_cast<int64_t>(g.buffer_size);
-  ok = ok && write_all(file, &buffer_size, sizeof(buffer_size)) &&
-       write_all(file, plan.ref_slot, sizeof(plan.ref_slot)) &&
-       write_all(file, &plan.grain_stride, sizeof(plan.grain_stride)) &&
-       write_all(file, &plan.grain_h, sizeof(plan.grain_h)) &&
-       write_all(file, plan.grain_lut, sizeof(plan.grain_lut));
-
-  const int32_t counts[3] = {static_cast<int32_t>(plan.coefficients.size()),
-                             static_cast<int32_t>(plan.residual.size()),
-                             static_cast<int32_t>(plan.grain_template.size())};
-  ok = ok && write_all(file, counts, sizeof(counts));
-
-  const int32_t nwaves = static_cast<int32_t>(plan.waves.size());
-  ok = ok && write_all(file, &nwaves, sizeof(nwaves));
-  for (const internal::WaveJobs& wave : plan.waves) {
-    if (!ok) break;
-    ok = write_vector(file, wave.intra) && write_vector(file, wave.inter) &&
-         write_vector(file, wave.itx) && write_vector(file, wave.residual);
-  }
-  ok = ok && write_vector(file, plan.deblock_v) && write_vector(file, plan.deblock_h) &&
-       write_vector(file, plan.cdef) && write_vector(file, plan.grain);
-
-  if (ok && !plan.coefficients.empty())
-    ok = write_all(file, plan.coefficients.data(),
-                   plan.coefficients.size() * sizeof(int32_t));
-  if (ok && !plan.residual.empty())
-    ok = write_all(file, plan.residual.data(), plan.residual.size() * sizeof(int32_t));
-  if (ok && !plan.grain_template.empty())
-    ok = write_all(file, plan.grain_template.data(), plan.grain_template.size());
-
-  std::fclose(file);
-  return ok;
-}
-
-bool write_frame(const std::string& path, const Frame& frame) {
-  std::FILE* file = std::fopen(path.c_str(), "wb");
-  if (!file) return false;
-  bool ok = true;
-  for (int p = 0; p < 3 && ok; ++p) {
-    const int w = frame.plane_width(p);
-    for (int y = 0; y < frame.plane_height(p) && ok; ++y)
-      ok = write_all(file, frame.plane(p) + static_cast<size_t>(y) * frame.stride[p],
-                     static_cast<size_t>(w) * sizeof(uint16_t));
-  }
-  std::fclose(file);
-  return ok;
-}
 
 void usage() {
   std::printf(
@@ -227,7 +166,7 @@ int main(int argc, char** argv) {
     }
 
     const std::string plan_path = output + "/frame_" + std::to_string(f) + ".plan";
-    if (!write_plan(plan_path, plan)) {
+    if (!plan_dump::write_plan(plan_path, plan)) {
       std::fprintf(stderr, "av1gpu_dump: cannot write %s\n", plan_path.c_str());
       return 1;
     }
@@ -246,7 +185,7 @@ int main(int argc, char** argv) {
                        std::to_string(plan.ref_slot[1]) + " out " + std::to_string(slot));
 
     const std::string frame_path = output + "/frame_" + std::to_string(f) + ".yuv16";
-    if (!write_frame(frame_path, decoded)) {
+    if (!plan_dump::write_frame(frame_path, decoded)) {
       std::fprintf(stderr, "av1gpu_dump: cannot write %s\n", frame_path.c_str());
       return 1;
     }

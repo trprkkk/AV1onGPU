@@ -36,6 +36,8 @@
 #include <vector>
 
 #include "av1gpu/av1gpu.hpp"
+#include "core/backend.hpp"
+#include "plan_dump.hpp"
 #include "frontend/dequant.hpp"
 #include "frontend/headers.hpp"
 #include "frontend/ivf.hpp"
@@ -55,6 +57,7 @@ struct Options {
   std::string compare;
   std::string hash_out;
   std::string hash_check;
+  std::string dump_plans;
   std::string backend = "auto";
   int device = 0;
   bool require_device = false;
@@ -70,6 +73,9 @@ void usage() {
       "  --compare F       compare against a planar 8 bit YUV file\n"
       "  --hash-out F      write one hash per shown frame to F\n"
       "  --hash-check F    compare the output against the hashes in F\n"
+      "  --dump-plans DIR  write every frame's decode plan to DIR (for replaying\n"
+      "                    through the device kernels on a machine with no GPU;\n"
+      "                    see tests/opencl_pipeline.py)\n"
       "  --backend B       auto (default), cpu, opencl or cuda\n"
       "  --device N        device index for that backend (default 0)\n"
       "  --require-device  fail instead of falling back to the CPU backend\n"
@@ -202,6 +208,10 @@ int main(int argc, char** argv) {
       opt.hash_check = argv[++i];
       continue;
     }
+    if (arg == "--dump-plans" && i + 1 < argc) {
+      opt.dump_plans = argv[++i];
+      continue;
+    }
     if (arg == "--backend" && i + 1 < argc) {
       opt.backend = argv[++i];
       continue;
@@ -293,6 +303,22 @@ int main(int argc, char** argv) {
     if (!out_file) {
       std::fprintf(stderr, "av1gpu_decode: cannot write %s\n", opt.output.c_str());
       return 2;
+    }
+  }
+
+  /* Plan dumping: the same plan the engine hands a backend, plus the CPU
+   * reference picture, so tests/opencl_pipeline.py can replay the frame through
+   * the real device kernels on a machine with no driver. The layout comes from
+   * the CPU backend (the layout is a property of the frame geometry, not of the
+   * device), which is also what av1gpu_dump does for synthetic clips. */
+  std::unique_ptr<internal::Backend> plan_backend;
+  std::vector<std::string> plan_manifest;
+  int plan_index = 0;
+  if (!opt.dump_plans.empty()) {
+    plan_backend = internal::create_cpu_backend({}, &error);
+    if (!plan_backend) {
+      std::fprintf(stderr, "av1gpu_decode: %s\n", error.c_str());
+      return 1;
     }
   }
 
@@ -570,12 +596,53 @@ int main(int argc, char** argv) {
         release_if_unused(freed);
       }
 
+      internal::FramePlan plan;
+      if (plan_backend) {
+        internal::FrameGeometry geom;
+        geom.width = syntax.width;
+        geom.height = syntax.height;
+        geom.bit_depth = syntax.bit_depth;
+        geom.ss_x = syntax.ss_x;
+        geom.ss_y = syntax.ss_y;
+        const internal::PlanLayout layout = plan_backend->prepare(geom);
+        if (!internal::build_frame_plan(syntax, layout, backend_options,
+                                        plan_backend->reference_capacity(), &plan, &error)) {
+          std::printf("frame %zu: plan: %s\n", index, error.c_str());
+          status = 1;
+          break;
+        }
+        const std::string plan_path =
+            opt.dump_plans + "/frame_" + std::to_string(plan_index) + ".plan";
+        if (!plan_dump::write_plan(plan_path, plan)) {
+          std::fprintf(stderr, "av1gpu_decode: cannot write %s\n", plan_path.c_str());
+          status = 1;
+          break;
+        }
+      }
+
       Frame picture;
       const int slot = decoder->decode_reference(syntax, &picture, &error);
       if (slot < 0) {
         std::printf("frame %zu: %s\n", index, error.c_str());
         status = 1;
         break;
+      }
+
+      if (plan_backend) {
+        const std::string frame_path =
+            opt.dump_plans + "/frame_" + std::to_string(plan_index) + ".yuv16";
+        if (!plan_dump::write_frame(frame_path, picture)) {
+          std::fprintf(stderr, "av1gpu_decode: cannot write %s\n", frame_path.c_str());
+          status = 1;
+          break;
+        }
+        /* the same shape av1gpu_dump writes, with the temporal unit appended so
+         * a reader can tell which frame of the stream it came from */
+        plan_manifest.push_back("frame " + std::to_string(plan_index) + " refs " +
+                                std::to_string(plan.ref_slot[0]) + " " +
+                                std::to_string(plan.ref_slot[1]) + " out " +
+                                std::to_string(slot) + " unit " + std::to_string(index));
+        ++plan_index;
       }
 
       std::printf("frame %zu: %dx%d, %zu block(s), %d transform block(s), "
@@ -610,6 +677,21 @@ int main(int argc, char** argv) {
       refresh_ref_pool(frame, &refs, decoded.ref_mvs, decoded.cdf);
     }
     if (status != 0) break;
+  }
+
+  if (!opt.dump_plans.empty()) {
+    /* the manifest is how the replay test knows which pool slot to store each
+     * frame in, and which slots the frame itself read */
+    const std::string manifest_path = opt.dump_plans + "/manifest.txt";
+    std::FILE* manifest_file = std::fopen(manifest_path.c_str(), "wb");
+    if (!manifest_file) {
+      std::fprintf(stderr, "av1gpu_decode: cannot write %s\n", manifest_path.c_str());
+      status = 1;
+    } else {
+      for (const std::string& line : plan_manifest)
+        std::fprintf(manifest_file, "%s\n", line.c_str());
+      std::fclose(manifest_file);
+    }
   }
 
   if (out_file) std::fclose(out_file);

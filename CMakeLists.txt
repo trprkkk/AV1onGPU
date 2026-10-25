@@ -192,6 +192,32 @@ if(AV1GPU_BUILD_TESTS)
       set_tests_properties(opencl_pipeline PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
 
+    # The same replay for real streams, where the plans come from the decoder
+    # itself, so the reference pool slot mapping is the real one:
+    #   palette_sc      the only fixture that codes palette blocks, so every
+    #                   palette prediction runs through the device kernels
+    #   lw_t2, lw_t3    the only ones that code local warped motion and OBMC,
+    #                   whose overlap candidates carry their own reference slot
+    #   svt_av1_320x240 a different encoder, so a different mix of tools
+    # All of it on a machine with no GPU at all.
+    if(TARGET av1gpu_decode)
+      foreach(stream palette_sc lw_t2 lw_t3 svt_av1_320x240)
+        set(frames 30)
+        if(stream STREQUAL "palette_sc")
+          set(frames 10)
+        elseif(stream STREQUAL "svt_av1_320x240")
+          set(frames 6)
+        endif()
+        add_test(NAME opencl_${stream}
+                 COMMAND ${AV1GPU_TEST_PY}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_pipeline.py
+                         --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/${stream}.ivf
+                         --frames ${frames} --decoder $<TARGET_FILE:av1gpu_decode>)
+        set_tests_properties(opencl_${stream} PROPERTIES SKIP_RETURN_CODE 77
+                             TIMEOUT 600)
+      endforeach()
+    endif()
+
     # Verification on a machine that really has a GPU: the OpenCL/CUDA backends
     # against the CPU reference and against a reference decoder's frame hashes.
     # Off by default because it needs a device; without one the script exits with

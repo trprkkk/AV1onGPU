@@ -16,8 +16,15 @@ are the production ones, and the comparison is exact.
     pip install pyopencl pocl-binary-distribution
     python3 tests/opencl_pipeline.py
     python3 tests/opencl_pipeline.py --frames 6 --qstep 20 --no-grain
+    python3 tests/opencl_pipeline.py --input tests/data/lw_t2.ivf --frames 30 \
+            --decoder build/bin/av1gpu_decode
 
-Exit codes: 0 all frames match, 1 mismatch, 77 OpenCL or the dumper is missing.
+With --input the plans come from a real stream instead of the synthetic clip
+(the decoder writes them with --dump-plans), which is the only way to replay
+palette coded blocks, local warped motion and OBMC with the decoder's own
+reference pool slots.
+
+Exit codes: 0 all frames match, 1 mismatch, 77 OpenCL or the tools are missing.
 """
 
 import argparse
@@ -36,9 +43,14 @@ sys.path.insert(0, HERE)
 import opencl_selftest as selftest  # noqa: E402  (probe, kernel source, helpers)
 
 MAGIC = b"AV1GPLAN"
-FORMAT_VERSION = 1
-REFERENCE_SLOTS = 6      # kReferenceSlots in the backends
+FORMAT_VERSION = 3       # 2 added the palette map, 3 the itx scratch size
+REFERENCE_SLOTS = 9      # kReferenceSlots in the backends
 CDEF_DIM = 8             # AV1G_CDEF_DIM
+MASK_DIFFWTD = 2         # AV1G_MASK_DIFFWTD
+# the ctypes mirror flattens nested struct arrays, so field `n` of the `k`th
+# Av1gObmcCandidate is reached as `obmc<k>_<n>` (see tests/opencl_selftest.py)
+OBMC_REF_SLOT = 9        # Av1gObmcCandidate::ref_slot
+OBMC_REF_OFF = 10        # Av1gObmcCandidate::ref_off
 
 
 # --------------------------------------------------------------------------
@@ -83,7 +95,9 @@ def read_plan(path, layouts):
         raise ValueError("%s is not a plan file" % path)
     version = r.i32()
     if version != FORMAT_VERSION:
-        raise ValueError("unsupported plan version %d" % version)
+        raise ValueError("unsupported plan version %d (this test reads %d; "
+                         "rebuild av1gpu_dump/av1gpu_decode)"
+                         % (version, FORMAT_VERSION))
 
     plan = {"version": version}
     (plan["width"], plan["height"], plan["bit_depth"], plan["ss_x"],
@@ -95,6 +109,9 @@ def read_plan(path, layouts):
     plan["stride"] = r.ints(3)
     plan["plane_off"] = r.ints(3)
     plan["buffer_size"] = r.i64()
+    # the inverse transform scratch arena: Av1gItxJob::tmp_off indexes it and a
+    # job needs w * h ints, which is more than its coefficient area
+    plan["tmp_size"] = r.i64()
     plan["ref_slot"] = r.ints(2)
     plan["grain_stride"] = r.i32()
     plan["grain_h"] = r.i32()
@@ -102,6 +119,7 @@ def read_plan(path, layouts):
     plan["coef_count"] = r.i32()
     plan["residual_count"] = r.i32()
     plan["grain_count"] = r.i32()
+    plan["palette_count"] = r.i32()
 
     plan["waves"] = []
     for _ in range(r.i32()):
@@ -119,7 +137,64 @@ def read_plan(path, layouts):
     plan["residual"] = r.ints(plan["residual_count"])
     plan["grain_template"] = list(struct.unpack(
         "<%db" % plan["grain_count"], r.raw(plan["grain_count"])))
+    plan["palette_map"] = np_frombytes(r.raw(plan["palette_count"]))
     return plan
+
+
+def np_frombytes(blob):
+    """The palette map as a uint8 array (a bytearray is enough and needs no
+    numpy at import time, but pyopencl wants a buffer)."""
+    return bytearray(blob)
+
+
+def check_buffers(plan):
+    """Checks every job against the pool it indexes, before anything runs.
+
+    The replay uploads each pool with exactly the length the plan gives it, so a
+    job that reaches past the end writes into whatever the allocator put next
+    to it - on a CPU OpenCL implementation that is the host heap, and the
+    process dies later with a nonsensical malloc error instead of a failed
+    test. That is how the inverse transform scratch buffer was found: it is a
+    per frame arena of w * h ints per transform, while the coefficient area of
+    the same job is clipped to 32 samples wide, so sizing the scratch buffer
+    from the coefficient pool overruns it.
+
+    Returns a list of problems; empty means every job fits.
+    """
+    problems = []
+
+    def need(what, end, limit):
+        if end > limit:
+            problems.append("%s: a job needs %d samples, the buffer has %d"
+                            % (what, end, limit))
+
+    for wave_index, wave in enumerate(plan["waves"]):
+        for job in wave["itx"]:
+            # the coefficient raster is Min(32, w) wide: only the low 32x32
+            # quarter of a 64 point transform is coded
+            need("wave %d itx coefficients" % wave_index,
+                 job.coef_off + min(job.w, 32) * min(job.h, 32),
+                 plan["coef_count"])
+            need("wave %d itx scratch" % wave_index, job.tmp_off + job.w * job.h,
+                 plan["tmp_size"])
+        for job in wave["residual"]:
+            need("wave %d residual" % wave_index, job.coef_off + job.w * job.h,
+                 plan["residual_count"])
+            # the residual pass has no scratch, but the arena is sized for the
+            # whole frame including it
+            need("wave %d residual scratch" % wave_index,
+                 job.tmp_off + job.w * job.h, plan["tmp_size"])
+        for job in wave["intra"]:
+            if not job.palette:
+                continue
+            if not plan["palette_count"]:
+                problems.append("wave %d: a palette block, but the plan carries "
+                                "no palette map" % wave_index)
+                continue
+            need("wave %d palette map" % wave_index,
+                 job.palette_off + (job.h - 1) * job.palette_stride + job.w,
+                 plan["palette_count"])
+    return problems
 
 
 # --------------------------------------------------------------------------
@@ -185,11 +260,18 @@ class Replay:
         residual = np.array(plan["residual"] + [0] * 64, dtype=np.int32)
         coef_buf = self.buffer(coef)
         residual_buf = self.buffer(residual)
-        # tmp shares the coefficient offsets (itx.tmp_off == itx.coef_off)
-        tmp_buf = self.buffer(np.zeros(max(len(coef), len(residual)), dtype=np.int32),
-                              readonly=False)
+        # the scratch arena is its own buffer, sized by the plan: an itx job
+        # writes w * h ints at tmp_off, which does not fit in the coefficient
+        # pool (that one is clipped to 32 samples wide for a 64 point transform)
+        tmp = np.zeros(plan["tmp_size"] + 64, dtype=np.int32)
+        tmp_buf = self.buffer(tmp, readonly=False)
         frame = self.buffer(np.zeros(size, dtype=np.uint16), readonly=False)
-        palette_buf = self.buffer(np.zeros(8, dtype=np.uint8))
+        # the palette colour map of the whole frame, one buffer, exactly as the
+        # backends upload it; the intra jobs index it with palette_off
+        palette = plan["palette_map"]
+        if not palette:
+            palette = bytearray(8)
+        palette_buf = self.buffer(np.frombuffer(bytes(palette), dtype=np.uint8))
 
         for wave in plan["waves"]:
             # ---- inter prediction (reads the reference pool) --------------
@@ -202,21 +284,36 @@ class Replay:
                         job.ref0_off += job.ref0_slot * size
                     if job.ref1_slot >= 0:
                         job.ref1_off += job.ref1_slot * size
+                    # a difference weighted chroma block builds its mask on the
+                    # luma plane, so those offsets need the same slot rebase
+                    if job.mask_kind == MASK_DIFFWTD:
+                        if job.ref0_slot >= 0:
+                            job.luma_ref0_off += job.ref0_slot * size
+                        if job.ref1_slot >= 0:
+                            job.luma_ref1_off += job.ref1_slot * size
+                    # overlap candidates carry their own reference slot
+                    for k in range(job.obmc_count):
+                        slot = getattr(job, "obmc%d_%d" % (k, OBMC_REF_SLOT))
+                        if slot < 0:
+                            continue
+                        name = "obmc%d_%d" % (k, OBMC_REF_OFF)
+                        setattr(job, name, getattr(job, name) + slot * size)
                 job_buf, pref, total = self.jobs(jobs, [j.w * j.h for j in jobs])
+                # arg 4 is the picture being decoded (a job that names no slot
+                # predicts from it), arg 5 the reference pool: both are the
+                # frame buffer and the pool, exactly as the backend passes them
                 self.launch("av1g_k_inter", total,
                             (job_buf, pref, np.int32(len(jobs)), np.int32(total),
-                             ref_pool, ref_pool, frame, filter_buf, np.int32(maxv)))
+                             frame, ref_pool, frame, filter_buf, np.int32(maxv)))
 
             # ---- intra prediction: one work item per block -----------------
             if wave["intra"]:
                 jobs = wave["intra"]
                 job_buf, pref, total = self.jobs(jobs, [1] * len(jobs))
-                # Palette blocks index a per frame colour map buffer. The dump
-                # does not carry that map yet, so a palette block would read the
-                # wrong entries; the frames replayed here code none. The kernel
-                # side is covered by opencl_selftest.py, and the whole path by
-                # decoding tests/data/palette_sc.ivf with --backend opencl on a
-                # machine that has an ICD loader.
+                # Palette blocks gather from the frame's colour map buffer
+                # through the colour indices in the job; the map comes from the
+                # plan file, so a palette coded stream is replayed exactly like
+                # any other.
                 self.launch("av1g_k_intra", len(jobs),
                             (job_buf, np.int32(len(jobs)), frame, palette_buf,
                              np.int32(maxv)))
@@ -327,6 +424,9 @@ def read_manifest(path):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--input", default=None,
+                        help="replay this .ivf stream instead of the synthetic clip; "
+                             "the plans come from av1gpu_decode --dump-plans")
     parser.add_argument("--frames", type=int, default=4,
                         help="frames to validate (the plans themselves decide the "
                              "wave counts, so more frames means more inter refs)")
@@ -336,10 +436,11 @@ def parse_args(argv=None):
     parser.add_argument("--no-cdef", action="store_true", help="decode without CDEF")
     parser.add_argument("--no-grain", action="store_true", help="decode without grain")
     parser.add_argument("--dumper", default=None, help="path to av1gpu_dump")
+    parser.add_argument("--decoder", default=None, help="path to av1gpu_decode")
     return parser.parse_args(argv)
 
 
-def main():
+def main(argv=None):
     try:
         import numpy as np
         import pyopencl as cl
@@ -352,10 +453,18 @@ def main():
         print("OpenCL pipeline test skipped: no OpenCL platform")
         return 77
 
-    args = parse_args()
-    dumper = args.dumper or os.path.join(ROOT, "build", "bin", "av1gpu_dump")
-    if not os.path.exists(dumper):
-        print("OpenCL pipeline test skipped: %s is not built" % dumper)
+    args = parse_args(argv)
+    if args.input:
+        # a real stream: av1gpu_decode writes the plans, because it is the only
+        # place that knows which pool slot each frame ends up in
+        tool = args.decoder or os.path.join(ROOT, "build", "bin", "av1gpu_decode")
+    else:
+        tool = args.dumper or os.path.join(ROOT, "build", "bin", "av1gpu_dump")
+    if not os.path.exists(tool):
+        print("OpenCL pipeline test skipped: %s is not built" % tool)
+        return 77
+    if args.input and not os.path.exists(args.input):
+        print("OpenCL pipeline test skipped: %s does not exist" % args.input)
         return 77
 
     device = found[0]
@@ -373,23 +482,44 @@ def main():
     frames = args.frames
     work = tempfile.mkdtemp(prefix="av1gpu-plans-")
     try:
-        command = [dumper, "--width", str(args.width), "--height", str(args.height),
-                   "--frames", str(frames), "--qstep", str(args.qstep),
-                   "--output", work]
-        if not args.no_cdef:
-            command.append("--cdef")
-        if not args.no_grain:
-            command.append("--grain")
+        if args.input:
+            command = [tool, args.input, "--backend", "cpu",
+                       "--frames", str(frames), "--dump-plans", work,
+                       "-o", os.devnull]
+        else:
+            command = [tool, "--width", str(args.width), "--height", str(args.height),
+                       "--frames", str(frames), "--qstep", str(args.qstep),
+                       "--output", work]
+            if not args.no_cdef:
+                command.append("--cdef")
+            if not args.no_grain:
+                command.append("--grain")
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
-            print("av1gpu_dump failed:\n%s" % result.stderr)
+            print("%s failed:\n%s\n%s" % (os.path.basename(tool), result.stderr,
+                                           result.stdout))
             return 1
         for line in result.stdout.strip().splitlines():
             print("  %s" % line)
 
-        plans = [read_plan(os.path.join(work, "frame_%d.plan" % f), layouts)
-                 for f in range(frames)]
         manifest = read_manifest(os.path.join(work, "manifest.txt"))
+        # the manifest is the authority on how many frames there are: a dump that
+        # stopped early is not a pass just because the frames it wrote agree
+        plans = [read_plan(os.path.join(work, "frame_%d.plan" % f), layouts)
+                 for f in sorted(manifest)]
+        frames = len(plans)
+        palette_blocks = sum(1 for plan in plans for wave in plan["waves"]
+                             for job in wave["intra"] if job.palette)
+        problems = ["frame %d: %s" % (index, problem)
+                    for index, plan in enumerate(plans)
+                    for problem in check_buffers(plan)]
+        if problems:
+            print("the plans do not fit their buffers:")
+            for problem in problems:
+                print("  %s" % problem)
+            return 1
+        if palette_blocks:
+            print("  %d palette coded block(s) in the replayed frames" % palette_blocks)
         # one flat pool, `REFERENCE_SLOTS` frames deep, exactly like the backend
         size = plans[0]["buffer_size"]
         if any(plan["buffer_size"] != size for plan in plans):
@@ -402,10 +532,11 @@ def main():
         failures = []
         filled = set()
         for index, plan in enumerate(plans):
-            refs, _, out_slot = manifest[index]
+            refs, refs1, out_slot = manifest[index]
             # the backend keeps the reference pool on the device, so a plan can
             # only be replayed once the frames it points at are there
-            missing = [slot for slot in (refs,) if slot >= 0 and slot not in filled]
+            missing = [slot for slot in (refs, refs1)
+                       if slot >= 0 and slot not in filled]
             if missing:
                 failures.append("frame %d: reference slot %s not decoded yet" %
                                 (index, missing))
