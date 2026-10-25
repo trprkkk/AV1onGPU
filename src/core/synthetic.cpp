@@ -239,7 +239,7 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
           job.filter_type = -1; /* the encoder writes the edge as it is */
           job.max_x = recon.plane_width(plane) - 1;
           job.max_y = recon.plane_height(plane) - 1;
-          av1g_intra_block(&job, recon.plane(plane), maxv);
+          av1g_intra_block(&job, recon.plane(plane), nullptr, maxv);
           for (int yy = 0; yy < h; ++yy)
             std::memcpy(pred.data() + static_cast<size_t>(yy) * w,
                         recon.plane(plane) + off + static_cast<size_t>(yy) * stride,

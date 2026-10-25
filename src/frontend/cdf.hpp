@@ -146,6 +146,10 @@ struct ModeCdf {
   uint16_t pal_sz[2][7][8];
   uint16_t pal_y[7][3][2];
   uint16_t pal_uv[2][2];
+  /* the colour map of a palette block: [plane][palette size - 2][colour
+   * context], one probability per colour past the first, so a row for a
+   * palette of N colours holds N - 1 of them */
+  uint16_t pal_color[2][7][5][8];
   /* chroma from luma */
   uint16_t cfl_sign[8];
   uint16_t cfl_alpha[6][16];

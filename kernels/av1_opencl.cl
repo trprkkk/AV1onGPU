@@ -55,11 +55,12 @@ __kernel void av1g_k_itx_cols(__global const Av1gItxJob *jobs,
  * because the edge filtering and the recursive predictor look at more than one
  * sample around the position being predicted. */
 __kernel void av1g_k_intra(__global const Av1gIntraJob *jobs, int njobs,
-                           __global av1g_px *plane, int maxv) {
+                           __global av1g_px *plane,
+                           __global const unsigned char *palette, int maxv) {
   const int j = (int)get_global_id(0);
   if (j >= njobs) return;
   Av1gIntraJob job = jobs[j];
-  av1g_intra_block(&job, plane, maxv);
+  av1g_intra_block(&job, plane, palette, maxv);
 }
 
 __kernel void av1g_k_inter(__global const Av1gInterJob *jobs,

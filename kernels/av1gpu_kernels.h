@@ -120,6 +120,19 @@ typedef struct {
   int luma_w, luma_h; /* CFL: the co-located luma block's right/bottom edge */
   int ss_x, ss_y;    /* chroma subsampling shifts (0/1)                    */
   int max_x, max_y;  /* last valid sample of this plane                    */
+  /* Palette prediction (screen content) replaces the intra prediction
+   * entirely: every sample is one of at most eight colours, taken from the
+   * block's colour map. Nothing is read from the neighbours - not the edges,
+   * not the corner - so such a block has no dependency on the ones around it,
+   * and the palette itself is a small table in the job. `palette_off` is the
+   * map's position inside the frame's palette pool, in bytes, at the corner of
+   * the *transform* block being predicted; `palette_stride` is the row pitch
+   * of the whole coding block's map. */
+  int palette;       /* 1: predict from palette_color + the map            */
+  int palette_size;  /* colours coded, 2..8 (unused by the kernel)         */
+  int palette_color[8];
+  int palette_off;
+  int palette_stride;
 } Av1gIntraJob;
 
 /*
@@ -1158,7 +1171,7 @@ AV1G_FN int av1g_intra_dc(const Av1gIntraJob *job, const int *above, const int *
  * per sample: the edge filtering, the recursive predictor and the luma
  * projection of chroma from luma all look at more than one sample. */
 AV1G_FN void av1g_intra_block(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plane,
-                              int maxv) {
+                              AV1G_GLOBAL const unsigned char *palette, int maxv) {
   int above_buf[AV1G_INTRA_EDGE];
   int left_buf[AV1G_INTRA_EDGE];
   int *above = above_buf + AV1G_INTRA_EDGE_OFF;
@@ -1166,6 +1179,21 @@ AV1G_FN void av1g_intra_block(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plan
   const int w = job->w, h = job->h, stride = job->dst_stride;
   AV1G_GLOBAL av1g_px *out = plane + job->dst_off;
   int i, j;
+
+  if (job->palette) {
+    /* Palette prediction: the colour map is coded, not predicted, so this is a
+     * table lookup per sample and nothing else - no edge filter, no
+     * directional walk, and none of the work the other modes do. */
+    AV1G_GLOBAL const unsigned char *map = palette + job->palette_off;
+    const int map_stride = job->palette_stride;
+    for (i = 0; i < h; ++i) {
+      for (j = 0; j < w; ++j) {
+        out[i * stride + j] =
+            (av1g_px)job->palette_color[map[i * map_stride + j]];
+      }
+    }
+    return;
+  }
 
   if (job->mode == AV1G_PRED_CFL) {
     /* Chroma from luma: the DC prediction of the chroma block plus the luma

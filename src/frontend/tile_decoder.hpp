@@ -199,7 +199,22 @@ struct TileBlock {
   int cfl_alpha[2] = {0, 0};
   bool filter_intra = false;
   int filter_intra_mode = 0;
+  /* Palette (screen content): the colours, per plane, and the colour map that
+   * says which of them each sample takes. The map is the block's own, at the
+   * block's size in samples: bw4 * 4 by bh4 * 4 for luma, and for chroma the
+   * subsampled size with the specification's floor of four samples per side.
+   * A palette of size zero means the plane is predicted as usual. */
   int palette_size[2] = {0, 0};
+  int palette_color_y[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int palette_color_u[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int palette_color_v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  std::vector<uint8_t> palette_map_y;
+  std::vector<uint8_t> palette_map_uv;
+  /* the maps' own size in samples, which is the block's size for luma and the
+   * subsampled size - with the specification's floor of four samples per side -
+   * for the chroma pair */
+  int palette_map_w[2] = {0, 0};
+  int palette_map_h[2] = {0, 0};
   int segment_id = 0;
   /* DeltaLFs[..][0..3]: the loop filter's delta, accumulated per superblock by
    * the delta_lf syntax (zero when the frame does not use it). */

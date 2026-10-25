@@ -54,11 +54,12 @@ extern "C" __global__ void av1g_k_itx_cols(const Av1gItxJob *jobs,
 /* One thread per block: intra prediction is a whole-block operation, since the
  * edge filtering and the recursive predictor read well past one sample. */
 extern "C" __global__ void av1g_k_intra(const Av1gIntraJob *jobs, int njobs,
-                                        av1g_px *plane, int maxv) {
+                                        av1g_px *plane,
+                                        const unsigned char *palette, int maxv) {
   const int j = AV1G_GID;
   if (j >= njobs) return;
   Av1gIntraJob job = jobs[j];
-  av1g_intra_block(&job, plane, maxv);
+  av1g_intra_block(&job, plane, palette, maxv);
 }
 
 extern "C" __global__ void av1g_k_inter(const Av1gInterJob *jobs,

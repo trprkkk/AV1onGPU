@@ -269,6 +269,7 @@ was built for.)
 | `w_cu2` | 30 | ROTZOOM global motion, a difference mask on chroma |
 | `lwn2`, `lwn3` | 30 each | local warped motion (`motion_mode = LOCALWARP`) |
 | `lw_t2`, `lw_t3` | 30 each | local warped motion **and** OBMC (in `tests/data/`) |
+| `palette_sc` | 10 | palette coded blocks (screen content, in `tests/data/`) |
 
 The four local-warp streams are the ROTZOOM clip re-encoded with libaom at
 `--cpu-used=2` and `--cpu-used=3`, `--crf=30`, `--lag-in-frames=25`,
@@ -295,6 +296,39 @@ pictures and not this decoder's. Regenerate one with
 
 but only after checking the stream against dav1d, or the file would record our
 own mistakes.
+
+`tests/data/palette_sc.ivf` is the screen content fixture: a synthetic desktop
+style clip (flat colour panels, thin lines, text-like glyph runs, chroma flat
+areas) encoded with libaom `tune-content=screen --enable-intrabc=0`, so every
+intra block that wants one codes a *palette* instead of a prediction mode. It is
+10 frames of 320x240, 6.7 KB, and it codes palettes on both planes: luma-only,
+luma+chroma, and 2, 3 and 4 colour palettes with cache reuse from the block
+above and to the left. Intra block copy is switched off because intrabc blocks
+are out of scope (the parser reads the flag and stops with a named error); the
+stream is otherwise the shortest thing that walks the whole palette syntax -
+`palette_mode_info`, `palette_tokens`, the colour map's three neighbour
+contexts, and the neighbour palette cache.
+
+Two bugs came out of this fixture and neither is visible without pixels:
+
+* **The delta width of a palette colour was CeilLog2, not FloorLog2 + 1.** A
+  colour is coded as a delta from the previous one, and the width of the next
+  delta is `Min(bits, FloorLog2(MAX_VALUE - prev - (plane ? 0 : 1)) + 1)`. The
+  two functions agree everywhere except on exact powers of two (a reachable
+  range of 2 needs *two* bits, not one), so the stream stayed in sync until a
+  block happened to land on one, then desynchronised - which is why the first
+  two frames were bit exact and the third was not.
+* **Palette CDFs kept their adaptation counters across a frame boundary.** The
+  counters (`cdf[n_symbols]`, saturating at 32) are *not* part of a saved frame
+  context: `load_cdfs` loads the probabilities and sets every counter back to 0,
+  so the next frame adapts at the base rate. `reset_cdf_counts()` was zeroing
+  the counters of the tables that existed when it was written and had never been
+  extended to `pal_y`, `pal_uv`, `pal_sz`, the key frame mode table, the intrabc
+  flag and the duplicate partition/skip tables. A stale counter of 32 makes the
+  adaptation rate `4 + (32 >> 4) + (n > 2)` instead of `4 + (n > 2)`, so the
+  probabilities drift by a few Q15 units per update and, several hundred
+  symbols later, a symbol decodes differently. Every table `init_default_cdf`
+  fills is now reset, together with a comment saying why.
 
 A single sample of drift is worth chasing rather than tolerating: the last three
 differences on `w_cu2` were one level on four chroma samples spread over three

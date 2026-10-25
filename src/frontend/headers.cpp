@@ -684,10 +684,14 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
   if (key_or_intra && h.allow_screen_content_tools && !h.superres) {
     h.allow_intrabc = r.read_bit();
   }
-  if (h.allow_intrabc) {
-    *out = h;
-    return unsupported("intra block copy (allow_intrabc) is not implemented", error);
-  }
+  /* allow_intrabc only says the *frame* may use intra block copy: the flag is
+   * per block (use_intrabc), and an encoder sets it for the whole frame as soon
+   * as it wants the option, whether or not a block takes it. So the header is
+   * accepted here; the tile parser refuses a block that actually copies from
+   * the frame it is decoding, which is the syntax this decoder cannot
+   * reconstruct. A frame that allows it also codes no CDEF, no restoration and
+   * no loop filter levels (see below) - all of which follow from this flag
+   * rather than from the blocks. */
 
   if (!key_or_intra) {
     h.allow_high_precision_mv = h.force_integer_mv ? false : r.read_bit();

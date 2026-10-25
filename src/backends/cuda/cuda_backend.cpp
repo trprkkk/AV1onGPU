@@ -241,6 +241,12 @@ class CudaBackend final : public Backend {
       }
       if (!wave.intra.empty()) {
         const int n = static_cast<int>(wave.intra.size());
+        if (!ensure(&palette_, &palette_cap_, plan.palette_map.size()))
+          return fail(error, "palette map upload failed");
+        if (!plan.palette_map.empty() &&
+            driver_.MemcpyHtoD(palette_, plan.palette_map.data(),
+                               plan.palette_map.size()) != cuda::CUDA_SUCCESS)
+          return fail(error, "palette map write failed");
         int total = 0;
         CUdeviceptr job_mem = 0, unused = 0;
         if (!upload_jobs(wave.intra, &job_mem, &unused, &total,
@@ -252,6 +258,7 @@ class CudaBackend final : public Backend {
           add_mem(a, job_mem);
           add_int(a, n);
           add_mem(a, frame_);
+          add_mem(a, palette_);
           add_int(a, maxv);
           if (!launch("av1g_k_intra", n, a)) return fail(error, "av1g_k_intra failed");
           ++launches;
@@ -678,11 +685,11 @@ class CudaBackend final : public Backend {
   PlanLayout layout_;
   bool tables_uploaded_ = false;
   CUdeviceptr frame_ = 0, scratch_ = 0, coef_ = 0, tmp_ = 0, residual_ = 0;
-  CUdeviceptr filters_ = 0, ref_pool_ = 0, grain_ = 0;
+  CUdeviceptr filters_ = 0, ref_pool_ = 0, grain_ = 0, palette_ = 0;
   CUdeviceptr lut_ = 0, rgb_ = 0, job_ = 0, pref_ = 0, pref_b_ = 0;
   size_t frame_cap_ = 0, scratch_cap_ = 0, coef_cap_ = 0, tmp_cap_ = 0;
   size_t residual_cap_ = 0, filters_cap_ = 0, ref_cap_ = 0;
-  size_t grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0;
+  size_t grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0, palette_cap_ = 0;
   size_t job_cap_ = 0, pref_cap_ = 0, pref_b_cap_ = 0;
   std::vector<uint16_t> staging_;
   bool slots_[kReferenceSlots] = {};

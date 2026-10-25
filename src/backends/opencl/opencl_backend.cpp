@@ -262,6 +262,16 @@ class OpenCLBackend final : public Backend {
       }
       if (!wave.intra.empty()) {
         int n = static_cast<int>(wave.intra.size());
+        /* the palette maps are one buffer for the whole frame; uploading them
+         * once per wave is cheap compared with the alternative of carrying a
+         * pointer per job, which a device buffer cannot express */
+        if (!ensure(&palette_, &palette_cap_, plan.palette_map.size()))
+          return fail(error, "palette map upload failed");
+        if (!plan.palette_map.empty() &&
+            api_.EnqueueWriteBuffer(queue_, palette_, opencl::CL_TRUE, 0,
+                                    plan.palette_map.size(), plan.palette_map.data(), 0,
+                                    nullptr, nullptr) != opencl::CL_SUCCESS)
+          return fail(error, "palette map write failed");
         cl_mem job_mem = 0, unused = 0;
         int total = 0;
         if (!upload_jobs(wave.intra, &job_mem, &unused, &total,
@@ -273,7 +283,8 @@ class OpenCLBackend final : public Backend {
         set_mem(k, 0, job_mem);
         set_int(k, 1, n);
         set_mem(k, 2, frame_);
-        set_int(k, 3, maxv);
+        set_mem(k, 3, palette_);
+        set_int(k, 4, maxv);
         if (!enqueue(k, n, 64)) return fail(error, "av1g_k_intra failed");
         ++launches;
       }
@@ -752,12 +763,12 @@ class OpenCLBackend final : public Backend {
 
   cl_mem frame_ = nullptr, scratch_ = nullptr, coef_ = nullptr, tmp_ = nullptr;
   cl_mem residual_ = nullptr, filters_ = nullptr;
-  cl_mem ref_pool_ = nullptr, grain_ = nullptr, lut_ = nullptr;
+  cl_mem ref_pool_ = nullptr, grain_ = nullptr, lut_ = nullptr, palette_ = nullptr;
   cl_mem rgb_ = nullptr, job_a_ = nullptr, job_b_ = nullptr;
   cl_mem pref_a_ = nullptr, pref_b_ = nullptr;
   size_t frame_cap_ = 0, scratch_cap_ = 0, coef_cap_ = 0, tmp_cap_ = 0;
   size_t residual_cap_ = 0, filters_cap_ = 0, ref_cap_ = 0;
-  size_t grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0;
+  size_t grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0, palette_cap_ = 0;
   size_t job_a_cap_ = 0, pref_a_cap_ = 0, pref_b_cap_ = 0;
   int max_local_ = 0;
   std::vector<uint16_t> staging_;

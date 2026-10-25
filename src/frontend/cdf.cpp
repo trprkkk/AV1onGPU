@@ -74,6 +74,10 @@ void init_default_cdf(CdfContext* cdf, int base_q_idx) {
   copy_table(cdf->mode.txpart, t::txpart);
 
   namespace it = cdf_tables_inter;
+  /* the palette colour map lives with the inter tables because it is only read
+   * by a frame that allows screen content tools, but its tables belong to the
+   * mode context */
+  copy_table(cdf->mode.pal_color, it::pal_color);
   copy_table(cdf->inter.y_mode, it::y_mode);
   copy_table(cdf->inter.is_inter, it::is_inter);
   copy_table(cdf->inter.skip_mode, it::skip_mode);
@@ -195,6 +199,23 @@ void reset_cdf_counts(CdfContext* cdf) {
   reset_2d(m.seg_id, 7);
   reset_2d(m.use_filter_intra, 1);
   reset_3d(m.txpart, 1);
+  /* the colour map's rows hold one probability per colour past the first, so
+   * the counter sits at PaletteSize - 1 and moves with the size */
+  for (int plane = 0; plane < 2; ++plane)
+    for (int size = 0; size < 7; ++size) reset_2d(m.pal_color[plane][size], size + 1);
+  /* every other table mentioned by init_coeff_cdfs / init_non_coeff_cdfs loses
+   * its counter too, including the small ones whose adaptation is easy to
+   * overlook: a counter left at 32 makes the next frame adapt its probability
+   * at a slower rate than the reference decoder and the two drift apart. */
+  reset_3d(m.kfym, 15);
+  for (int level = 0; level < kBlockLevelCount; ++level)
+    reset_2d(m.partition[level], kPartitionSymbols[level]);
+  reset_2d(m.skip, 1);
+  reset_row(m.intrabc, 1);
+  reset_2d(m.seg_pred, 1);
+  reset_3d(m.pal_sz, 6);
+  reset_3d(m.pal_y, 1);
+  reset_2d(m.pal_uv, 1);
   reset_2d(cdf->skip.table, 1);
   reset_row(m.delta_q, 3);
   reset_2d(m.delta_lf, 3);

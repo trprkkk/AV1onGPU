@@ -161,6 +161,8 @@ class CpuBackend final : public Backend {
 
     /* ---- prediction, transform, residual --------------------------------- */
     std::vector<int> tmp(plan.tmp_size + 64, 0);
+    /* the palette colour maps of the frame, read by the blocks that code one */
+    const unsigned char* palette = plan.palette_map.data();
     for (const WaveJobs& wave : plan.waves) {
       /* Inside a wave no job reads another job's output, so every stage of a
        * wave is embarrassingly parallel - the same property the GPU backends
@@ -269,7 +271,7 @@ class CpuBackend final : public Backend {
 #pragma omp parallel for schedule(dynamic, 4)
 #endif
       for (int i = 0; i < nintra; ++i)
-        av1g_intra_block(&wave.intra[static_cast<size_t>(i)], frame, maxv);
+        av1g_intra_block(&wave.intra[static_cast<size_t>(i)], frame, palette, maxv);
       const int nitx = static_cast<int>(wave.itx.size());
 #if defined(AV1GPU_HAVE_OPENMP)
 #pragma omp parallel for schedule(dynamic, 4)

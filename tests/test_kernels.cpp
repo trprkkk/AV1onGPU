@@ -325,7 +325,7 @@ void test_intra() {
     for (int x = 0; x < 16; ++x) p.at(8 + x, 7) = static_cast<uint16_t>(x * 4);
     Av1gIntraJob job = make_intra_job(8, 8);
     job.mode = AV1G_PRED_V;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     CHECK_EQ(p.at(8, 8), 0);
     CHECK_EQ(p.at(9, 8), 4);
     CHECK_EQ(p.at(15, 15), 28);
@@ -335,7 +335,7 @@ void test_intra() {
     for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = static_cast<uint16_t>(10 + y);
     Av1gIntraJob job = make_intra_job(8, 8);
     job.mode = AV1G_PRED_H;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     CHECK_EQ(p.at(8, 8), 10);
     CHECK_EQ(p.at(15, 15), 17);
   }
@@ -347,7 +347,7 @@ void test_intra() {
     for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = static_cast<uint16_t>(y);
     Av1gIntraJob job = make_intra_job(8, 8);
     job.mode = AV1G_PRED_DC;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     const int want = (28 + 28 + 8) / 16; /* sum 0..7 twice, plus the rounding term */
     for (int y = 0; y < 8; ++y)
       for (int x = 0; x < 8; ++x) CHECK_EQ(p.at(8 + x, 8 + y), want);
@@ -359,7 +359,7 @@ void test_intra() {
     Av1gIntraJob job = make_intra_job(8, 8);
     job.mode = AV1G_PRED_DC;
     job.have_left = 0;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     const int want = (100 * 8 + 28 + 4) >> 3;
     for (int y = 0; y < 8; ++y)
       for (int x = 0; x < 8; ++x) CHECK_EQ(p.at(8 + x, 8 + y), want);
@@ -372,7 +372,7 @@ void test_intra() {
     job.mode = AV1G_PRED_DC;
     job.have_left = 0;
     job.have_above = 0;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     CHECK_EQ(p.at(9, 9), 128);
   }
 
@@ -384,7 +384,7 @@ void test_intra() {
     p.at(7, 7) = 90;
     Av1gIntraJob job = make_intra_job(8, 8);
     job.mode = AV1G_PRED_PAETH;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     for (int y = 0; y < 8; ++y)
       for (int x = 0; x < 8; ++x) CHECK_EQ(p.at(8 + x, 8 + y), 90);
   }
@@ -396,7 +396,7 @@ void test_intra() {
     for (int y = 0; y < 8; ++y) p.at(7, 8 + y) = static_cast<uint16_t>(100 + 5 * y);
     Av1gIntraJob job = make_intra_job(8, 8);
     job.mode = AV1G_PRED_SMOOTH;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     for (int i = 0; i < 8; ++i)
       for (int j = 0; j < 8; ++j) {
         const int wy = av1g_sm_weight(8, i), wx = av1g_sm_weight(8, j);
@@ -416,7 +416,7 @@ void test_intra() {
     Av1gIntraJob job = make_intra_job(8, 8);
     job.mode = AV1G_PRED_D67;
     job.angle = 1; /* 67 + 3 = 70 degrees */
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     /* use a second job with edge filtering off to compute the expectation */
     const int pangle = av1g_tbl_mode_to_angle[AV1G_PRED_D67] + 3;
     CHECK_EQ(pangle, 70);
@@ -445,7 +445,7 @@ void test_intra() {
     for (int x = 0; x < 40; ++x) p.at(x, 7) = static_cast<uint16_t>((x * 3) & 0xff);
     Av1gIntraJob job = make_intra_job(4, 4);
     job.mode = AV1G_PRED_D45;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     /* dx at 45 degrees makes half way between two samples, so just check the
      * prediction is inside the edge range and that it is monotone across the
      * row (the definition of a directional predictor) */
@@ -508,7 +508,7 @@ void test_intra() {
     job.luma_stride = 40;
     job.luma_w = 24;
     job.luma_h = 24;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     CHECK_EQ(p.at(8, 8), 60);
     CHECK_EQ(p.at(11, 11), 60);
   }
@@ -543,7 +543,7 @@ void test_intra() {
     job.luma_stride = 40;
     job.luma_w = 24;
     job.luma_h = 24;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
 
     int L[4][4];
     long long sum = 0;
@@ -590,7 +590,7 @@ void test_intra() {
     job.luma_stride = 40;
     job.luma_w = 32;
     job.luma_h = 32;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     int L[8][8];
     long long sum = 0;
     for (int i = 0; i < 8; ++i) {
@@ -621,7 +621,7 @@ void test_intra() {
     job.mode = AV1G_PRED_DC;
     job.filter_intra = 1;
     job.filter_intra_mode = 0;
-    av1g_intra_block(&job, p.data.data(), 255);
+    av1g_intra_block(&job, p.data.data(), nullptr, 255);
     bool flat = true;
     for (int y = 0; y < 8; ++y)
       for (int x = 0; x < 8; ++x)

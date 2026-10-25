@@ -143,13 +143,18 @@ if(AV1GPU_BUILD_TESTS)
   endforeach()
 
   # Bit exact streams: the whole front end plus the CPU backend against hashes
-  # of the reference decoder's output (see tests/data/README.md). These streams
-  # are the only fixtures in the repository that code local warped motion and
-  # OBMC, and every frame of them is bit exact.
+  # of the reference decoder's output (see tests/data/README.md). lw_t2 and
+  # lw_t3 are the only fixtures that code local warped motion and OBMC,
+  # palette_sc the only screen content one (palette coded blocks); every frame
+  # of all three is bit exact.
   if(TARGET av1gpu_decode)
-    foreach(stream lw_t2 lw_t3)
+    foreach(stream lw_t2 lw_t3 palette_sc)
+      set(frames 30)
+      if(stream STREQUAL "palette_sc")
+        set(frames 10)
+      endif()
       add_test(NAME stream_${stream}
-               COMMAND av1gpu_decode --backend cpu --frames 30
+               COMMAND av1gpu_decode --backend cpu --frames ${frames}
                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/${stream}.ivf
                        --hash-check ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/${stream}.hash)
     endforeach()

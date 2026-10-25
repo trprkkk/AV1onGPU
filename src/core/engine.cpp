@@ -165,6 +165,11 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
       std::memcpy(plan->residual.data(), syntax.residual.data(),
                   std::min(plan->residual.size(), syntax.residual.size()) *
                       sizeof(int32_t));
+    /* The palette maps are one byte per sample and indexed by the block that
+     * codes them, so the pool is copied as it is. The trailing slack keeps a
+     * backend's buffer allocation non-zero for a frame without a palette. */
+    plan->palette_map.assign(syntax.palette_map.begin(), syntax.palette_map.end());
+    plan->palette_map.resize(plan->palette_map.size() + 8, 0);
 
     /* ---- reference slots -------------------------------------------------- */
     for (int i = 0; i < 2; ++i) {
@@ -332,6 +337,13 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
          * of 8 (MiCols * MI_SIZE), not from the visible size. */
         job.max_x = (((geom.width + 7) & ~7) >> (plane ? geom.ss_x : 0)) - 1;
         job.max_y = (((geom.height + 7) & ~7) >> (plane ? geom.ss_y : 0)) - 1;
+        if (b.use_palette) {
+          job.palette = 1;
+          job.palette_size = b.palette_size;
+          for (int i = 0; i < 8; ++i) job.palette_color[i] = b.palette[i];
+          job.palette_off = b.palette_off;
+          job.palette_stride = b.palette_stride;
+        }
         wj.intra.push_back(job);
       } else {
         Av1gInterJob job;

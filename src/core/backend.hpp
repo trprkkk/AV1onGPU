@@ -85,6 +85,9 @@ struct FramePlan {
   /* Coefficient pool, indexed by Av1gItxJob::coef_off. */
   std::vector<int32_t> coefficients;
   std::vector<int32_t> residual;
+  /* Palette colour maps of the frame's palette blocks, indexed by
+   * Av1gIntraJob::palette_off. Empty unless the frame codes a palette. */
+  std::vector<uint8_t> palette_map;
   /* Size of the inverse transform scratch buffer, indexed by
    * Av1gItxJob::tmp_off. A job needs w * h ints, which is not the same as its
    * coefficient area (that one is clipped to 32 samples wide for a 64 point

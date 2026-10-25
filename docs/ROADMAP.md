@@ -252,8 +252,11 @@ Both mistakes produce a difference of a few dozen samples per frame, which reads
 like a rounding difference in the blend itself; that is the trap this took a hunt
 to get out of.
 
-Still missing from the inter path: inter/intra compound. Intrabc and palette are
-the remaining intra tools, and they only appear on screen content streams.
+Still missing from the inter path: inter/intra compound. Of the intra tools only
+intrabc is left - palette is decoded and reconstructed (see
+`tests/data/palette_sc.ivf` and `docs/ACCURACY.md`), and intrabc blocks are
+refused by name because they are the one syntax that predicts from inside the
+frame the decoder is still building.
 
 ## 4. Spec-conformant film grain
 

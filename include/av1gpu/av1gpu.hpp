@@ -247,6 +247,18 @@ struct BlockSyntax {
    * transform becomes a Walsh-Hadamard and both shifts are dropped. */
   bool lossless = false;
 
+  /* Palette prediction (screen content): the block's samples are chosen from
+   * `palette_size` colours by a coded colour map, instead of being predicted
+   * from the neighbours. `palette` holds this plane's colours, `palette_off`
+   * the corner of this transform block inside FrameSyntax::palette_map, whose
+   * rows are `palette_stride` bytes - the coding block's own width. A palette
+   * block still carries residual if the bitstream codes one. */
+  bool use_palette = false;
+  int palette_size = 0;
+  int palette[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int palette_off = 0;
+  int palette_stride = 0;
+
   /* inter */
   int ref[2] = {-1, -1};  /* indices into FrameSyntax::reference_slots */
   /* Motion vectors in 1/8 *luma* samples, exactly as the bitstream codes them
@@ -361,6 +373,10 @@ struct FrameSyntax {
   /* Shared pools indexed by TransformBlock::coef_offset. */
   std::vector<int32_t> coefficients;
   std::vector<int32_t> residual;
+  /* Palette colour maps of every palette block in the frame, one byte per
+   * sample, indexed by BlockSyntax::palette_off. Empty unless the frame uses
+   * screen content tools. */
+  std::vector<uint8_t> palette_map;
 
   std::vector<DeblockEdge> deblock;
   std::vector<CdefBlock> cdef;

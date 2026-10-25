@@ -201,6 +201,28 @@ def pad_rows(table):
     return table
 
 
+def palette_color_table(spec):
+    """The fourteen palette colour index tables as one array.
+
+    ``Default_Palette_Size_N_{Y,Uv}_Color_Cdf[ctx][N + 1]``: the table for a
+    palette of N colours codes N - 1 probabilities, so the rows of the fourteen
+    tables have different lengths. They are padded to eight entries here so one
+    array can hold all of them; ``read_symbol`` only reads the entries its
+    symbol count needs, and the padding sits past the adaptation counter.
+    """
+    planes = []
+    for suffix in ("Y", "Uv"):
+        sizes = []
+        for size in range(2, 9):
+            name = "Default_Palette_Size_%d_%s_Color_Cdf" % (size, suffix)
+            if name not in spec:
+                raise KeyError(name)
+            rows = to_inverse(spec[name], name)
+            sizes.append([row + [0] * (8 - len(row)) for row in rows])
+        planes.append(sizes)
+    return planes
+
+
 def dims_of(table):
     dims = []
     node = table
@@ -210,9 +232,9 @@ def dims_of(table):
     return tuple(dims)
 
 
-def emit_array(name, table, spec_name, alphabet):
+def emit_rows_body(table):
+    """The body of a nested uint16_t initialiser, one row per line."""
     dims = dims_of(table)
-    suffix = "".join("[%d]" % d for d in dims)
 
     def rows(node, indent, top=False):
         """Rows, one per line; the outermost braces come from the declaration."""
@@ -226,12 +248,18 @@ def emit_array(name, table, spec_name, alphabet):
         # a single context table has no inner braces; indent its one row anyway
         return "%s%s" % ("  " * indent, line if top else "{ %s }" % line)
 
+    return rows(table, 1, top=True)
+
+
+def emit_array(name, table, spec_name, alphabet):
+    dims = dims_of(table)
+    suffix = "".join("[%d]" % d for d in dims)
     note = NOTES.get(name)
     shapes = " x ".join(str(d) for d in dims[:-1]) if len(dims) > 1 else "one context"
     comment = "/* %s\n   * %s */\n" % (
         "%s: %d symbols, %s." % (spec_name, alphabet, shapes), note) if note else ""
     return "%sinline const uint16_t %s%s = {\n%s,\n};\n\n" % (
-        comment, name, suffix, rows(table, 1, top=True))
+        comment, name, suffix, emit_rows_body(table))
 
 
 def main():
@@ -255,6 +283,22 @@ def main():
             first = first[0]
         alphabet = len(first) - 1
         body.append(emit_array(name, pad_rows(rows), spec_name, alphabet))
+
+    # The palette colour index tables, one per palette size, in one array. The
+    # symbol count is the palette size minus one, which is why they could not go
+    # through TABLES: their rows are not all the same length.
+    try:
+        pal = palette_color_table(spec)
+    except KeyError as missing_table:
+        missing.append(str(missing_table).strip("'"))
+    else:
+        body.append(
+            "/* palette colour index, [plane][palette size - 2][colour context].\n"
+            "   * The palette size - 1 symbol index is coded as a symbol with\n"
+            "   * palette size values, so the row for a palette of N colours codes\n"
+            "   * N - 1 probabilities and is padded to eight entries. */\n"
+            "inline const uint16_t pal_color[2][7][5][8] = {\n%s,\n};\n\n"
+            % emit_rows_body(pal))
     if missing:
         sys.stderr.write("the specification has no %s\n" % ", ".join(missing))
         return 1

@@ -681,6 +681,33 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
       }
     }
 
+    /* Palette blocks hand their colour maps to the plan: the map is a property
+     * of the coding block, and every transform block of it points at its own
+     * corner of that map. A block with a palette still carries the residual the
+     * bitstream coded, which the engine adds on top of the prediction. */
+    int palette_base[3] = {0, 0, 0};
+    bool palette_coded[3] = {false, false, false};
+    auto add_palette_map = [&](int plane, const std::vector<uint8_t>& map) {
+      if (map.empty()) return;
+      palette_base[plane] = static_cast<int>(out->palette_map.size());
+      out->palette_map.insert(out->palette_map.end(), map.begin(), map.end());
+      palette_coded[plane] = true;
+    };
+    if (!inter && block.palette_size[0] > 0) add_palette_map(0, block.palette_map_y);
+    if (!inter && block.palette_size[1] > 0 &&
+        !(palette_coded[1] || palette_coded[2])) {
+      /* one map for both chroma planes: they share the block and the indices,
+       * and differ only in which colour table an index selects */
+      if (!block.palette_map_uv.empty()) {
+        const int base = static_cast<int>(out->palette_map.size());
+        out->palette_map.insert(out->palette_map.end(), block.palette_map_uv.begin(),
+                                block.palette_map_uv.end());
+        palette_base[1] = base;
+        palette_base[2] = base;
+        palette_coded[1] = palette_coded[2] = true;
+      }
+    }
+
     for (const TileTransform& transform : block.transforms) {
       const int plane = transform.plane;
       if (plane > 0 && seq.monochrome) continue;
@@ -726,10 +753,26 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
       /* Chroma from luma is a prediction mode of its own: the engine has to
        * know, both to run the CfL prediction and to make the block wait for
        * the co-located luma. It carries the alpha separately. */
-      const bool is_cfl = !inter && plane > 0 && block.uv_mode == kModeChromaFromLuma;
+      /* A palette block predicts every sample from its colour map, which the
+       * engine reads out of the plan's palette pool. Nothing else of the intra
+       * path applies: no mode, no angle, no chroma from luma, no filter intra. */
+      if (!inter && palette_coded[plane] && transform.eob >= 0) {
+        bs.use_palette = true;
+        bs.palette_size = plane == 0 ? block.palette_size[0] : block.palette_size[1];
+        for (int i = 0; i < 8; ++i) {
+          bs.palette[i] = plane == 0 ? block.palette_color_y[i]
+                                     : (plane == 1 ? block.palette_color_u[i]
+                                                   : block.palette_color_v[i]);
+        }
+        bs.palette_stride = block.palette_map_w[plane == 0 ? 0 : 1];
+        bs.palette_off = palette_base[plane] + (start_y - block_y) * bs.palette_stride +
+                         (start_x - block_x);
+      }
+      const bool is_cfl = !inter && !bs.use_palette && plane > 0 &&
+                          block.uv_mode == kModeChromaFromLuma;
       bs.mode = to_prediction_mode(plane == 0 ? block.y_mode : block.uv_mode);
       bs.angle_delta = plane == 0 ? block.y_angle : (is_cfl ? 0 : block.uv_angle);
-      if (!inter && plane == 0 && block.filter_intra) {
+      if (!inter && !bs.use_palette && plane == 0 && block.filter_intra) {
         bs.use_filter_intra = true;
         bs.filter_intra_mode = to_filter_intra_mode(block.filter_intra_mode);
       }

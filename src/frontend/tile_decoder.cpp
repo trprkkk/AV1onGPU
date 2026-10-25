@@ -1,6 +1,7 @@
 #include "frontend/tile_decoder.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -255,6 +256,20 @@ constexpr int8_t kWedgeContext[kBlockSizeCount] = {0, 0, 0, 0, 1, 2, 3, 4, 5, 6,
  * direction when the transform type alphabet is selected. */
 constexpr int8_t kFilterIntraToIntraDir[5] = {kModeDc, kModeVertical, kModeHorizontal,
                                               kModeHorizontalDown, kModeDc};
+
+/* The palette colour map reads one of PALETTE_NUM_NEIGHBORS (three) colour
+ * contexts, chosen from a hash of the scores its three neighbours gave the
+ * colours: a colour that both the left and the above sample use scores 4, one
+ * that only one of them uses 2, and the diagonal neighbour adds 1. The hash is
+ * at most eight, and Palette_Color_Context maps it to one of the five tables -
+ * the entries of -1 are hashes the synthesis below cannot produce, and they are
+ * spelled out rather than removed so the table reads like the specification's.
+ * Hash 0 (no neighbour at all) cannot occur either: the first sample of the map
+ * is decoded uniformly. */
+constexpr int kPaletteColors = 8;
+constexpr int kPaletteNumNeighbours = 3;
+constexpr int kPaletteColorHashMultipliers[kPaletteNumNeighbours] = {1, 2, 2};
+constexpr int kPaletteColorContext[9] = {-1, -1, 0, -1, -1, 4, 3, 2, 1};
 
 class TileParser {
  public:
@@ -2697,6 +2712,17 @@ class TileParser {
       }
     }
 
+    /* use_intrabc: a frame that allows intra block copy codes this flag for
+     * every block. The block then predicts from a position inside the frame it
+     * is decoding, which this decoder does not implement - but the flag has to
+     * be read for the frame to stay in sync, so a stream that sets it is
+     * refused by name instead of being misparsed from here on. */
+    if (intra_frame && frame_.allow_intrabc) {
+      if (decoder_.read_symbol(cdf_.mode.intrabc, 1) != 0) {
+        return stop_at_residual(block, "tile: intra block copy is not implemented");
+      }
+    }
+
     /* the frame's deltas are coded once per superblock, by its first block */
     read_deltas_ = false;
     trace_point(row, col, "delta");
@@ -2722,8 +2748,9 @@ class TileParser {
     /* palette_mode_info: only for frames that allow screen content tools */
     trace_point(row, col, "uv");
     if (!block.is_inter && frame_.allow_screen_content_tools && size >= kBlock8x8 &&
-        block_width4(size) * 4 <= 64 && block_height4(size) * 4 <= 64) {
-      return stop_at_residual(block, "tile: palette mode syntax is not implemented");
+        block_width4(size) <= 16 && block_height4(size) <= 16) {
+      const ParseStatus status = read_palette_mode_info(&block, size, row, col, has_chroma);
+      if (status != ParseStatus::Ok) return status;
     }
 
     /* filter_intra_mode_info */
@@ -2735,6 +2762,16 @@ class TileParser {
         block.filter_intra_mode = static_cast<int>(decoder_.read_symbol(cdf_.mode.filter_intra, 4));
       }
     }
+
+    /* palette_tokens: the colour maps, coded after the modes and before the
+     * transform size - the transform does not affect them. */
+    {
+      const ParseStatus status = read_palette_tokens(&block, size, row, col);
+      if (status != ParseStatus::Ok) return status;
+    }
+    /* the cells this block covers carry its palettes (or nothing) from here
+     * on: the next block's cache reads them */
+    mark_palette(block, size, row, col);
 
     /* read_tx_size: the block codes its transform size when the frame allows a
      * choice; an inter block can then split it further (var-tx), which the
@@ -2817,6 +2854,325 @@ class TileParser {
     trace_state(block);
     out_->blocks.push_back(block);
     return ParseStatus::Ok;
+  }
+
+  /* --- palette ------------------------------------------------------------ */
+
+  /* FloorLog2 + 1, for the palette's delta width: a delta that may be any
+   * value up to `range` needs that many bits, and a range of zero samples
+   * needs none. Note that this is not CeilLog2: a range of exactly 2 needs two
+   * bits (0 and 1), not one. */
+  static int palette_bits(int range) {
+    int bits = 0;
+    while ((1 << bits) <= range) ++bits;
+    return bits;
+  }
+
+  /* get_palette_cache: the distinct colours of the palettes above and to the
+   * left, merged into one ascending list. Only the U colours of a chroma
+   * palette are in it - the V palette is coded against its own signed deltas
+   * and is never offered to a neighbour - and only the luma palette for the
+   * luma plane.
+   *
+   * The above palette is valid within one 64x64 band only: the array behind it
+   * is a single row of cells that the next band overwrites, so a block at the
+   * top of a band starts from an empty cache. That is the specification's
+   * `(MiRow * MI_SIZE) % 64` test, and it is why the encoder may not depend on
+   * a palette coded more than 64 samples above. */
+  int palette_cache(int plane, int row, int col, uint8_t* cache) {
+    int n = 0;
+    auto push = [&](int value) {
+      if (n == 0 || cache[n - 1] != value) cache[n++] = static_cast<uint8_t>(value);
+    };
+    const uint8_t* above = pal_above_col_[plane][col].data();
+    const uint8_t* left = pal_left_col_[plane][row].data();
+    int above_n = 0, left_n = 0;
+    if (have_top(row) && (row & 15) != 0) above_n = pal_above_sz_[plane][col];
+    if (have_left(col)) left_n = pal_left_sz_[plane][row];
+    int a = 0, l = 0;
+    while (a < above_n && l < left_n) {
+      const int above_c = above[a], left_c = left[l];
+      if (left_c < above_c) {
+        push(left_c);
+        ++l;
+      } else {
+        push(above_c);
+        ++a;
+        if (left_c == above_c) ++l;
+      }
+    }
+    while (a < above_n) push(above[a++]);
+    while (l < left_n) push(left[l++]);
+    return n;
+  }
+
+  /* palette_colors_v: the chroma plane's V colours, coded either in full or as
+   * signed deltas that wrap around the sample range. V is the one palette the
+   * syntax does not sort: the two chroma planes share a block and a colour map,
+   * but not a colour order. */
+  ParseStatus read_palette_v(TileBlock* block, int size, int row, int col) {
+    const int bit_depth = seq_.bit_depth;
+    const int max_value = (1 << bit_depth) - 1;
+    if (decoder_.read_bit()) {
+      int bits = bit_depth - 4 + static_cast<int>(decoder_.read_literal(2));
+      int value = static_cast<int>(decoder_.read_literal(bit_depth));
+      block->palette_color_v[0] = value;
+      for (int i = 1; i < size; ++i) {
+        int delta = static_cast<int>(decoder_.read_literal(bits));
+        if (delta != 0 && decoder_.read_bit()) delta = -delta;
+        value = (value + delta) & max_value;
+        block->palette_color_v[i] = value;
+      }
+    } else {
+      for (int i = 0; i < size; ++i)
+        block->palette_color_v[i] = static_cast<int>(decoder_.read_literal(bit_depth));
+    }
+    if (trace_enabled()) {
+      std::fprintf(stderr, "PALV %d %d n=%d [", col * 4, row * 4, size);
+      for (int i = 0; i < size; ++i)
+        std::fprintf(stderr, "%s%d", i ? " " : "", block->palette_color_v[i]);
+      std::fprintf(stderr, "]\n");
+    }
+    return ParseStatus::Ok;
+  }
+
+  /* One plane's palette: its size, the colours it reuses from the neighbours'
+   * cache, and the new colours as deltas from the previous one. The result is
+   * ascending, which is the invariant the cache and the merge rely on.
+   *
+   * Luma codes one more than each delta, so an unchanged colour stays
+   * reachable; chroma codes the delta itself and therefore accounts for one
+   * sample less when it narrows the width of the next delta. */
+  ParseStatus read_palette_plane(TileBlock* block, int plane, int sz_ctx, int row, int col) {
+    const int bit_depth = seq_.bit_depth;
+    const int max_value = (1 << bit_depth) - 1;
+    uint8_t cache[kPaletteColors] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const int cache_n = palette_cache(plane, row, col, cache);
+    if (trace_enabled())
+      std::fprintf(stderr, "PALQ %d %d pl=%d ctx=%d rng=%u cdf0=%u cdf5=%u\n", col * 4, row * 4,
+                   plane, sz_ctx, decoder_.state().range, cdf_.mode.pal_sz[plane][sz_ctx][0],
+                   cdf_.mode.pal_sz[plane][sz_ctx][5]);
+    const int size =
+        static_cast<int>(decoder_.read_symbol(cdf_.mode.pal_sz[plane][sz_ctx], 6)) + 2;
+    uint8_t colors[kPaletteColors] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int idx = 0;
+    for (int i = 0; i < cache_n && idx < size; ++i) {
+      if (decoder_.read_bit()) colors[idx++] = cache[i];
+    }
+    if (trace_enabled()) {
+      std::fprintf(stderr, "PALP %d %d pl=%d sz=%d ncache=%d used=%d\n", col * 4, row * 4, plane, size,
+                   cache_n, idx);
+    }
+    if (idx < size) {
+      int value = static_cast<int>(decoder_.read_literal(bit_depth));
+      colors[idx++] = static_cast<uint8_t>(value);
+      if (idx < size) {
+        int bits = bit_depth - 3 + static_cast<int>(decoder_.read_literal(2));
+        while (idx < size) {
+          const int delta =
+              static_cast<int>(decoder_.read_literal(bits)) + (plane == 0 ? 1 : 0);
+          value = std::min(max_value, value + delta);
+          colors[idx++] = static_cast<uint8_t>(value);
+          /* The next delta only has to reach the top of the range: for luma
+           * the delta counts from one above the current colour, so one sample
+           * less is left; for chroma, whose delta is not offset, the current
+           * colour itself is still reachable. Getting this width wrong
+           * desynchronises the range decoder even when the colours decoded so
+           * far look plausible. */
+          const int remaining = max_value - value - (plane == 0 ? 1 : 0);
+          bits = std::min(bits, palette_bits(std::max(remaining, 0)));
+        }
+      }
+      /* the cache and the new colours are both ascending, so this is the
+       * merge the specification's sort() is allowed to be */
+      std::sort(colors, colors + size);
+    }
+    if (trace_enabled()) {
+      std::fprintf(stderr, "PALC %d %d pl=%d n=%d rng=%u [", col * 4, row * 4, plane, size,
+                   decoder_.state().range);
+      for (int i = 0; i < size; ++i) std::fprintf(stderr, "%s%d", i ? " " : "", colors[i]);
+      std::fprintf(stderr, "]\n");
+    }
+    if (plane == 0) {
+      block->palette_size[0] = size;
+      for (int i = 0; i < size; ++i) block->palette_color_y[i] = colors[i];
+    } else {
+      block->palette_size[1] = size;
+      for (int i = 0; i < size; ++i) block->palette_color_u[i] = colors[i];
+      return read_palette_v(block, size, row, col);
+    }
+    return ParseStatus::Ok;
+  }
+
+  /* palette_mode_info: the palette of an intra block, coded only when the block
+   * is 8x8 or larger (a smaller block has no room for a useful one) and no
+   * larger than 64x64. The two planes decide independently, but a chroma
+   * palette needs a luma one to have been coded: UVMode is DC only when YMode
+   * is DC, and the block's colour map is shared. */
+  ParseStatus read_palette_mode_info(TileBlock* block, BlockSize size, int row, int col,
+                                     bool has_chroma) {
+    const int sz_ctx = kBlockWidthLog2[size] + kBlockHeightLog2[size] - 2;
+    if (block->y_mode == kModeDc) {
+      const int ctx = (have_top(row) && pal_above_sz_[0][col] > 0 ? 1 : 0) +
+                      (have_left(col) && pal_left_sz_[0][row] > 0 ? 1 : 0);
+      if (decoder_.read_symbol(cdf_.mode.pal_y[sz_ctx][ctx], 1) != 0) {
+        const ParseStatus status = read_palette_plane(block, 0, sz_ctx, row, col);
+        if (status != ParseStatus::Ok) return status;
+      }
+    }
+    trace_point(row, col, "pal");
+    if (has_chroma && block->uv_mode == kModeDc) {
+      const int ctx = block->palette_size[0] > 0 ? 1 : 0;
+      if (decoder_.read_symbol(cdf_.mode.pal_uv[ctx], 1) != 0) {
+        const ParseStatus status = read_palette_plane(block, 1, sz_ctx, row, col);
+        if (status != ParseStatus::Ok) return status;
+      }
+    }
+    return ParseStatus::Ok;
+  }
+
+  /* get_palette_color_context: what the three neighbours already decoded say
+   * about this sample's colour. Each colour scores 2 for every neighbour that
+   * uses it (the above and left ones), 1 for the diagonal one; the three
+   * highest scores, in order, are the three colours most likely here, and the
+   * hash of those scores selects the table the colour index is read with. */
+  int palette_color_context(const uint8_t* map, int stride, int r, int c, int size,
+                            uint8_t* order) {
+    int scores[kPaletteColors] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < kPaletteColors; ++i) order[i] = static_cast<uint8_t>(i);
+    if (c > 0) scores[map[r * stride + c - 1]] += 2;
+    if (r > 0 && c > 0) scores[map[(r - 1) * stride + c - 1]] += 1;
+    if (r > 0) scores[map[(r - 1) * stride + c]] += 2;
+    for (int i = 0; i < kPaletteNumNeighbours; ++i) {
+      int best = i;
+      for (int j = i + 1; j < size; ++j) {
+        if (scores[j] > scores[best]) best = j;
+      }
+      if (best != i) {
+        const int score = scores[best];
+        const uint8_t color = order[best];
+        for (int k = best; k > i; --k) {
+          scores[k] = scores[k - 1];
+          order[k] = order[k - 1];
+        }
+        scores[i] = score;
+        order[i] = color;
+      }
+    }
+    int hash = 0;
+    for (int i = 0; i < kPaletteNumNeighbours; ++i)
+      hash += scores[i] * kPaletteColorHashMultipliers[i];
+    return hash;
+  }
+
+  /* palette_tokens: the colour map, one index per sample. The first sample is
+   * coded uniformly; every other one through the table its neighbours select,
+   * in a diagonal wavefront so that all three neighbours are known. Only the
+   * part of the block that is on screen is coded - the rest of the map repeats
+   * the last coded column and row, which is what makes a block that hangs over
+   * the frame edge well defined. */
+  ParseStatus read_palette_map(TileBlock* block, int plane, int block_w, int block_h,
+                               int onscreen_w, int onscreen_h, int size) {
+    std::vector<uint8_t>& map = plane == 0 ? block->palette_map_y : block->palette_map_uv;
+    map.assign(static_cast<size_t>(block_w) * static_cast<size_t>(block_h), 0);
+    block->palette_map_w[plane == 0 ? 0 : 1] = block_w;
+    block->palette_map_h[plane == 0 ? 0 : 1] = block_h;
+    uint8_t* cell = map.data();
+    uint8_t order[kPaletteColors] = {0, 1, 2, 3, 4, 5, 6, 7};
+    cell[0] = static_cast<uint8_t>(decoder_.read_uniform(static_cast<uint32_t>(size)));
+    for (int i = 1; i < onscreen_w + onscreen_h - 1; ++i) {
+      const int first = std::min(i, onscreen_w - 1);
+      const int last = std::max(0, i - onscreen_h + 1);
+      for (int j = first; j >= last; --j) {
+        const int hash = palette_color_context(cell, block_w, i - j, j, size, order);
+        const int ctx = kPaletteColorContext[hash];
+        if (ctx < 0) return corrupt("palette_color_context");
+        const int idx = static_cast<int>(decoder_.read_symbol(
+            cdf_.mode.pal_color[plane][size - 2][ctx], size - 1));
+        if (idx < 0 || idx >= size) return corrupt("palette_color_idx");
+        cell[(i - j) * block_w + j] = order[idx];
+      }
+    }
+    for (int i = 0; i < onscreen_h; ++i) {
+      for (int j = onscreen_w; j < block_w; ++j) {
+        cell[i * block_w + j] = cell[i * block_w + onscreen_w - 1];
+      }
+    }
+    for (int i = onscreen_h; i < block_h; ++i) {
+      for (int j = 0; j < block_w; ++j) {
+        cell[i * block_w + j] = cell[(onscreen_h - 1) * block_w + j];
+      }
+    }
+    if (trace_enabled()) {
+      std::fprintf(stderr, "PALM %d %d pl=%d sz=%d rng=%u\n", block->mi_col * 4,
+                   block->mi_row * 4, plane, size, decoder_.state().range);
+    }
+    return ParseStatus::Ok;
+  }
+
+  /* palette_tokens: both palettes' colour maps. The chroma map is coded at the
+   * chroma resolution, but its block size has a floor of four samples per side,
+   * which is what makes a 4x8 luma block's chroma map 4x4 and not 2x4. */
+  ParseStatus read_palette_tokens(TileBlock* block, BlockSize size, int row, int col) {
+    if (block->palette_size[0] == 0 && block->palette_size[1] == 0) return ParseStatus::Ok;
+    const int bw4 = block_width4(size), bh4 = block_height4(size);
+    const int sub_x = (!seq_.monochrome && seq_.ss_x) ? 1 : 0;
+    const int sub_y = (!seq_.monochrome && seq_.ss_y) ? 1 : 0;
+    const int luma_w = std::min(bw4 * 4, std::max(1, mi_cols() - col) * 4);
+    const int luma_h = std::min(bh4 * 4, std::max(1, mi_rows() - row) * 4);
+    if (block->palette_size[0]) {
+      const ParseStatus status = read_palette_map(block, 0, bw4 * 4, bh4 * 4, luma_w, luma_h,
+                                                 block->palette_size[0]);
+      if (status != ParseStatus::Ok) return status;
+    }
+    if (block->palette_size[1]) {
+      int chroma_w = (bw4 * 4) >> sub_x, chroma_h = (bh4 * 4) >> sub_y;
+      int onscreen_w = luma_w >> sub_x, onscreen_h = luma_h >> sub_y;
+      if (chroma_w < 4) {
+        chroma_w += 2;
+        onscreen_w += 2;
+      }
+      if (chroma_h < 4) {
+        chroma_h += 2;
+        onscreen_h += 2;
+      }
+      const ParseStatus status = read_palette_map(block, 1, chroma_w, chroma_h, onscreen_w,
+                                                 onscreen_h, block->palette_size[1]);
+      if (status != ParseStatus::Ok) return status;
+    }
+    return ParseStatus::Ok;
+  }
+
+  /* PaletteSizes / PaletteColors, per 4x4 cell: the next block's cache reads the
+   * cell above and the cell to the left, and a block that codes no palette
+   * writes zero there so that its neighbours see an empty cache. The chroma
+   * palette is stored on the luma grid, at the block's own cells - aomedia bug
+   * 2183: the specification reads PaletteSizes[1] at luma coordinates, so a
+   * 4x4 luma block's chroma palette belongs to two luma cells, not to one
+   * chroma cell. */
+  void mark_palette(const TileBlock& block, BlockSize size, int row, int col) {
+    const int bw4 = block_width4(size), bh4 = block_height4(size);
+    const int cols = mi_cols(), rows = mi_rows();
+    for (int y = 0; y < bh4; ++y) {
+      const int r = row + y;
+      if (r >= rows) break;
+      pal_left_sz_[0][r] = static_cast<uint8_t>(block.palette_size[0]);
+      pal_left_sz_[1][r] = static_cast<uint8_t>(block.palette_size[1]);
+      for (int i = 0; i < kPaletteColors; ++i) {
+        pal_left_col_[0][r][i] = static_cast<uint8_t>(block.palette_color_y[i]);
+        pal_left_col_[1][r][i] = static_cast<uint8_t>(block.palette_color_u[i]);
+      }
+    }
+    for (int x = 0; x < bw4; ++x) {
+      const int c = col + x;
+      if (c >= cols) break;
+      pal_above_sz_[0][c] = static_cast<uint8_t>(block.palette_size[0]);
+      pal_above_sz_[1][c] = static_cast<uint8_t>(block.palette_size[1]);
+      for (int i = 0; i < kPaletteColors; ++i) {
+        pal_above_col_[0][c][i] = static_cast<uint8_t>(block.palette_color_y[i]);
+        pal_above_col_[1][c][i] = static_cast<uint8_t>(block.palette_color_u[i]);
+      }
+    }
   }
 
   /* --- coefficients ------------------------------------------------------ */
@@ -3404,6 +3760,14 @@ class TileParser {
   /* cdef_idx per 64x64, -1 until a block that is not skipped reads it */
   std::vector<int8_t> cdef_idx_;
   std::vector<uint8_t> y_mode_map_;
+  /* PaletteSizes / PaletteColors of the rows and columns already coded, per
+   * plane (0 = luma, 1 = the U colours of the chroma palette). The palette
+   * cache of a block reads the cell above and the cell to the left of its top
+   * left corner, and nothing else. */
+  std::vector<uint8_t> pal_above_sz_[2];
+  std::vector<std::array<uint8_t, kPaletteColors>> pal_above_col_[2];
+  std::vector<uint8_t> pal_left_sz_[2];
+  std::vector<std::array<uint8_t, kPaletteColors>> pal_left_col_[2];
   std::vector<int8_t> above_tx_lw_;
   std::vector<int8_t> left_tx_lh_;
   /* luma transform type per 4x4 unit, as transform_type() writes it */
@@ -3421,6 +3785,13 @@ class TileParser {
     skip_map_.assign(static_cast<size_t>(cols) * rows, 0);
     skip_mode_map_.assign(static_cast<size_t>(cols) * rows, 0);
     y_mode_map_.assign(static_cast<size_t>(cols) * rows, kModeDc);
+    for (int plane = 0; plane < 2; ++plane) {
+      const std::array<uint8_t, kPaletteColors> no_colors = {0, 0, 0, 0, 0, 0, 0, 0};
+      pal_above_sz_[plane].assign(static_cast<size_t>(cols), 0);
+      pal_above_col_[plane].assign(static_cast<size_t>(cols), no_colors);
+      pal_left_sz_[plane].assign(static_cast<size_t>(rows), 0);
+      pal_left_col_[plane].assign(static_cast<size_t>(rows), no_colors);
+    }
     above_tx_lw_.assign(static_cast<size_t>(cols), 0);
     left_tx_lh_.assign(static_cast<size_t>(rows), 0);
     tx_cell_lw_.assign(static_cast<size_t>(cols) * rows, 0);
