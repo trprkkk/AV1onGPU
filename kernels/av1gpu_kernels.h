@@ -2458,6 +2458,17 @@ AV1G_FN void av1g_cdef_block(const Av1gCdefJob *job, AV1G_GLOBAL const av1g_px *
 #define AV1G_GRAIN_CHROMA_POSITIONS 25   /* plus the luma coupling position */
 #define AV1G_GRAIN_LUMA_W 82
 #define AV1G_GRAIN_LUMA_H 73
+/* The chroma grain arrays are their own size, not the frame's chroma size: the
+ * spec fixes them at 44x38 for 4:2:0 and 82x73 (the luma size) for 4:4:4, because
+ * the largest block offset (6 + 15) plus a 34 wide block still has to fit. */
+#define AV1G_GRAIN_CHROMA_W 44
+#define AV1G_GRAIN_CHROMA_H 38
+AV1G_FN int av1g_grain_array_w(int plane, int ss_x) {
+  return plane == 0 ? AV1G_GRAIN_LUMA_W : (ss_x ? AV1G_GRAIN_CHROMA_W : AV1G_GRAIN_LUMA_W);
+}
+AV1G_FN int av1g_grain_array_h(int plane, int ss_y) {
+  return plane == 0 ? AV1G_GRAIN_LUMA_H : (ss_y ? AV1G_GRAIN_CHROMA_H : AV1G_GRAIN_LUMA_H);
+}
 #define AV1G_GRAIN_LUT_ENTRIES 768 /* ScalingLut[3][256] */
 
 typedef struct {
@@ -2561,7 +2572,7 @@ AV1G_HOST_FN void av1g_grain_ar_filter(const Av1gGrainParams *params, signed cha
         }
       }
       plane[y * w + x] = (signed char)av1g_clip(
-          gmin, gmax, (int)plane[y * w + x] + av1g_grain_round2(sum, shift));
+          (int)plane[y * w + x] + av1g_grain_round2(sum, shift), gmin, gmax);
     }
   }
 }
@@ -2673,7 +2684,7 @@ AV1G_HOST_FN void av1g_grain_noise_plane(const Av1gGrainParams *params, const si
   const int n_stripes = (ph + step - 1) / step;
   const int gmin = av1g_grain_min(params->bitdepth);
   const int gmax = av1g_grain_max(params->bitdepth);
-  const int src_w = plane == 0 ? AV1G_GRAIN_LUMA_W : (AV1G_GRAIN_LUMA_W >> ss_x);
+  const int src_w = av1g_grain_array_w(plane, ss_x);
   const int overlap = params->overlap_flag;
   int s, x, y, i, j;
 
@@ -2698,12 +2709,12 @@ AV1G_HOST_FN void av1g_grain_noise_plane(const Av1gGrainParams *params, const si
             if (j < 2 && overlap && x > 0) {
               const int old = (int)stripe[i * stripe_w + col];
               g = av1g_grain_round2(j == 0 ? old * 27 + g * 17 : old * 17 + g * 27, 5);
-              g = av1g_clip(gmin, gmax, g);
+              g = av1g_clip(g, gmin, gmax);
             }
           } else if (j == 0 && overlap && x > 0) {
             const int old = (int)stripe[i * stripe_w + col];
             g = av1g_grain_round2(old * 23 + g * 22, 5);
-            g = av1g_clip(gmin, gmax, g);
+            g = av1g_clip(g, gmin, gmax);
           }
           stripe[i * stripe_w + col] = (signed char)g;
         }
@@ -2722,13 +2733,13 @@ AV1G_HOST_FN void av1g_grain_noise_plane(const Av1gGrainParams *params, const si
           const int old =
               (int)scratch[((size_t)(stripe_index - 1) * stripe_rows + row + 32) * stripe_w + x];
           g = av1g_grain_round2(row == 0 ? old * 27 + g * 17 : old * 17 + g * 27, 5);
-          g = av1g_clip(gmin, gmax, g);
+          g = av1g_clip(g, gmin, gmax);
         }
       } else if (row < 1 && stripe_index > 0 && overlap) {
         const int old =
             (int)scratch[((size_t)(stripe_index - 1) * stripe_rows + row + 16) * stripe_w + x];
         g = av1g_grain_round2(old * 23 + g * 22, 5);
-        g = av1g_clip(gmin, gmax, g);
+        g = av1g_clip(g, gmin, gmax);
       }
       out[y * pw + x] = (signed char)g;
     }

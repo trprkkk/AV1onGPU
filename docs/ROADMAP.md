@@ -21,8 +21,8 @@ through `found_ref` (`frame_size_with_refs`) and skip mode are derived, not
 guessed. That pool carries each slot's order hint and
 frame id, which is what `frame_refs_short_signaling` (7.8) and the frame id
 checks of 5.9.2 - including `mark_ref_frames` and the order hints an error
-resilient frame re-states - work on. Features that are not implemented (restoration,
-film grain data) are reported with a message instead of being misparsed.
+resilient frame re-states - work on. Features that are not implemented (loop restoration) are reported
+with a message instead of being misparsed.
 `av1gpu_probe` shows what it found in a real file, and
 `tests/data/svt_av1_320x240.ivf` keeps the parser honest against bytes from a
 real encoder.
@@ -288,8 +288,7 @@ Superres is done too: a frame that is coded narrower than it is displayed
 reconstructs and filters at the coded width, is upscaled after CDEF (7.16), and
 is stored as a reference at the displayed width, so the frames after it predict
 from it with the per sample step of 7.11.3.2 (`tests/data/superres.ivf`,
-bit exact against dav1d through both backends - see `docs/ACCURACY.md`). Of the
-tools AV1 defines, what is left is a film grain synthesis filter (section 4).
+bit exact against dav1d through both backends - see `docs/ACCURACY.md`).
 Every inter and intra prediction tool decodes bit exactly, and so does
 segmentation, which is
 not a prediction tool but a per block quantiser and loop filter override with
@@ -298,10 +297,18 @@ three forced decisions attached (`tests/data/seg_altq.ivf`, see
 frame ids, `frame_size_with_refs` and the pool invalidation rules of 5.9.2 are
 implemented and pinned by tests (see `docs/ACCURACY.md`).
 
-## 4. Spec-conformant film grain
+## 4. Film grain (done)
 
-Replace the synthetic template with the specification's AR filter and overlap
-blending, and pick up the per-plane grain parameters from the bitstream.
+**Done: the specification's synthesis filter.** The frame header carries the
+whole `film_grain_params()` (5.9.30) - the per-plane scaling curves, the luma
+correlation of the chroma curves, the auto-regressive coefficients, the overlap
+and restricted range flags - including the `update_grain = 0` case, where a frame
+inherits the parameters of the reference it points at. The generator, the AR
+filter and the stripe blending run on the host (`src/core/grain.cpp`) because
+both are sequential across samples; the kernels do the per sample blend, so every
+backend produces the same bytes. `tests/data/grain.ivf` pins it: 30 frames, every
+sample equal to dav1d's, on the CPU backend and through the OpenCL kernels
+(`docs/ACCURACY.md`).
 
 ## 5. Faster scheduling for intra frames
 

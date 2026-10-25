@@ -83,8 +83,12 @@ Result run(const av1gpu::BackendOptions& options, const av1gpu::SyntheticConfig&
   syntax.reserve(frames);
   source.reserve(frames);
   for (int f = 0; f < frames; ++f) {
-    av1gpu::Frame src;
-    av1gpu::FrameSyntax s = av1gpu::synthetic_encode(cfg, f, f == 0 ? nullptr : &ref, &src, &ref);
+    av1gpu::Frame src, stored;
+    /* `ref` is what the encoder predicts from: the reconstruction before the
+     * film grain, which is what a decoder keeps in its reference pool */
+    av1gpu::FrameSyntax s =
+        av1gpu::synthetic_encode(cfg, f, f == 0 ? nullptr : &ref, &src, &ref, &stored);
+    ref = stored;
     syntax.push_back(s);
     source.push_back(src);
   }

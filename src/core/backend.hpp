@@ -225,10 +225,16 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
                       const BackendOptions& options, int reference_capacity,
                       FramePlan* plan, std::string* error);
 
-/* Runs deblock / CDEF / film grain on a host frame, exactly as the decoder
- * does. Used by encoders (including the synthetic one) so that their reference
- * frames do not drift. */
-void apply_post_filters_host(Frame* frame, const FrameSyntax& syntax);
+/* Runs deblock / CDEF (and, by default, film grain) on a host frame, exactly as
+ * the decoder does. Used by encoders (including the synthetic one) so that their
+ * reference frames do not drift. `grain` adds the film grain at the end;
+ * the reference frame store needs the picture *before* it (7.20), so an encoder
+ * calls this with `grain = false` and then apply_grain_host() on the display
+ * copy. */
+void apply_post_filters_host(Frame* frame, const FrameSyntax& syntax, bool grain = true);
+
+/* The film grain synthesis filter alone (7.18.3), on a host frame. */
+void apply_grain_host(Frame* frame, const FrameSyntax& syntax);
 
 /* ------------------------------------------------------------------------- */
 /* tables shared by every backend                                            */

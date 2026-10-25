@@ -152,9 +152,11 @@ int main(int argc, char** argv) {
   int slot = -1;
 
   for (int f = 0; f < frames; ++f) {
-    Frame source, recon;
-    FrameSyntax syntax = synthetic_encode(cfg, f, f == 0 ? nullptr : &reference, &source, &recon);
-    reference = recon;
+    Frame source, recon, stored;
+    FrameSyntax syntax =
+        synthetic_encode(cfg, f, f == 0 ? nullptr : &reference, &source, &recon, &stored);
+    /* the decoder's reference pool holds the picture before the film grain */
+    reference = stored;
     if (raw) {
       /* reconstruction only: the loop filters are dropped from the syntax, so
          the CPU reference and the plan both stop after the waves. */

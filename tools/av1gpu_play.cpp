@@ -122,8 +122,11 @@ int main(int argc, char** argv) {
   int written = 0;
 
   for (int f = 0; f < frames; ++f) {
+    av1gpu::Frame stored;
     av1gpu::FrameSyntax syntax =
-        av1gpu::synthetic_encode(cfg, f, f == 0 ? nullptr : &reference, nullptr, &reference);
+        av1gpu::synthetic_encode(cfg, f, f == 0 ? nullptr : &reference, nullptr, &reference, &stored);
+    /* the next frame predicts from the picture before the film grain */
+    reference = stored;
     if (slot >= 0) {
       syntax.reference_slots.clear();
       syntax.reference_slots.push_back(slot);

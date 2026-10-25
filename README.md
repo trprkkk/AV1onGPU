@@ -102,7 +102,8 @@ kernels/av1gpu_kernels.h      the maths: all stages, shared by every backend
 kernels/av1_opencl.cl         OpenCL entry points (one work item per output)
 kernels/av1_cuda.cu           CUDA entry points, mirroring the OpenCL file
 src/core/engine.cpp           syntax -> job plan, wavefront scheduler, Decoder
-src/core/tables.cpp           transform bases, subpel filters, grain, colour
+src/core/tables.cpp           transform bases, subpel filters, colour
+src/core/grain.cpp            film grain: noise, AR filter, stripe blending
 src/core/post_filters.cpp     host deblock/CDEF/grain, shared with encoders
 src/backends/cpu/             reference backend (the correctness baseline)
 src/backends/opencl/          loader (dlopen) + backend
@@ -140,8 +141,8 @@ pool is also what reference frame ids are checked against, and what
 `frame_refs_short_signaling` derives the five uncoded references from
 (`set_frame_refs()`, 7.8): see `docs/ACCURACY.md`.
 
-What is *refused with a message* instead of being misparsed: restoration
-filters and film grain data.
+What is *refused with a message* instead of being misparsed: loop restoration
+filters.
 
 The tile payload is coded with AV1's boolean range decoder, which
 `src/frontend/range_decoder.hpp` implements: adaptive Q15 symbol CDFs, boolean
@@ -276,10 +277,10 @@ coded blocks (`tests/data/palette_sc.ivf`), inter/intra compound
 (`tests/data/inter_intra.ivf`), intra block copy (`tests/data/intrabc.ivf`) and
 skip mode, which the `lw_t2`/`lw_t3`/`inter_intra` fixtures code thousands of
 times, and segmentation (`tests/data/seg_altq.ivf`, a different quantiser per
-segment) and superres, where a frame is coded narrower than it is displayed and
-upscaled after CDEF (`tests/data/superres.ivf`). Film grain uses a synthetic
-template instead of the specification's synthesis filter (see `docs/ROADMAP.md`,
-section 4).
+segment), superres, where a frame is coded narrower than it is displayed and
+upscaled after CDEF (`tests/data/superres.ivf`), and film grain, whose generator,
+auto-regressive filter and stripe blending follow 7.18.3 sample for sample
+(`tests/data/grain.ivf`).
 `av1gpu::synthetic_encode` is a small closed loop test encoder that produces
 valid syntax from a generated clip and does not need any of those.
 

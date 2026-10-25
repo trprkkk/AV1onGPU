@@ -46,10 +46,13 @@ Clip make_clip(int frames, int qstep, bool cdef, bool grain, int w = 128, int h 
   clip.syntax.resize(frames);
   clip.recon.resize(frames);
   for (int f = 0; f < frames; ++f) {
+    /* recon is the picture a decoder outputs (grain included), stored the one it
+     * keeps as a reference (before the grain) */
+    Frame stored;
     FrameSyntax syntax = synthetic_encode(clip.cfg, f, f == 0 ? nullptr : &ref, &clip.source[f],
-                                          &clip.recon[f]);
+                                          &clip.recon[f], &stored);
     clip.syntax[f] = syntax;
-    ref = clip.recon[f];
+    ref = stored;
   }
   return clip;
 }

@@ -161,7 +161,8 @@ void synthetic_source(const SyntheticConfig& cfg, int frame_index, Frame* out) {
 }
 
 FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
-                             const Frame* reference, Frame* source, Frame* recon_out) {
+                             const Frame* reference, Frame* source, Frame* recon_out,
+                             Frame* stored_out) {
   Frame src;
   synthetic_source(cfg, frame_index, &src);
   if (source) *source = src;
@@ -478,11 +479,16 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
     g.clip_to_restricted_range = false;
   }
 
-  /* the reference the *decoder* will use has the loop filters applied, so the
-   * encoder must apply them too or the next inter frame drifts away */
-  internal::apply_post_filters_host(&recon, syntax);
-
-  if (recon_out) *recon_out = recon;
+  /* The reference the *decoder* will use has the loop filters applied but the
+   * film grain is not part of it (7.20: grain belongs to the output process), so
+   * the encoder keeps the filtered picture and grains only the display copy. */
+  Frame stored = recon;
+  internal::apply_post_filters_host(&stored, syntax, /*grain=*/false);
+  if (stored_out) *stored_out = stored;
+  if (recon_out) {
+    *recon_out = stored;
+    internal::apply_grain_host(recon_out, syntax);
+  }
   return syntax;
 }
 

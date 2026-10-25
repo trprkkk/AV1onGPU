@@ -28,8 +28,14 @@ not disagreements between backends.
   a vertical and a horizontal edge cross: running both at once is a data race,
   and it made `test_pipeline` fail roughly one run in five until the two passes
   were separated.
-* **Film grain application.** Per 128×128 tile, per luma bucket LUT, added on
-  top of the reconstructed picture with clipping.
+* **Film grain synthesis.** The generator, the auto-regressive filter and the
+  overlap blending are the specification's, sample for sample, including the
+  chroma coupling that reads the luma grain (7.18.3); the blend is one multiply,
+  one `Round2` and one `Clip3` per sample. The sequential half runs on the host
+  because neither the AR filter nor the stripe stitching parallelises across
+  samples, and the per sample map runs in the kernels, so every backend adds the
+  same noise. `tests/data/grain.ivf` pins it against dav1d: 30 frames, every
+  sample equal.
 * **Colour conversion.** One integer matrix per (matrix, range, bit depth),
   Q16 coefficients with the level/range offsets folded into the constant term,
   so limited-range black is (0,0,0) and limited-range white is 255.
@@ -78,12 +84,6 @@ not disagreements between backends.
   by a rate/distortion search, so enabling CDEF there lowers PSNR against the
   clean source (see the measurements below) — that is the synthetic encoder's
   choice, not a filter defect.
-* **Film grain template.** The AV1 grain model is a large AR filter with
-  per-plane coefficients and overlap blending driven by an LFSR. This
-  implementation generates a zero-mean triangular noise template from a
-  seeded xorshift (`tables::grain_template`), scaled per luma bucket through the
-  32-entry LUT, tiled at 128×128 with optional overlap. Grain therefore *looks*
-  right and costs the right amount of work, but it is not bitstream compatible.
 * **Intra predictors.** DC, V, H, Paeth and bilinear-style smooth/V/H follow
   their spec definitions. `av1g_smooth_w(i, n) = ((i + 1) * 256) / (n + 1)` is a
   synthesised approximation of the spec's smooth-mode weight table. Chroma-from-
@@ -148,6 +148,15 @@ three layers, all of them runnable on a machine with no GPU driver:
    frame later, not as a mismatch. `plan_dump.hpp` writes the real `tmp_size`
    (plan format 3) and `check_buffers()` fails the test if any job reaches past
    its pool.
+
+   Film grain is where the plan turned into more than job arrays. The noise image
+   and the three 256 entry scaling curves are built on the host (plan format 5
+   carries them as `noise`/`grain_lut` with a per plane offset and stride),
+   because the generator and the auto-regressive filter are sequential; the
+   replay uploads them and runs the same two passes the backends do, chroma
+   first. It also has to copy a frame into its reference pool *before* those
+   passes - 7.20 stores the decoded picture, not the displayed one - or every
+   inter frame after the first comes back different.
 
 To those a fourth layer can be added where a software OpenCL device exists: the
 C++ backend itself, not just the kernel source. PoCL (`pip install pyopencl
@@ -718,6 +727,64 @@ upscaled ones that were stored. The plan format carries both geometries (`v4`
 added `out_width`/`out_height` and the per plane display sizes next to the coded
 ones, plus the upscale jobs), which is what lets the replay check the displayed
 picture rather than the coded one.
+
+## Film grain
+
+Film grain is the one filter that runs after the picture is finished: it is part
+of the output process (7.18.3), not of the reconstruction, and it is the only one
+that is not a local neighbourhood operation. The noise comes from an
+auto-regressive filter over a pseudo-random template - every sample depends on
+the ones already filtered above it and to its left - and the 32-sample-high
+stripes are then stitched together with weights that depend on how far into the
+frame they are. Neither half parallelises across samples, so both run once per
+frame on the host (`src/core/grain.cpp`); the kernels are left with the per
+sample map (scale one noise sample by the plane's curve, add, clip), which is why
+every backend adds the same noise.
+
+Four things decide the result and all four are easy to misread:
+
+* `GrainCenter = 128 << (BitDepth - 8)`, so the grain lives in
+  `[-128, 127]` at 8 bit and is kept as `signed char`; `GrainMin`/`GrainMax` clip
+  the AR filter's output back into that range.
+* Two different shifts: `ScalingShift = grain_scaling_minus_8 + 8` for the blend
+  and `ar_coeff_shift_minus_6 + 6` for the AR filter. Feeding one where the other
+  belongs shifts the grain by up to four bits - visible, but not obviously wrong.
+* The chroma grain arrays are **44×38** at 4:2:0 (82×73 at 4:4:4), not the
+  frame's chroma size: the largest block offset (6 + 15) plus a 34 wide block has
+  to fit. Allocating them as `(width + 1) >> 1` by `(height + 1) >> 1` also
+  allocates them at the *wrong stride*, so the noise blobs come out a different
+  shape rather than out of range.
+* `Round2` here is the unsigned rounding - `(v + (1 << (n - 1))) >> n` over a
+  signed value, so -3 rounds to -1 at `n = 1`. It is *not* the `Round2Signed`
+  that motion compensation uses, and the two differ for every negative sample.
+
+**Blend order.** The chroma planes are blended first. Their `averageLuma` is the
+luma of the picture *before* any grain was added, so the luma plane has to be
+untouched while the chroma jobs run; the plan keeps two job lists
+(`grain_chroma`, then `grain_luma`) for exactly that reason.
+
+**References are grained later.** The reference frame update (7.20) stores the
+decoded picture, which is the one *before* the grain, because grain belongs to
+the output process. So a backend copies the frame into the reference pool first
+and runs the grain kernels afterwards, and a request for "the picture just
+decoded" reads the display frame rather than the pool. Getting this the other way
+round is invisible on an intra-only stream and corrupts every inter frame of a
+grained one.
+
+**What is verified.** `tests/data/grain.ivf` is a 30 frame stream with the grain
+parameters patched into its frame headers (see `tests/data/README.md`; no encoder here can signal
+film grain). Every sample of every frame is equal to dav1d's, through the CPU
+backend (`stream_grain`) and through the OpenCL kernels (`opencl_grain`).
+`tests/data/make_grain.py --profile` was what made that possible: it switches on
+one part of the synthesis at a time - a constant luma curve with no AR filter and
+no overlap, then the AR filter, then the overlap blending, then a real curve,
+then chroma points, then chroma-from-luma - and each profile is now bit exact
+against dav1d on its own. Bisecting that way turns "everything differs" into two
+one-line bugs instead of a parameter hunt: `av1g_clip` takes `(v, lo, hi)` here
+while the specification writes `Clip3(lo, hi, v)`, and the grain code had copied
+the specification's order into the call, so every sample clipped to `GrainMax`
+and the noise was a flat +127 at 8 bit; and the chroma grain arrays were
+allocated at the frame's chroma size instead of 44×38.
 
 ## Measured quality (synthetic clip, 640×360, CPU reference backend)
 

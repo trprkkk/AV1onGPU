@@ -353,6 +353,29 @@ class CpuBackend final : public Backend {
       }
     }
 
+    /* ---- reference (7.20) -------------------------------------------------- */
+    /* The reference frame update stores the decoded picture, which is the one
+     * *before* the film grain: grain belongs to the output process (7.18.3), so
+     * the reference copy is taken first and the grain pass below changes the
+     * display picture only. */
+    int slot = -1;
+    if (keep_reference) {
+      slot = allocate_slot();
+      if (slot < 0) {
+        *error = "CPU reference pool exhausted";
+        return false;
+      }
+      RefFrame& ref = refs_[slot];
+      ref.used = true;
+      ref.width = g.frame.width;
+      ref.height = g.frame.height;
+      ref.bit_depth = g.frame.bit_depth;
+      ref.ss_x = g.frame.ss_x;
+      ref.ss_y = g.frame.ss_y;
+      std::memcpy(ref_pool_.data() + static_cast<size_t>(slot) * g.buffer_size, frame,
+                  g.buffer_size * sizeof(uint16_t));
+    }
+    /* ---- film grain (7.18.3) ----------------------------------------------- */
     {
       const int n = static_cast<int>(plan.grain_chroma.size());
 #if defined(AV1GPU_HAVE_OPENMP)
@@ -373,6 +396,7 @@ class CpuBackend final : public Backend {
                          maxv);
       }
     }
+
 
     if (std::getenv("AV1GPU_MCDUMP")) {
       static int dumped3 = 0;
@@ -422,23 +446,6 @@ class CpuBackend final : public Backend {
       }
     }
 
-    int slot = -1;
-    if (keep_reference) {
-      slot = allocate_slot();
-      if (slot < 0) {
-        *error = "CPU reference pool exhausted";
-        return false;
-      }
-      RefFrame& ref = refs_[slot];
-      ref.used = true;
-      ref.width = g.frame.width;
-      ref.height = g.frame.height;
-      ref.bit_depth = g.frame.bit_depth;
-      ref.ss_x = g.frame.ss_x;
-      ref.ss_y = g.frame.ss_y;
-      std::memcpy(ref_pool_.data() + static_cast<size_t>(slot) * g.buffer_size, frame,
-                  g.buffer_size * sizeof(uint16_t));
-    }
     if (out_slot) *out_slot = slot;
     last_slot_ = slot;
 
@@ -456,13 +463,18 @@ class CpuBackend final : public Backend {
 
   bool to_rgb(int slot, ColorMatrix matrix, ColorRange range, std::vector<uint8_t>* rgb,
               std::string* error) override {
-    const uint16_t* samples = nullptr;
-    if (slot >= 0 && slot < kReferenceSlots && refs_[slot].used)
-      samples = ref_pool_.data() + static_cast<size_t>(slot) * layout_.buffer_size;
-    else if (last_slot_ >= 0 && refs_[last_slot_].used)
-      samples = ref_pool_.data() + static_cast<size_t>(last_slot_) * layout_.buffer_size;
-    else
-      samples = frame_.data();
+    /* The reference pool holds the picture *before* the film grain (7.20) and
+     * frame_ the one after it, so a request for the frame that was just decoded
+     * reads frame_ - the reference is only the fallback for an older slot. */
+    const uint16_t* samples = frame_.data();
+    if (slot >= 0) {
+      if (slot >= kReferenceSlots || !refs_[slot].used) {
+        if (error) *error = "invalid reference slot";
+        return false;
+      }
+      if (slot != last_slot_)
+        samples = ref_pool_.data() + static_cast<size_t>(slot) * layout_.buffer_size;
+    }
     if (!samples) {
       if (error) *error = "no frame to convert";
       return false;

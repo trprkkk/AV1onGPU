@@ -44,7 +44,8 @@ import opencl_selftest as selftest  # noqa: E402  (probe, kernel source, helpers
 
 MAGIC = b"AV1GPLAN"
 FORMAT_VERSION = 5       # 2 the palette map, 3 the itx scratch size,
-                         # 4 the display geometry and the upscale jobs
+                         # 4 the display geometry and the upscale jobs,
+                         # 5 the film grain noise image and its two passes
 REFERENCE_SLOTS = 9      # kReferenceSlots in the backends
 CDEF_DIM = 8             # AV1G_CDEF_DIM
 MASK_DIFFWTD = 2         # AV1G_MASK_DIFFWTD
@@ -260,8 +261,16 @@ class Replay:
         global_size = ((elements + local - 1) // local) * local
         self.cl.enqueue_nd_range_kernel(self.queue, kernel, (global_size,), (local,))
 
-    def decode(self, plan, filter_buf, ref_pool):
-        """Decodes one frame; returns a device buffer holding the result."""
+    def decode(self, plan, filter_buf, ref_pool, before_grain=None):
+        """Decodes one frame; returns a device buffer holding the result.
+
+        `before_grain` is called with the frame buffer once the picture is
+        finished and before the film grain pass, which is where the backends copy
+        a frame into the reference pool: 7.20 stores the decoded picture, and the
+        grain belongs to the output process (7.18.3), so a reference never
+        carries grain. Getting that order wrong is invisible on an intra frame
+        and shifts every inter frame that follows.
+        """
         cl, np, mf = self.cl, self.np, self.cl.mem_flags
         maxv = plan["maxv"]
         size = plan["buffer_size"]
@@ -383,6 +392,9 @@ class Replay:
             self.launch("av1g_k_upscale", total,
                         (job_buf, pref, np.int32(len(jobs)), np.int32(total), snapshot,
                          frame, filter_buf, np.int32(maxv)))
+
+        if before_grain is not None:
+            before_grain(frame)
 
         # ---- film grain ----------------------------------------------------
         # Two passes: the chroma planes scale their noise by the luma of the
@@ -574,16 +586,22 @@ def main(argv=None):
                                 (index, missing))
                 break
 
-            decoded_buf = replay.decode(plan, filter_buf, ref_pool)
+            # this frame becomes a reference for the frames that follow it, in
+            # the pool slot the encoder assigned to it - copied before the grain,
+            # the way the backends do it
+            def keep_reference(frame_buf, out_slot=out_slot):
+                if out_slot < 0:
+                    return
+                cl.enqueue_copy(queue, ref_pool, frame_buf,
+                                dst_offset=out_slot * size * 2,
+                                byte_count=size * 2).wait()
+
+            decoded_buf = replay.decode(plan, filter_buf, ref_pool,
+                                        before_grain=keep_reference)
             decoded = replay.read(decoded_buf, size)
             expected = np.fromfile(os.path.join(work, "frame_%d.yuv16" % index),
                                    dtype=np.uint16)
             failures += compare(plan, decoded, expected, index)
-
-            # this frame becomes a reference for the frames that follow it, in
-            # the pool slot the encoder assigned to it
-            cl.enqueue_copy(queue, ref_pool, decoded_buf,
-                            dst_offset=out_slot * size * 2, byte_count=size * 2).wait()
             filled.add(out_slot)
 
         print("")

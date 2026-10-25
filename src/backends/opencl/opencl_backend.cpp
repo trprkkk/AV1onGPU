@@ -412,6 +412,29 @@ class OpenCLBackend final : public Backend {
       ++launches;
     }
 
+    /* ---- reference (7.20) -------------------------------------------------- */
+    /* The reference frame update stores the decoded picture, which is the one
+     * *before* the film grain: grain belongs to the output process (7.18.3), so
+     * the reference copy is issued first and the grain kernels below change the
+     * display picture only. */
+    /* ---- keep as reference (device to device) ------------------------------ */
+    int slot = -1;
+    if (keep_reference) {
+      slot = allocate_slot();
+      if (slot < 0) return fail(error, "OpenCL reference pool exhausted");
+      /* frame_ is the source, so the slot offset is the *destination* one;
+       * getting those the other way round makes the driver reject the copy as
+       * out of range on every slot but zero. */
+      if (api_.EnqueueCopyBuffer(queue_, frame_, ref_pool_, 0,
+                                 static_cast<size_t>(slot) * g.buffer_size *
+                                     sizeof(uint16_t),
+                                 g.buffer_size * sizeof(uint16_t), 0, nullptr,
+                                 nullptr) != opencl::CL_SUCCESS)
+        return fail(error, "reference copy failed");
+      api_.Finish(queue_);
+      slots_[slot] = true;
+    }
+    /* ---- film grain (7.18.3) ----------------------------------------------- */
     /* ---- film grain -------------------------------------------------------- */
     if (!plan.grain_chroma.empty() || !plan.grain_luma.empty()) {
       /* The noise image is built on the host (the sequential half of the
@@ -473,23 +496,6 @@ class OpenCLBackend final : public Backend {
     }
     const double t3 = now_ms();
 
-    /* ---- keep as reference (device to device) ------------------------------ */
-    int slot = -1;
-    if (keep_reference) {
-      slot = allocate_slot();
-      if (slot < 0) return fail(error, "OpenCL reference pool exhausted");
-      /* frame_ is the source, so the slot offset is the *destination* one;
-       * getting those the other way round makes the driver reject the copy as
-       * out of range on every slot but zero. */
-      if (api_.EnqueueCopyBuffer(queue_, frame_, ref_pool_, 0,
-                                 static_cast<size_t>(slot) * g.buffer_size *
-                                     sizeof(uint16_t),
-                                 g.buffer_size * sizeof(uint16_t), 0, nullptr,
-                                 nullptr) != opencl::CL_SUCCESS)
-        return fail(error, "reference copy failed");
-      api_.Finish(queue_);
-      slots_[slot] = true;
-    }
     if (out_slot) *out_slot = slot;
     last_slot_ = slot;
 
@@ -513,6 +519,9 @@ class OpenCLBackend final : public Backend {
       return false;
     }
     const PlanLayout& g = layout_;
+    /* The reference pool holds the picture *before* the film grain (7.20) and
+     * frame_ the one after it, so a request for the frame that was just decoded
+     * reads frame_ - the reference is only the fallback for an older slot. */
     cl_mem source = frame_;
     int base = 0;
     if (slot >= 0) {
@@ -520,11 +529,10 @@ class OpenCLBackend final : public Backend {
         *error = "invalid reference slot";
         return false;
       }
-      source = ref_pool_;
-      base = slot * static_cast<int>(g.buffer_size);
-    } else if (last_slot_ >= 0 && slots_[last_slot_]) {
-      source = ref_pool_;
-      base = last_slot_ * static_cast<int>(g.buffer_size);
+      if (slot != last_slot_) {
+        source = ref_pool_;
+        base = slot * static_cast<int>(g.buffer_size);
+      }
     }
 
     Av1gColorJob job;

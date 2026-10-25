@@ -63,6 +63,50 @@ GRAIN = {
 }
 
 
+# Named mixes of the parameters, for chasing a difference against a reference
+# decoder one part of the synthesis at a time. `full` is the default and switches
+# on everything the syntax can carry.
+PROFILES = {
+    "full": {},
+    "luma": {
+        "y": [(0, 40)], "cb": [], "cr": [], "chroma_scaling_from_luma": False,
+        "ar_coeff_lag": 0, "ar_coeffs_y": [], "ar_coeffs_cb": [], "ar_coeffs_cr": [],
+        "overlap_flag": False, "clip_to_restricted_range": False,
+    },
+    "luma_clip": {
+        "y": [(0, 40)], "cb": [], "cr": [], "chroma_scaling_from_luma": False,
+        "ar_coeff_lag": 0, "ar_coeffs_y": [], "ar_coeffs_cb": [], "ar_coeffs_cr": [],
+        "overlap_flag": False, "clip_to_restricted_range": True,
+    },
+    "luma_ar": {
+        "y": [(0, 40)], "cb": [], "cr": [], "chroma_scaling_from_luma": False,
+        "overlap_flag": False, "clip_to_restricted_range": False,
+    },
+    "luma_overlap": {
+        "y": [(0, 40)], "cb": [], "cr": [], "chroma_scaling_from_luma": False,
+        "ar_coeff_lag": 0, "ar_coeffs_y": [], "ar_coeffs_cb": [], "ar_coeffs_cr": [],
+        "overlap_flag": True, "clip_to_restricted_range": False,
+    },
+    "luma_curve": {
+        "cb": [], "cr": [], "chroma_scaling_from_luma": False,
+        "ar_coeff_lag": 0, "ar_coeffs_y": [], "ar_coeffs_cb": [], "ar_coeffs_cr": [],
+        "overlap_flag": False, "clip_to_restricted_range": False,
+    },
+    "chroma_only": {
+        "y": [(0, 8)], "cb": [(0, 16)], "cr": [(0, 16)],
+        "chroma_scaling_from_luma": False,
+        "ar_coeff_lag": 0, "ar_coeffs_y": [], "ar_coeffs_cb": [], "ar_coeffs_cr": [],
+        "overlap_flag": False, "clip_to_restricted_range": False,
+    },
+    "chroma_csl": {
+        "y": [(0, 16), (128, 24), (255, 16)], "cb": [], "cr": [],
+        "chroma_scaling_from_luma": True,
+        "ar_coeff_lag": 0, "ar_coeffs_y": [], "ar_coeffs_cb": [], "ar_coeffs_cr": [],
+        "overlap_flag": False, "clip_to_restricted_range": False,
+    },
+}
+
+
 def u(value, bits):
     """A fixed width unsigned syntax element, as a list of bit characters."""
     if value < 0 or value >= (1 << bits):
@@ -100,10 +144,12 @@ def film_grain_params(frame_type, seed, seq):
     if GRAIN["y"]:
         for value in GRAIN["ar_coeffs_y"][:num_pos_luma]:
             bits += u(value + 128, 8)
-    if chroma and (GRAIN["chroma_scaling_from_luma"] or GRAIN["cb"]):
+    # the coefficients are coded when the chroma curve comes from luma even if no
+    # chroma points were coded at all, so the test is not gated on `chroma`
+    if GRAIN["chroma_scaling_from_luma"] or GRAIN["cb"]:
         for value in GRAIN["ar_coeffs_cb"][:num_pos_chroma]:
             bits += u(value + 128, 8)
-    if chroma and (GRAIN["chroma_scaling_from_luma"] or GRAIN["cr"]):
+    if GRAIN["chroma_scaling_from_luma"] or GRAIN["cr"]:
         for value in GRAIN["ar_coeffs_cr"][:num_pos_chroma]:
             bits += u(value + 128, 8)
     bits += u(GRAIN["ar_coeff_shift_minus_6"], 2)
@@ -124,7 +170,22 @@ def main():
     ap.add_argument("--probe", default=os.path.join("build", "bin", "av1gpu_probe"))
     ap.add_argument("--seed", type=int, default=1234,
                     help="grain_seed of the first frame; later frames step it")
+    ap.add_argument("--profile", default="full", choices=sorted(PROFILES),
+                    help="which parts of the synthesis to switch on (default full)")
     args = ap.parse_args()
+    GRAIN.update(PROFILES[args.profile])
+    # A profile only names the parts it changes, so the coefficient lists still
+    # have to reach the length the lag and the point lists imply: one value for
+    # every position, zero where the profile did not pick one.
+    lag = GRAIN["ar_coeff_lag"]
+    num_pos_luma = 2 * lag * (lag + 1)
+    num_pos_chroma = num_pos_luma + (1 if GRAIN["y"] else 0)
+    for name, count in (("ar_coeffs_y", num_pos_luma), ("ar_coeffs_cb", num_pos_chroma),
+                        ("ar_coeffs_cr", num_pos_chroma)):
+        values = list(GRAIN[name])
+        if len(values) < count:
+            values += [0] * (count - len(values))
+        GRAIN[name] = values[:count]
 
     seq, frame_positions = header_positions(args.probe, args.input)
     if seq["mono"]:

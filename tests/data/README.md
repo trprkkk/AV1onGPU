@@ -239,6 +239,30 @@ is bit exact against dav1d, and the decode is a real superres decode: the tiles
 reconstruct 320 columns, CDEF runs on those, and the upscale kernel then produces
 the 480 column picture (see `docs/ACCURACY.md`).
 
+`grain.ivf` is the film grain fixture: 30 frames of 320x240, 32 KB, the
+`seg_altq` stream with `film_grain_params()` patched into every frame header. No
+encoder here signals grain (libaom's `film-grain` option is not reachable through
+ffmpeg's wrapper) so the parameters are written by hand: four luma curve points,
+two points each for Cb and Cr, `ar_coeff_lag` 2 with a full set of coefficients
+(chroma ones included, so the luma correlation at the centre position runs),
+overlap blending on and clipping to the restricted range on. `grain_seed` is 1234
+for the first frame and 31 higher for each following one, so every frame's noise
+is a different image.
+
+```
+python3 tests/data/make_grain.py seg_altq.ivf grain.ivf --seed 1234
+```
+
+The script reads the field positions from `av1gpu_probe`'s `AV1GPU_HDRPOS` trace
+and re-aligns the patched header to the byte boundary the tile data starts on, so
+it does not keep a second copy of the header syntax. `--profile` switches on one
+part of the synthesis at a time (`luma`, `luma_ar`, `luma_overlap`, `luma_curve`,
+`luma_clip`, `chroma_only`, `chroma_csl`), which is how the implementation was
+bisected against dav1d; each profile is bit exact on its own. `grain.hash` holds
+the per frame hashes and `stream_grain` checks them, while `opencl_grain` replays
+the same frames through the device kernels. Every sample of every frame is equal
+to dav1d's (see `docs/ACCURACY.md`).
+
 `svt_av1_320x240.ivf` is a real AV1 stream, not a hand written header: six frames
 of a 320x240 gradient at 8 bit 4:2:0, encoded with SVT-AV1 (crf 40, preset 10)
 and muxed into IVF. The front-end tests parse it end to end, so the parser is

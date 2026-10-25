@@ -15,7 +15,31 @@
 namespace av1gpu {
 namespace internal {
 
-void apply_post_filters_host(Frame* frame, const FrameSyntax& syntax) {
+void apply_grain_host(Frame* frame, const FrameSyntax& syntax) {
+  if (!syntax.grain.apply || frame->empty()) return;
+  /* The sequential half of the synthesis, exactly as the plan build runs it;
+   * the blend itself is the kernels' per sample map. */
+  GrainNoise noise;
+  build_grain(syntax.grain, frame->bit_depth, syntax.ss_x, syntax.ss_y,
+              syntax.color.matrix == ColorMatrix::Identity, frame->width, frame->height, &noise);
+  std::vector<Av1gGrainJob> chroma, luma;
+  for (int plane = 0; plane < 3; ++plane) {
+    append_grain_jobs(noise, plane, frame->plane_width(plane), frame->plane_height(plane), 0,
+                      frame->stride[plane], 0, frame->stride[0], frame->width, syntax.ss_x,
+                      syntax.ss_y, &chroma, &luma);
+  }
+  /* chroma first: it blends against the luma the picture has before any grain */
+  for (const Av1gGrainJob& job : chroma) {
+    av1g_grain_block(&job, frame->plane(job.plane), frame->plane(0), noise.noise.data(), noise.lut,
+                     frame->max_value());
+  }
+  for (const Av1gGrainJob& job : luma) {
+    av1g_grain_block(&job, frame->plane(0), frame->plane(0), noise.noise.data(), noise.lut,
+                     frame->max_value());
+  }
+}
+
+void apply_post_filters_host(Frame* frame, const FrameSyntax& syntax, bool grain) {
   const int maxv = (1 << frame->bit_depth) - 1;
 
   auto at = [&](int plane, int x, int y) { return y * frame->stride[plane] + x; };
@@ -77,29 +101,7 @@ void apply_post_filters_host(Frame* frame, const FrameSyntax& syntax) {
     }
   }
 
-  /* ---- film grain ------------------------------------------------------- */
-  if (syntax.grain.apply) {
-    /* The sequential half of the synthesis, exactly as the plan build runs it;
-     * the blend itself is the kernels' per sample map. */
-    GrainNoise noise;
-    build_grain(syntax.grain, frame->bit_depth, syntax.ss_x, syntax.ss_y,
-                syntax.color.matrix == ColorMatrix::Identity, frame->width, frame->height, &noise);
-    std::vector<Av1gGrainJob> chroma, luma;
-    for (int plane = 0; plane < 3; ++plane) {
-      append_grain_jobs(noise, plane, frame->plane_width(plane), frame->plane_height(plane), 0,
-                        frame->stride[plane], 0, frame->stride[0], frame->width, syntax.ss_x,
-                        syntax.ss_y, &chroma, &luma);
-    }
-    /* chroma first: it blends against the luma the picture has before any grain */
-    for (const Av1gGrainJob& job : chroma) {
-      av1g_grain_block(&job, frame->plane(job.plane), frame->plane(0), noise.noise.data(), noise.lut,
-                       frame->max_value());
-    }
-    for (const Av1gGrainJob& job : luma) {
-      av1g_grain_block(&job, frame->plane(0), frame->plane(0), noise.noise.data(), noise.lut,
-                       frame->max_value());
-    }
-  }
+  if (grain) apply_grain_host(frame, syntax);
 }
 
 } /* namespace internal */

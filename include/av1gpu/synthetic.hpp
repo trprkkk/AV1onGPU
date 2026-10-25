@@ -42,14 +42,19 @@ void synthetic_source(const SyntheticConfig& cfg, int frame_index, Frame* out);
 
 /* Encodes `frame_index`.
  *
- *   reference  previously reconstructed frame, or null for a key frame
- *   source     optional, receives the source picture
- *   recon      optional, receives the encoder's own reconstruction
+ *   reference      previously reconstructed frame, or null for a key frame
+ *   source         optional, receives the source picture
+ *   recon          optional, receives the encoder's reconstruction *with* the
+ *                  film grain, i.e. the picture a decoder outputs
+ *   stored         optional, receives the same picture *before* the film grain,
+ *                  which is what a decoder keeps in its reference pool (7.20)
+ *                  and therefore what the next inter frame has to predict from
  *
  * The returned syntax has reference_slots == {0} when inter blocks are present,
  * so the caller has to fill in the device slot it wants to use. */
 FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
-                             const Frame* reference, Frame* source, Frame* recon);
+                             const Frame* reference, Frame* source, Frame* recon,
+                             Frame* stored = nullptr);
 
 } /* namespace av1gpu */
 

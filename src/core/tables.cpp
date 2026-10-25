@@ -2,7 +2,8 @@
  * AV1onGPU - shared tables
  *
  * What lives here is the host side data the backends share: the subpel filter
- * weights, the film grain generator, and the colour transforms. The transform
+ * weights and the colour transforms. (The film grain noise lives in
+ * src/core/grain.cpp: it is generated per frame, not a table.) The transform
  * and prediction tables are not here: they are normative, so they are generated
  * from the specification (tools/gen_kernel_tables.py) and compiled into the
  * kernel header, which every backend includes. Keeping one copy means the CPU

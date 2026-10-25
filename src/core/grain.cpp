@@ -79,8 +79,11 @@ void build_grain(const FilmGrainParams& params, int bit_depth, int ss_x, int ss_
       params.chroma_scaling_from_luma || params.num_cb_points > 0 || params.num_cr_points > 0;
 
   /* ---- generate the grain (7.18.3.3) -------------------------------- */
-  const int chroma_w = (luma_w + ss_x) >> ss_x;
-  const int chroma_h = (luma_h + ss_y) >> ss_y;
+  /* 7.18.3.3: the chroma grain array is 44x38 at 4:2:0 - the largest block
+   * offset plus a block - and the luma size at 4:4:4. It is not the frame's
+   * chroma size, which is what an unqualified reading of "chroma" suggests. */
+  const int chroma_w = av1g_grain_array_w(1, ss_x);
+  const int chroma_h = av1g_grain_array_h(1, ss_y);
   std::vector<signed char> luma_grain(static_cast<size_t>(AV1G_GRAIN_LUMA_W) * AV1G_GRAIN_LUMA_H);
   std::vector<signed char> cb_grain;
   std::vector<signed char> cr_grain;
