@@ -674,6 +674,54 @@ void test_inter() {
       worst2 = std::max(worst2, std::abs(static_cast<int>(dst2[y * stride + x]) -
                                          static_cast<int>(dst[y * stride + x])));
   CHECK(worst2 <= 1);
+
+  /* Two *different* references, each in its own pool slot, one prediction per
+   * slot: skip mode's only blend. The two halves are rounded once, together
+   * (Round2(pred0 + pred1, InterPostRound + 1)), so a flat 100 against a flat
+   * 200 is exactly 150 - not 150 +- 1, and not 100 or 200, which is what a
+   * slot that resolved to the wrong reference or a blend that dropped one half
+   * would give. */
+  {
+    std::vector<uint16_t> pool(static_cast<size_t>(stride) * 48 * 2, 0);
+    for (size_t i = 0; i < static_cast<size_t>(stride) * 48; ++i) {
+      pool[i] = 100;
+      pool[static_cast<size_t>(stride) * 48 + i] = 200;
+    }
+    Av1gInterJob blend;
+    std::memset(&blend, 0, sizeof(blend));
+    blend.w = 8;
+    blend.h = 8;
+    blend.dst_stride = stride;
+    blend.ref_x = 16;
+    blend.ref_y = 16;
+    blend.ref_w = 48;
+    blend.ref_h = 48;
+    blend.ref0_stride = stride;
+    blend.ref1_stride = stride;
+    /* the slot index is the backend's business: it rebases the offsets by
+     * slot * buffer_size before calling the kernel, so the second reference
+     * here starts one padded plane further in */
+    blend.ref0_slot = 0;
+    blend.ref1_slot = 1;
+    blend.ref1_off = static_cast<int>(static_cast<size_t>(stride) * 48);
+    blend.filt = AV1G_FILT_REGULAR;
+    blend.filt_v = AV1G_FILT_REGULAR;
+    blend.compound = AV1G_COMPOUND_AVG;
+    blend.w0 = 8;
+    blend.w1 = 8;
+    blend.bitdepth = 8;
+    std::vector<uint16_t> dst3(static_cast<size_t>(stride) * 48, 0);
+    av1g_inter_block(&blend, dst3.data(), dst3.data(), pool.data(), tables::filters().data(), 255);
+    int wrong = 0;
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x)
+        if (dst3[y * stride + x] != 150) ++wrong;
+    CHECK_EQ(wrong, 0);
+    /* the two slots are 100 and 200 apart: a blend that read one slot twice
+     * cannot land on 150 */
+    CHECK_EQ(pool[0], static_cast<uint16_t>(100));
+    CHECK_EQ(pool[static_cast<size_t>(stride) * 48], static_cast<uint16_t>(200));
+  }
 }
 
 /* Intra block copy (7.11.5). The block predicts from the frame it belongs to,

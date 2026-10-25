@@ -444,6 +444,44 @@ cannot see that, and the per-kernel check had used one; the frame level test wit
 a real edge and several groups does, and `opencl_selftest.py` now includes that
 case as well.
 
+## Skip mode
+
+Skip mode is the only inter tool with no mode syntax at all. `skip_mode_params`
+picks a *pair* of references out of the seven the frame already references - the
+nearest one in the past and the nearest one in the future, or, for a frame whose
+references all lie in the past, the two nearest past ones - and a block that sets
+the flag predicts from that pair at the top of the candidate stack, at the
+frame's vector precision, blended with the plain average. It codes no `is_inter`,
+no reference, no mode, no filter and no residual: the flag comes first, and
+everything else follows from it.
+
+Three things are easy to get wrong and each of them is silent:
+
+* **The pair is in *reference type* space, not slot space.**
+  `SkipModeFrame[0]` is `LAST_FRAME + Min(forwardIdx, backwardIdx)`, so it is a
+  frame type and its slot comes from `ref_frame_idx[]`. `tests/test_frontend.cpp`
+  checks both members of the pair against the header's own reference list, on
+  every inter frame of `inter_intra.ivf`, including the all-past fallback
+  (a frame whose second member is itself a forward reference).
+* **It is a compound block with the average blend, and the two halves have their
+  own references.** A blend that dropped one half, or read one slot twice, is a
+  pixel error no entropy check can see. `test_kernels` pins the arithmetic
+  directly: a flat 100 against a flat 200 in two different pool slots comes out
+  at exactly 150, once, at `InterPostRound + 1` - which also means the backend's
+  slot rebase is exercised, because without it both halves read slot 0 and the
+  result is 100.
+* **`has_subpel_filter` is false**, so no filter symbol is coded and the block
+  keeps the frame's filter - and it is still a *skipped* block, so it carries no
+  residual and its coefficient context is reset.
+
+The fixtures cover it densely: `inter_intra.ivf` codes 1033 skip-mode blocks,
+`lw_t2.ivf` 2220, `lw_t3.ivf` 2042 and `svt_av1_320x240.ivf` 43, and every frame
+of all four is bit exact against dav1d and through the OpenCL kernels. Replacing
+the stack entry the pair is taken from with the second one - a one character
+change - decodes to only 4 of 110 matching frames on `inter_intra.ivf` while the
+bitstream stays perfectly in sync, which is exactly the kind of error the hash
+tests exist for.
+
 ## Measured quality (synthetic clip, 640×360, CPU reference backend)
 
 PSNR of the decoded picture against the *clean source*, frames 1–11:

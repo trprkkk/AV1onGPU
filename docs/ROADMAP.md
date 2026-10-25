@@ -67,7 +67,7 @@ the first symbol of the fixture's key frame.
    reference types, motion vector, inter mode, motion mode and subpel filter.
    What is in place:
 
-   * the inter frame preamble: skip mode (read, then refused), skip, `cdef`,
+   * the inter frame preamble: skip mode, skip, `cdef`,
      the per superblock deltas, and either an intra block (whose y and uv modes
      use the inter frame's own tables) or `is_inter`, the reference tree,
      the dynamic reference list, the motion vector residual, inter/intra, the
@@ -109,9 +109,14 @@ the first symbol of the fixture's key frame.
      dav1d prints, and on the `gm6` fixture the saved grid of frame 1 (1191
      cells) and the projected grid of frame 2 (1041 cells) are cell for cell
      identical, block trace included.
-   * *Skip mode.* A skipped block takes both references and both motion vectors
-     from the pair of reference frames the frame header names; its context is
-     already tracked (`skip_mode_map_`).
+   * *Skip mode*, done: a skipped block takes both references and both motion
+     vectors from the pair of reference frames the frame header names, at the
+     frame's vector precision, with no mode symbols, no residual and the
+     average blend. The frame header derives the pair (`skip_mode_params`), the
+     block layer reads the flag with its own two neighbour context, and the
+     fixtures code it 1033 (`inter_intra`), 2220 (`lw_t2`), 2042 (`lw_t3`) and
+     43 (`svt_av1_320x240`) times - bit exact, which is what pins the pair, the
+     vector and the blend.
    * *Compound prediction.* The syntax (reference pair, `comp_group_idx`,
      `compound_idx`, wedge index and sign) plus the engine's masked blend; the
      kernels already implement the average and distance blends.
@@ -260,8 +265,7 @@ Both mistakes produce a difference of a few dozen samples per frame, which reads
 like a rounding difference in the blend itself; that is the trap this took a hunt
 to get out of.
 
-The inter path is now complete apart from skip mode, which is parsed and
-refused. Inter/intra compound came last: the intra half of a block is predicted
+The inter path is now complete. Inter/intra compound came last: the intra half of a block is predicted
 over the block's full size, from the reconstructed neighbours of the frame being
 decoded, and blended with the inter half at the taper (`II_V`, `II_H`,
 `II_SMOOTH`, flat `II_DC`) or the wedge mask of a `wedge_interintra` block, with
@@ -277,7 +281,9 @@ schedule has to wait for a rectangle of samples rather than for the neighbouring
 edges: the block's vector is clipped to the part of the tile that already exists
 (7.11.5), and the scheduler turns that rectangle into wave dependencies.
 
-What is left of the *whole* decoder is skip mode, which is parsed and refused.
+Of the tools AV1 defines, what is left is segmentation, superres and frame ids -
+all three refused by name rather than misparsed - plus a film grain synthesis
+filter (section 4). Every inter and intra prediction tool decodes bit exactly.
 
 ## 4. Spec-conformant film grain
 

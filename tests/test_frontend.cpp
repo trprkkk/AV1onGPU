@@ -841,6 +841,85 @@ void test_real_stream() {
 }
 
 
+/* Skip mode, from the header down (7.10.1 skip_mode_params and the
+ * SkipModeFrame pair). A frame that codes it names two references - one on each
+ * side of the frame in display order - and the pair is what a skipped block
+ * predicts from: both references, both vectors, no mode symbols and no
+ * residual. The pair is sorted, so index 0 is always one of the forward
+ * references (LAST..LAST3) and index 1 one of the backward ones
+ * (BWDREF..ALTREF).
+ *
+ * The block layer is checked by the `stream_*` tests: tests/data/inter_intra.ivf
+ * codes 1033 skip-mode blocks, lw_t2 2220, lw_t3 2042 and svt_av1_320x240 43,
+ * and every frame of all four is bit exact against dav1d - a skip-mode block
+ * that read a mode symbol, or took the wrong pair of references, would show up
+ * immediately. */
+void test_skip_mode_header() {
+  std::printf("skip mode (frame header)\n");
+  const std::string path = std::string(AV1GPU_TEST_DATA_DIR) + "/inter_intra.ivf";
+  std::vector<uint8_t> data;
+  std::FILE* file = std::fopen(path.c_str(), "rb");
+  CHECK(file != nullptr);
+  if (!file) return;
+  uint8_t chunk[16384];
+  size_t got = 0;
+  while ((got = std::fread(chunk, 1, sizeof(chunk), file)) > 0)
+    data.insert(data.end(), chunk, chunk + got);
+  std::fclose(file);
+
+  IvfReader reader;
+  std::string error;
+  CHECK(reader.open(data, &error));
+
+  SequenceHeader seq;
+  RefPool pool;
+  int present = 0, allowed = 0, frames = 0, both_past = 0;
+  IvfFrame frame;
+  while (reader.next(&frame, &error)) {
+    std::vector<Obu> obus;
+    CHECK(split_obus(frame.payload.data(), frame.payload.size(), &obus, &error));
+    for (const Obu& obu : obus) {
+      if (obu.type == ObuType::SequenceHeader) {
+        CHECK(parse_sequence_header(obu.data, obu.size, &seq, &error) == ParseStatus::Ok);
+      } else if (obu.type == ObuType::Frame || obu.type == ObuType::FrameHeader) {
+        FrameHeader h;
+        CHECK(parse_frame_header(seq, obu.data, obu.size, &h, &error, &pool) ==
+              ParseStatus::Ok);
+        if (!h.show_existing_frame) {
+          ++frames;
+          if (h.skip_mode_allowed) ++allowed;
+          if (h.skip_mode_present) {
+            ++present;
+            /* Two different references, sorted by reference type. Usually they
+             * straddle this frame - one forward, one backward - but a frame
+             * whose references all lie in the past pairs the two nearest ones
+             * instead (skip_mode_params), so both members being forward is
+             * legal and this fixture does code such frames. */
+            CHECK(h.skip_mode_frame[0] >= kRefLast);
+            CHECK(h.skip_mode_frame[1] <= kRefAltref);
+            CHECK(h.skip_mode_frame[0] < h.skip_mode_frame[1]);
+            /* and both name frames the header actually references */
+            CHECK(h.ref_frame_idx[h.skip_mode_frame[0] - 1] >= 0);
+            CHECK(h.ref_frame_idx[h.skip_mode_frame[1] - 1] >= 0);
+            if (h.skip_mode_frame[1] < kRefBwdref) ++both_past;
+          }
+        }
+        refresh_ref_pool(h, &pool);
+      }
+    }
+  }
+  CHECK(frames > 0);
+  /* skip mode is only allowed when the frame has a reference on each side, and
+   * the fixture's encoder switches it on for most of its inter frames - a
+   * regression that stopped allowing it would show up here */
+  CHECK(allowed > frames / 2);
+  CHECK(present > 0);
+  /* the fixture codes both kinds of pair, which is what makes it worth
+   * checking the fallback as well as the straddling case */
+  CHECK(both_past > 0);
+  CHECK(both_past < present);
+}
+
 /* The tile group is where the payload stops being plain bits. A single tile
  * that runs to the end of the payload is the common case; the group can also
  * carry a subset of the tiles, and the last tile of the group is never given a
@@ -1714,6 +1793,7 @@ int main() {
   test_tile_group();
   test_tile_decoder();
   test_intrabc_frame();
+  test_skip_mode_header();
   test_real_stream();
   return testing::finish("test_frontend");
 }
