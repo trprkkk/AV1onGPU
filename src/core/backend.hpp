@@ -70,6 +70,48 @@ struct PlanLayout {
  * chroma block can never leave the padded area either. */
 constexpr int kPlanePadding = 64;
 
+/* The host half of the film grain synthesis filter (7.18.3): the generated
+ * grain, the noise image cut from it, and the three scaling tables.
+ *
+ * The synthesis is only *partly* parallel: the auto-regressive filter and the
+ * block stitching are sequential, so they run on the host once per frame, and
+ * what reaches the kernels is the finished noise image plus the per sample
+ * blend. That keeps the GPU path a pure map over samples - and, because the
+ * host is the only place the sequential part lives, all three backends agree by
+ * construction. */
+struct GrainNoise {
+  /* The parameters the noise was built from, in the kernels' layout. */
+  Av1gGrainParams params;
+  /* The three noise images, back to back, one byte per sample: the plane
+   * offsets and row pitches the jobs index them with. */
+  std::vector<signed char> noise;
+  int noise_off[3] = {0, 0, 0};
+  int noise_stride[3] = {0, 0, 0};
+  /* ScalingLut[ plane ][ 8 bit sample value ], the curve each plane's noise is
+   * scaled by. */
+  int lut[AV1G_GRAIN_LUT_ENTRIES] = {0};
+  /* The range the blended result is clipped to: the restricted range when
+   * clip_to_restricted_range is set, the full range otherwise. */
+  int min_value = 0;
+  int max_luma = 255;
+  int max_chroma = 255;
+};
+
+/* Builds the grain and the noise image for a frame whose *display* size is
+ * `luma_w` x `luma_h` (superres included: the grain is added after the
+ * upscaling). A frame whose parameters give chroma no grain builds no chroma
+ * noise. */
+void build_grain(const FilmGrainParams& params, int bit_depth, int ss_x, int ss_y,
+                 bool identity_matrix, int luma_w, int luma_h, GrainNoise* out);
+
+/* Appends the grain jobs of one plane: `dst_off`/`dst_stride` address the plane
+ * the jobs write, `luma_off`/`luma_stride` the luma samples they read (from the
+ * same buffer; the CPU host path passes them relative to the luma plane). */
+void append_grain_jobs(const GrainNoise& grain, int plane, int plane_w, int plane_h, int dst_off,
+                       int dst_stride, int luma_off, int luma_stride, int luma_w, int ss_x,
+                       int ss_y, std::vector<Av1gGrainJob>* chroma,
+                       std::vector<Av1gGrainJob>* luma);
+
 /* Builds the plane layout the backends share: visible sample counts, padded
  * strides and plane offsets into one flat sample buffer. `stride_align` is the
  * row alignment the backend wants (32 for the CPU, 64 for the GPU ones).
@@ -126,13 +168,14 @@ struct FramePlan {
    * display width. Runs on the CDEF output and before the film grain, which is
    * why the grain jobs below are built on the display geometry. */
   std::vector<Av1gUpscaleJob> upscale;
-  std::vector<Av1gGrainJob> grain;
+  /* Film grain, in two passes: the chroma planes read the luma the picture had
+   * before any grain was added, so they run first, and the luma samples they
+   * blend against are the ones a later pass is about to change. */
+  std::vector<Av1gGrainJob> grain_chroma;
+  std::vector<Av1gGrainJob> grain_luma;
 
-  /* Film grain template (host generated, uploaded once per frame). */
-  std::vector<signed char> grain_template;
-  int grain_stride = 0;
-  int grain_h = 0;
-  int grain_lut[64] = {0};
+  /* The film grain noise image and scaling tables the jobs above index. */
+  GrainNoise grain_noise;
 };
 
 class Backend {
@@ -220,10 +263,6 @@ bool gm_setup_shear(const int32_t* params, int* alpha, int* beta, int* gamma, in
  * false for the shapes that carry no wedge. */
 bool wedge_entry(int block_w, int block_h, int wedge_index, int* dir, int* xoff, int* yoff,
                  int* flip);
-
-/* Generates the film grain template for a seed, as the AV1 spec's
- * pseudo random noise generator does. */
-void grain_template(int seed, int stride, int rows, std::vector<signed char>* out);
 
 /* Q16 colour matrix coefficients for (matrix, range). */
 void color_matrix(ColorMatrix matrix, ColorRange range, int bit_depth, int m[8],

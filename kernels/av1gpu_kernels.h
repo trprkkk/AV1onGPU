@@ -290,19 +290,33 @@ typedef struct {
 } Av1gCdefJob;
 
 /*
- * Film grain over a rectangular region.  `grain` is a signed pseudo-random
- * template of `grain_h` rows generated on the host, `lut` maps a luma range to
- * a Q6 gain.
+ * Film grain over a rectangular region.
+ *
+ * The synthesis filter of 7.18.3 has two halves. The *noise* half is
+ * sequential - an auto-regressive filter over a pseudo-random template, then
+ * square grain blocks stitched together with overlap blending - so the host
+ * builds the finished noise image (`noise`, signed, one byte per sample) and
+ * this struct describes how to add it to the picture. The *addition* half is
+ * per sample, and that is what the kernels do: a luma sample looks its own
+ * value up in the luma scaling table, while a chroma sample first merges the
+ * luma and chroma values into one index, which is how the chroma noise follows
+ * the luma structure of the picture.
  */
 typedef struct {
-  int dst_off, dst_stride;
-  int x, y, w, h;
+  int dst_off, dst_stride;   /* plane origin / row pitch in the frame       */
+  int noise_off, noise_stride;
+  int x, y, w, h;            /* region, in plane samples                    */
+  int plane;                 /* 0 luma, 1 Cb, 2 Cr                          */
+  int ss_x, ss_y;
   int bitdepth;
-  int grain_off;
-  int grain_stride;
-  int grain_h;
-  int lut_off;
-  int overlap; /* 0 none, 1 bottom edge only, 2 all edges               */
+  int scaling_shift;         /* grain_scaling_minus_8 + 8                   */
+  int num_y_points, num_cb_points, num_cr_points;
+  int chroma_scaling_from_luma;
+  int cb_mult, cb_luma_mult, cb_offset;
+  int cr_mult, cr_luma_mult, cr_offset;
+  int min_value, max_value;  /* clip_to_restricted_range bounds for the plane */
+  int luma_off, luma_stride; /* the luma plane, for the chroma merge        */
+  int luma_w;                /* luma width, which bounds lumaNextX          */
 } Av1gGrainJob;
 
 /* YUV -> RGB conversion of one rectangular region */
@@ -2436,38 +2450,371 @@ AV1G_FN void av1g_cdef_block(const Av1gCdefJob *job, AV1G_GLOBAL const av1g_px *
 /* film grain                                                         */
 /* ------------------------------------------------------------------ */
 
-AV1G_FN void av1g_grain_px(const Av1gGrainJob *job, AV1G_GLOBAL av1g_px *dst,
-                           AV1G_GLOBAL const signed char *grain,
-                           AV1G_GLOBAL const int *lut, int x, int y, int maxv) {
-  const int shift = job->bitdepth - 8;
-  const int idx = (job->y + y) % job->grain_h;
-  const int gx = (job->x + x) % job->grain_stride;
-  const int t = (int)grain[job->grain_off + idx * job->grain_stride + gx];
-  AV1G_GLOBAL av1g_px *p = dst + job->dst_off + y * job->dst_stride + x;
-  const int cur = (int)*p;
-  const int scale = lut[job->lut_off + av1g_clip((cur >> shift) >> 2, 0, 63)];
-  int g = av1g_rshift_rnd((long long)t * scale, 6);
-  /* fade the grain towards block borders to avoid visible seams */
-  if (job->overlap) {
-    const int ex = (x < (job->w - 1 - x)) ? x : (job->w - 1 - x);
-    const int ey = (job->overlap == 2)
-                       ? ((y < (job->h - 1 - y)) ? y : (job->h - 1 - y))
-                       : y;
-    if (ex < 2 || ey < 2) g = (g * 2 + 1) >> 2;
-  }
-  *p = (av1g_px)av1g_clip_px(cur + g, maxv);
+/* film_grain_params (5.9.30), the part the synthesis filter reads. The grain
+ * itself is generated on the host (the auto-regressive filter is sequential),
+ * the kernels only add the result to the picture. */
+#define AV1G_GRAIN_POINTS 16
+#define AV1G_GRAIN_POSITIONS 24          /* 2 * 3 * 4: the largest lag      */
+#define AV1G_GRAIN_CHROMA_POSITIONS 25   /* plus the luma coupling position */
+#define AV1G_GRAIN_LUMA_W 82
+#define AV1G_GRAIN_LUMA_H 73
+#define AV1G_GRAIN_LUT_ENTRIES 768 /* ScalingLut[3][256] */
+
+typedef struct {
+  int seed;
+  int bitdepth;
+  int num_y_points, num_cb_points, num_cr_points;
+  int chroma_scaling_from_luma;
+  int y_value[AV1G_GRAIN_POINTS], y_scaling[AV1G_GRAIN_POINTS];
+  int cb_value[AV1G_GRAIN_POINTS], cb_scaling[AV1G_GRAIN_POINTS];
+  int cr_value[AV1G_GRAIN_POINTS], cr_scaling[AV1G_GRAIN_POINTS];
+  int grain_scaling_minus_8;
+  int ar_coeff_lag;
+  int ar_coeffs_y[AV1G_GRAIN_POSITIONS];
+  int ar_coeffs_cb[AV1G_GRAIN_CHROMA_POSITIONS];
+  int ar_coeffs_cr[AV1G_GRAIN_CHROMA_POSITIONS];
+  int ar_coeff_shift_minus_6;
+  int grain_scale_shift;
+  int cb_mult, cb_luma_mult, cb_offset;
+  int cr_mult, cr_luma_mult, cr_offset;
+  int overlap_flag;
+  int clip_to_restricted_range;
+} Av1gGrainParams;
+
+/* GrainCenter, GrainMin and GrainMax (7.18.3.1): the range the generated grain
+ * lives in, centred on zero so that the auto-regressive filter stays symmetric.
+ */
+AV1G_FN int av1g_grain_center(int bitdepth) { return 128 << (bitdepth - 8); }
+AV1G_FN int av1g_grain_min(int bitdepth) { return -av1g_grain_center(bitdepth); }
+AV1G_FN int av1g_grain_max(int bitdepth) {
+  return (256 << (bitdepth - 8)) - 1 - av1g_grain_center(bitdepth);
+}
+
+/* Round2() (7.18.3): add half of the divisor and shift down. Unlike the
+ * Round2Signed the motion compensation predication uses, this rounds a
+ * negative value *up*, which the grain's signed noise relies on. */
+AV1G_FN int av1g_grain_round2(int v, int n) {
+  return n <= 0 ? v : (v + (1 << (n - 1))) >> n;
+}
+
+/* get_random_number( bits ) (7.18.3.2): a 16 bit shift register whose feedback
+ * bit is an xorshift of its own state, so a seed defines the whole sequence. */
+AV1G_FN int av1g_grain_random(unsigned int *state, int bits) {
+  unsigned int r = *state;
+  const unsigned int bit = ((r >> 0) ^ (r >> 1) ^ (r >> 3) ^ (r >> 12)) & 1u;
+  r = (r >> 1) | (bit << 15);
+  *state = r;
+  return (int)((r >> (16 - bits)) & ((1u << bits) - 1u));
 }
 
 #if !defined(AV1G_DEVICE)
-AV1G_HOST_FN void av1g_grain_block(const Av1gGrainJob *job, av1g_px *dst,
-                              const signed char *grain, const int *lut, int maxv) {
+
+/* The white noise the auto-regressive filter shapes: one Gaussian sample per
+ * position, scaled down into the grain range. `active` is num_y_points > 0 (or
+ * the chroma equivalent): a plane nothing will read is left at zero. */
+AV1G_HOST_FN void av1g_grain_fill_noise(unsigned int state, signed char *out, int w, int h,
+                                        int active, int shift) {
   int x, y;
-  for (y = 0; y < job->h; ++y)
-    for (x = 0; x < job->w; ++x) av1g_grain_px(job, dst, grain, lut, x, y, maxv);
+  for (y = 0; y < h; ++y) {
+    for (x = 0; x < w; ++x) {
+      const int g = active ? (int)av1g_tbl_gaussian_sequence[av1g_grain_random(&state, 11)] : 0;
+      out[y * w + x] = (signed char)av1g_grain_round2(g, shift);
+    }
+  }
 }
 
-#endif
-/* ------------------------------------------------------------------ */
+/* The auto-regressive filter (7.18.3.3): every interior sample is predicted
+ * from its already filtered neighbours to the left and above, which is why this
+ * half of the synthesis is inherently sequential. A chroma filter has one
+ * coefficient more than the luma one: at the centre position, where a luma
+ * filter has no term, it averages the *luma* grain over the samples the chroma
+ * sample covers, which is what correlates chroma grain with the picture. */
+AV1G_HOST_FN void av1g_grain_ar_filter(const Av1gGrainParams *params, signed char *plane, int w,
+                                       int h, const int *coeffs, const signed char *luma,
+                                       int ss_x, int ss_y) {
+  const int lag = params->ar_coeff_lag;
+  const int shift = params->ar_coeff_shift_minus_6 + 6;
+  const int gmin = av1g_grain_min(params->bitdepth);
+  const int gmax = av1g_grain_max(params->bitdepth);
+  int x, y;
+  for (y = 3; y < h; ++y) {
+    for (x = 3; x < w - 3; ++x) {
+      int sum = 0, pos = 0, delta_row, delta_col;
+      for (delta_row = -lag; delta_row <= 0; ++delta_row) {
+        for (delta_col = -lag; delta_col <= lag; ++delta_col) {
+          if (delta_row == 0 && delta_col == 0) {
+            if (luma && params->num_y_points > 0) {
+              const int luma_x = ((x - 3) << ss_x) + 3;
+              const int luma_y = ((y - 3) << ss_y) + 3;
+              int acc = 0, i, j;
+              for (i = 0; i <= ss_y; ++i) {
+                for (j = 0; j <= ss_x; ++j) {
+                  acc += (int)luma[(luma_y + i) * AV1G_GRAIN_LUMA_W + luma_x + j];
+                }
+              }
+              sum += av1g_grain_round2(acc, ss_x + ss_y) * coeffs[pos];
+            }
+            break;
+          }
+          sum += (int)plane[(y + delta_row) * w + (x + delta_col)] * coeffs[pos];
+          ++pos;
+        }
+      }
+      plane[y * w + x] = (signed char)av1g_clip(
+          gmin, gmax, (int)plane[y * w + x] + av1g_grain_round2(sum, shift));
+    }
+  }
+}
+
+/* generate_grain_process (7.18.3.3). LumaGrain is 82x73; the chroma planes are
+ * chroma_w x chroma_h (44x38 at 4:2:0) and their filter reads the *filtered*
+ * luma grain, so the luma pass runs first. */
+AV1G_HOST_FN void av1g_grain_generate(const Av1gGrainParams *params, signed char *luma,
+                                      signed char *cb, signed char *cr, int chroma_w, int chroma_h,
+                                      int ss_x, int ss_y) {
+  const int shift = 12 - params->bitdepth + params->grain_scale_shift;
+  const int seed = params->seed;
+  if (luma) {
+    av1g_grain_fill_noise((unsigned int)seed, luma, AV1G_GRAIN_LUMA_W, AV1G_GRAIN_LUMA_H,
+                          params->num_y_points > 0, shift);
+    if (params->num_y_points > 0) {
+      av1g_grain_ar_filter(params, luma, AV1G_GRAIN_LUMA_W, AV1G_GRAIN_LUMA_H, params->ar_coeffs_y,
+                           0, ss_x, ss_y);
+    }
+  }
+  if (cb) {
+    av1g_grain_fill_noise((unsigned int)seed ^ 0xb524u, cb, chroma_w, chroma_h,
+                          params->num_cb_points > 0 || params->chroma_scaling_from_luma, shift);
+  }
+  if (cr) {
+    av1g_grain_fill_noise((unsigned int)seed ^ 0x49d8u, cr, chroma_w, chroma_h,
+                          params->num_cr_points > 0 || params->chroma_scaling_from_luma, shift);
+  }
+  if (cb && cr && (params->chroma_scaling_from_luma || params->num_cb_points > 0 ||
+                   params->num_cr_points > 0)) {
+    av1g_grain_ar_filter(params, cb, chroma_w, chroma_h, params->ar_coeffs_cb, luma, ss_x, ss_y);
+    av1g_grain_ar_filter(params, cr, chroma_w, chroma_h, params->ar_coeffs_cr, luma, ss_x, ss_y);
+  }
+}
+
+/* scaling_lookup_initialization (7.18.3.4): a piecewise linear curve through the
+ * coded points, expanded to 256 entries for 8 bit input. */
+AV1G_HOST_FN void av1g_grain_scaling_lut(const Av1gGrainParams *params, int plane, int *lut) {
+  const int *value;
+  const int *scaling;
+  int num_points, i, x;
+  if (plane == 0 || params->chroma_scaling_from_luma) {
+    num_points = params->num_y_points;
+    value = params->y_value;
+    scaling = params->y_scaling;
+  } else if (plane == 1) {
+    num_points = params->num_cb_points;
+    value = params->cb_value;
+    scaling = params->cb_scaling;
+  } else {
+    num_points = params->num_cr_points;
+    value = params->cr_value;
+    scaling = params->cr_scaling;
+  }
+  if (num_points <= 0) {
+    for (x = 0; x < 256; ++x) lut[x] = 0;
+    return;
+  }
+  for (x = 0; x < value[0]; ++x) lut[x] = scaling[0];
+  for (i = 0; i + 1 < num_points; ++i) {
+    const int delta_y = scaling[i + 1] - scaling[i];
+    const int delta_x = value[i + 1] - value[i];
+    const int delta = delta_y * ((65536 + (delta_x >> 1)) / delta_x);
+    for (x = 0; x < delta_x; ++x) {
+      lut[value[i] + x] = scaling[i] + ((x * delta + 32768) >> 16);
+    }
+  }
+  for (x = value[num_points - 1]; x < 256; ++x) lut[x] = scaling[num_points - 1];
+}
+
+/* ---- the noise image ---------------------------------------------------- */
+/*
+ * add_noise_synthesis (7.18.3.5), the half that has to run in order: square
+ * grain blocks are cut out of the generated grain at a random offset per block
+ * and stitched into 32 sample high stripes, whose neighbours are blended with
+ * them; the stripes then blend vertically into the noise image. The blending
+ * weights (27/17 horizontally and vertically for luma, 23/22 for chroma) keep
+ * the noise continuous across block borders.
+ *
+ * Only one plane is produced per call. `stripe_rows` is 34 (17 at 4:2:0).
+ */
+#define AV1G_GRAIN_STRIPE_ROWS 34
+#define AV1G_GRAIN_STRIPE_ROWS_CHROMA 17
+
+AV1G_HOST_FN size_t av1g_grain_scratch_size(int width, int height, int ss_x, int ss_y, int plane) {
+  const int sub_x = plane ? ss_x : 0;
+  const int sub_y = plane ? ss_y : 0;
+  const int pw = (width + sub_x) >> sub_x;
+  const int ph = (height + sub_y) >> sub_y;
+  const int step = 32 >> sub_y;
+  const int n_stripes = (ph + step - 1) / step;
+  /* A stripe is one block wider than the plane: a block written at the right
+   * edge runs past the end, and the specification allows those extra samples
+   * because nothing reads them. */
+  const size_t stripe_w = (size_t)pw + 34;
+  return (size_t)n_stripes * (34 >> sub_y) * stripe_w;
+}
+
+AV1G_HOST_FN void av1g_grain_noise_plane(const Av1gGrainParams *params, const signed char *grain,
+                                         int plane, int width, int height, int ss_x, int ss_y,
+                                         signed char *out, signed char *scratch) {
+  const int sub_x = plane ? ss_x : 0;
+  const int sub_y = plane ? ss_y : 0;
+  const int pw = (width + sub_x) >> sub_x;
+  const int ph = (height + sub_y) >> sub_y;
+  const int stripe_rows = 34 >> sub_y;
+  const size_t stripe_w = (size_t)pw + 34;
+  const int step = 32 >> sub_y;
+  const int n_stripes = (ph + step - 1) / step;
+  const int gmin = av1g_grain_min(params->bitdepth);
+  const int gmax = av1g_grain_max(params->bitdepth);
+  const int src_w = plane == 0 ? AV1G_GRAIN_LUMA_W : (AV1G_GRAIN_LUMA_W >> ss_x);
+  const int overlap = params->overlap_flag;
+  int s, x, y, i, j;
+
+  /* ---- horizontal: cut grain blocks out of the grain, blend them in place -- */
+  for (s = 0; s < n_stripes; ++s) {
+    signed char *stripe = scratch + (size_t)s * stripe_rows * stripe_w;
+    unsigned int state = (unsigned int)params->seed;
+    state ^= (unsigned int)(((s * 37 + 178) & 255) << 8);
+    state ^= (unsigned int)((s * 173 + 105) & 255);
+    /* The step is counted in luma samples for both planes. */
+    for (x = 0; x < (width + 1) / 2; x += 16) {
+      const int r = av1g_grain_random(&state, 8);
+      const int offset_x = r >> 4;
+      const int offset_y = r & 15;
+      const int src_x = sub_x ? 6 + offset_x : 9 + offset_x * 2;
+      const int src_y = sub_y ? 6 + offset_y : 9 + offset_y * 2;
+      for (i = 0; i < stripe_rows; ++i) {
+        for (j = 0; j < (34 >> sub_x); ++j) {
+          int g = (int)grain[(src_y + i) * src_w + src_x + j];
+          const int col = sub_x ? x + j : x * 2 + j;
+          if (sub_x == 0) {
+            if (j < 2 && overlap && x > 0) {
+              const int old = (int)stripe[i * stripe_w + col];
+              g = av1g_grain_round2(j == 0 ? old * 27 + g * 17 : old * 17 + g * 27, 5);
+              g = av1g_clip(gmin, gmax, g);
+            }
+          } else if (j == 0 && overlap && x > 0) {
+            const int old = (int)stripe[i * stripe_w + col];
+            g = av1g_grain_round2(old * 23 + g * 22, 5);
+            g = av1g_clip(gmin, gmax, g);
+          }
+          stripe[i * stripe_w + col] = (signed char)g;
+        }
+      }
+    }
+  }
+
+  /* ---- vertical: blend each stripe with the bottom of the one above -------- */
+  for (y = 0; y < ph; ++y) {
+    const int stripe_index = y >> (5 - sub_y);
+    const int row = y - (stripe_index << (5 - sub_y));
+    for (x = 0; x < pw; ++x) {
+      int g = (int)scratch[((size_t)stripe_index * stripe_rows + row) * stripe_w + x];
+      if (sub_y == 0) {
+        if (row < 2 && stripe_index > 0 && overlap) {
+          const int old =
+              (int)scratch[((size_t)(stripe_index - 1) * stripe_rows + row + 32) * stripe_w + x];
+          g = av1g_grain_round2(row == 0 ? old * 27 + g * 17 : old * 17 + g * 27, 5);
+          g = av1g_clip(gmin, gmax, g);
+        }
+      } else if (row < 1 && stripe_index > 0 && overlap) {
+        const int old =
+            (int)scratch[((size_t)(stripe_index - 1) * stripe_rows + row + 16) * stripe_w + x];
+        g = av1g_grain_round2(old * 23 + g * 22, 5);
+        g = av1g_clip(gmin, gmax, g);
+      }
+      out[y * pw + x] = (signed char)g;
+    }
+  }
+}
+
+#endif /* !AV1G_DEVICE */
+
+/* scale_lut( plane, index ) (7.18.3.5): the table holds one value per 8 bit
+ * step, so a higher bit depth interpolates between two neighbouring entries. */
+AV1G_FN int av1g_grain_scale_lut(AV1G_GLOBAL const int *lut, int index, int bitdepth) {
+  const int shift = bitdepth - 8;
+  const int x = shift > 0 ? (index >> shift) : index;
+  if (bitdepth == 8 || x >= 255) return lut[x > 255 ? 255 : x];
+  const int rem = index - (x << shift);
+  const int start = lut[x];
+  const int end = lut[x + 1];
+  return start + av1g_grain_round2((end - start) * rem, shift);
+}
+
+/* One sample of the blend: the noise image sample scaled by the plane's curve at
+ * this sample's value (luma) or at the merged luma/chroma value (chroma), added
+ * and clipped to the frame's range. */
+AV1G_FN void av1g_grain_px(const Av1gGrainJob *job, AV1G_GLOBAL av1g_px *dst,
+                           AV1G_GLOBAL const av1g_px *luma,
+                           AV1G_GLOBAL const signed char *noise, AV1G_GLOBAL const int *lut,
+                           int x, int y, int maxv) {
+  const int bitdepth = job->bitdepth;
+  const int shift = bitdepth - 8;
+  const int gy = job->y + y;
+  const int gx = job->x + x;
+  AV1G_GLOBAL av1g_px *p = dst + job->dst_off + y * job->dst_stride + x;
+  const int n = (int)noise[job->noise_off + gy * job->noise_stride + gx];
+  const int orig = (int)*p;
+  int g, index, lut_off, mult = 0, luma_mult = 0, offset = 0;
+  if (job->plane == 0) {
+    if (job->num_y_points <= 0) return;
+    lut_off = 0;
+    index = orig;
+  } else {
+    if (job->plane == 1) {
+      if (job->num_cb_points <= 0 && !job->chroma_scaling_from_luma) return;
+      lut_off = 256;
+      mult = job->cb_mult;
+      luma_mult = job->cb_luma_mult;
+      offset = job->cb_offset;
+    } else {
+      if (job->num_cr_points <= 0 && !job->chroma_scaling_from_luma) return;
+      lut_off = 512;
+      mult = job->cr_mult;
+      luma_mult = job->cr_luma_mult;
+      offset = job->cr_offset;
+    }
+    /* averageLuma: the luma samples this chroma sample covers, rounded once.
+     * This is the luma of the picture *before* any grain - which is why the
+     * chroma planes are blended first (see the job order in the plan). */
+    const int luma_y = gy << job->ss_y;
+    const int luma_x = gx << job->ss_x;
+    const int next_x = luma_x + 1 < job->luma_w ? luma_x + 1 : job->luma_w - 1;
+    const int l0 = (int)luma[job->luma_off + luma_y * job->luma_stride + luma_x];
+    int average = l0;
+    if (job->ss_x) {
+      const int l1 = (int)luma[job->luma_off + luma_y * job->luma_stride + next_x];
+      average = av1g_grain_round2(l0 + l1, 1);
+    }
+    if (job->chroma_scaling_from_luma) {
+      index = average;
+    } else {
+      const int combined = average * (luma_mult - 128) + orig * (mult - 128);
+      index = av1g_clip_px((combined >> 6) + ((offset - 256) << shift), maxv);
+    }
+  }
+  g = av1g_grain_round2(av1g_grain_scale_lut(lut + lut_off, index, bitdepth) * n,
+                        job->scaling_shift);
+  *p = (av1g_px)av1g_clip(orig + g, job->min_value, job->max_value);
+}
+
+#if !defined(AV1G_DEVICE)
+AV1G_HOST_FN void av1g_grain_block(const Av1gGrainJob *job, av1g_px *dst, const av1g_px *luma,
+                                   const signed char *noise, const int *lut, int maxv) {
+  int x, y;
+  for (y = 0; y < job->h; ++y)
+    for (x = 0; x < job->w; ++x) av1g_grain_px(job, dst, luma, noise, lut, x, y, maxv);
+}
+#endif /* !AV1G_DEVICE */
+
 /* YUV -> RGB                                                         */
 /* ------------------------------------------------------------------ */
 

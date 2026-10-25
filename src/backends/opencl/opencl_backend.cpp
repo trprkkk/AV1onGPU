@@ -413,30 +413,38 @@ class OpenCLBackend final : public Backend {
     }
 
     /* ---- film grain -------------------------------------------------------- */
-    if (!plan.grain.empty()) {
-      ensure(&grain_, &grain_cap_, plan.grain_template.size());
-      api_.EnqueueWriteBuffer(queue_, grain_, opencl::CL_TRUE, 0,
-                              plan.grain_template.size(), plan.grain_template.data(), 0,
-                              nullptr, nullptr);
-      ensure(&lut_, &lut_cap_, sizeof(plan.grain_lut));
-      api_.EnqueueWriteBuffer(queue_, lut_, opencl::CL_TRUE, 0, sizeof(plan.grain_lut),
-                              plan.grain_lut, 0, nullptr, nullptr);
-      int total = 0;
-      cl_mem job_mem = 0, pref_mem = 0;
-      if (!upload_jobs(plan.grain, &job_mem, &pref_mem, &total,
-                       [](const Av1gGrainJob& j) { return j.w * j.h; }))
-        return fail(error, "grain job upload failed");
-      cl_kernel k = kernel("av1g_k_grain");
-      set_mem(k, 0, job_mem);
-      set_mem(k, 1, pref_mem);
-      set_int(k, 2, static_cast<int>(plan.grain.size()));
-      set_int(k, 3, total);
-      set_mem(k, 4, frame_);
-      set_mem(k, 5, grain_);
-      set_mem(k, 6, lut_);
-      set_int(k, 7, maxv);
-      if (!enqueue(k, total, 64)) return fail(error, "av1g_k_grain failed");
-      ++launches;
+    if (!plan.grain_chroma.empty() || !plan.grain_luma.empty()) {
+      /* The noise image is built on the host (the sequential half of the
+       * synthesis) and uploaded once; the two passes below only launch. */
+      const size_t noise_size = plan.grain_noise.noise.size();
+      ensure(&grain_, &grain_cap_, noise_size);
+      api_.EnqueueWriteBuffer(queue_, grain_, opencl::CL_TRUE, 0, noise_size,
+                              plan.grain_noise.noise.data(), 0, nullptr, nullptr);
+      ensure(&lut_, &lut_cap_, sizeof(plan.grain_noise.lut));
+      api_.EnqueueWriteBuffer(queue_, lut_, opencl::CL_TRUE, 0, sizeof(plan.grain_noise.lut),
+                              plan.grain_noise.lut, 0, nullptr, nullptr);
+      /* chroma first: its noise is scaled by the luma of the picture before any
+       * grain was added, so the luma pass has to come after it */
+      for (const std::vector<Av1gGrainJob>* pass : {&plan.grain_chroma, &plan.grain_luma}) {
+        if (pass->empty()) continue;
+        int total = 0;
+        cl_mem job_mem = 0, pref_mem = 0;
+        if (!upload_jobs(*pass, &job_mem, &pref_mem, &total,
+                         [](const Av1gGrainJob& j) { return j.w * j.h; }))
+          return fail(error, "grain job upload failed");
+        cl_kernel k = kernel("av1g_k_grain");
+        set_mem(k, 0, job_mem);
+        set_mem(k, 1, pref_mem);
+        set_int(k, 2, static_cast<int>(pass->size()));
+        set_int(k, 3, total);
+        set_mem(k, 4, frame_);
+        set_mem(k, 5, frame_);
+        set_mem(k, 6, grain_);
+        set_mem(k, 7, lut_);
+        set_int(k, 8, maxv);
+        if (!enqueue(k, total, 64)) return fail(error, "av1g_k_grain failed");
+        ++launches;
+      }
     }
 
     if (api_.Finish(queue_) != opencl::CL_SUCCESS) return fail(error, "clFinish failed");

@@ -24,18 +24,25 @@
  *     int64 buffer_size
  *     int64 tmp_size
  *     int32 ref_slot[2]
- *     int32 grain_stride, grain_h
- *     int32 grain_lut[64]
- *     int32 coef_count, residual_count, grain_template_count, palette_count
+ *     int32 noise_off[3], noise_stride[3]   (the film grain noise image)
+ *     int32 grain_lut[768]                  (ScalingLut[3][256])
+ *     int32 coef_count, residual_count, noise_count, palette_count
  *     int32 nwaves
  *     for each wave: int32 n_intra, n_inter, n_itx, n_residual, then the arrays
  *     int32 n_deblock_v, n_deblock_h
  *     then the deblock arrays
  *     int32 n_cdef, then the cdef array
  *     int32 n_upscale, then the upscale array
- *     int32 n_grain, then the grain array
- *     coefficients[], residual[], grain_template[]
+ *     int32 n_grain_chroma, then that array   (the chroma planes' jobs)
+ *     int32 n_grain_luma, then that array     (the luma plane's jobs)
+ *     coefficients[], residual[], noise[], then the palette map
  *     palette_map[]           (palette_count bytes)
+ *
+ * Version 5 replaced the film grain noise template with the finished noise
+ * image (`noise[]`, indexed per plane by noise_off/noise_stride) and the 256
+ * entry scaling tables per plane, and split the grain jobs into two passes:
+ * the chroma planes blend against the luma of the picture *before* any grain,
+ * so they must run before the luma jobs.
  *
  * Version 2 added the palette colour map. It is a byte per sample, one map per
  * plane per palette coded block, concatenated at the offsets the intra jobs
@@ -153,7 +160,7 @@ int main(int argc, char** argv) {
          the CPU reference and the plan both stop after the waves. */
       syntax.deblock.clear();
       syntax.cdef.clear();
-      syntax.apply_grain = false;
+      syntax.grain.apply = false;
     }
     if (slot >= 0) {
       syntax.reference_slots.clear();

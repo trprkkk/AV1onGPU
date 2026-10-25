@@ -974,31 +974,84 @@ void test_filters() {
         if (dst[(8 + y) * stride + 8 + x] != 90) flat = false;
     CHECK(flat);
   }
-  /* film grain with a zero gain leaves the frame alone */
+  /* film grain: the blend scales the noise image sample by the plane's curve at
+   * that sample's value, adds it and clips to the frame's range */
   {
-    std::vector<uint16_t> dst(static_cast<size_t>(stride) * size, 77);
-    std::vector<signed char> grain(64 * 64, 40);
-    int lut[64] = {0};
+    const int w = 32;
+    std::vector<uint16_t> dst(static_cast<size_t>(w) * w, 77);
+    std::vector<signed char> noise(64 * 64, 40);
+    int lut[AV1G_GRAIN_LUT_ENTRIES] = {0};
     Av1gGrainJob job;
     std::memset(&job, 0, sizeof(job));
-    job.dst_off = 4 * stride + 4;
-    job.dst_stride = stride;
+    job.dst_off = 4 * w + 4;
+    job.dst_stride = w;
+    job.noise_stride = 64;
     job.w = 8;
     job.h = 8;
-    job.grain_stride = 64;
-    job.grain_h = 64;
+    job.plane = 0;
     job.bitdepth = 8;
-    av1g_grain_block(&job, dst.data(), grain.data(), lut, 255);
+    job.scaling_shift = 8;
+    job.num_y_points = 2;
+    job.min_value = 16;
+    job.max_value = 235;
+    job.luma_w = 8;
+
+    /* a curve of zero is no gain at all */
+    av1g_grain_block(&job, dst.data(), dst.data(), noise.data(), lut, 255);
     bool same = true;
     for (int y = 0; y < 8; ++y)
       for (int x = 0; x < 8; ++x)
-        if (dst[(4 + y) * stride + 4 + x] != 77) same = false;
+        if (dst[static_cast<size_t>((4 + y) * w + 4 + x)] != 77) same = false;
     CHECK(same);
 
-    /* and with a non zero gain it changes the samples without clipping */
-    for (int i = 0; i < 64; ++i) lut[i] = 32;
-    av1g_grain_block(&job, dst.data(), grain.data(), lut, 255);
-    CHECK(dst[4 * stride + 4] != 77);
+    /* a curve of 256 is a gain of one, so the noise is added as it stands */
+    for (int i = 0; i < AV1G_GRAIN_LUT_ENTRIES; ++i) lut[i] = 256;
+    av1g_grain_block(&job, dst.data(), dst.data(), noise.data(), lut, 255);
+    CHECK(dst[static_cast<size_t>(4 * w + 4)] == 117);
+
+    /* and a sample past the plane's maximum is clipped, not wrapped */
+    std::fill(dst.begin(), dst.end(), static_cast<uint16_t>(220));
+    av1g_grain_block(&job, dst.data(), dst.data(), noise.data(), lut, 255);
+    CHECK(dst[static_cast<size_t>(4 * w + 4)] == 235);
+  }
+
+  /* chroma grain from luma: with chroma_scaling_from_luma the curve is indexed
+   * by the average of the luma samples the chroma sample covers */
+  {
+    const int w = 32;
+    std::vector<uint16_t> buf(static_cast<size_t>(w) * w, 0);
+    /* two rows of luma, then the chroma rows below them */
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 16; ++x) buf[static_cast<size_t>(y * w + x)] = 128;
+    const int chroma_off = 8 * w;
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) buf[static_cast<size_t>(chroma_off + y * w + x)] = 100;
+    std::vector<signed char> noise(64 * 64, 40);
+    /* one table per plane, each indexed by an 8 bit sample value */
+    int lut[AV1G_GRAIN_LUT_ENTRIES];
+    for (int i = 0; i < AV1G_GRAIN_LUT_ENTRIES; ++i) lut[i] = i % 256;
+    Av1gGrainJob job;
+    std::memset(&job, 0, sizeof(job));
+    job.dst_off = chroma_off;
+    job.dst_stride = w;
+    job.noise_stride = 64;
+    job.w = 8;
+    job.h = 8;
+    job.plane = 1;
+    job.ss_x = 1;
+    job.ss_y = 1;
+    job.bitdepth = 8;
+    job.scaling_shift = 8;
+    job.num_y_points = 2;
+    job.chroma_scaling_from_luma = 1;
+    job.max_value = 255;
+    job.luma_off = 0;
+    job.luma_stride = w;
+    job.luma_w = 16;
+    av1g_grain_block(&job, buf.data(), buf.data(), noise.data(), lut, 255);
+    /* averageLuma = 128, so the curve gives 128 and the noise (40) becomes
+     * Round2(128 * 40, 8) = 20 */
+    CHECK(buf[static_cast<size_t>(chroma_off)] == 120);
   }
 }
 

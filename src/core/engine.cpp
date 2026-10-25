@@ -666,37 +666,19 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     }
 
     /* ---- film grain -------------------------------------------------------- */
-    if (syntax.apply_grain && syntax.grain.template_size > 0) {
-      plan->grain_stride = std::max(64, syntax.grain.template_size);
-      plan->grain_h = std::max(64, syntax.grain.template_size);
-      tables::grain_template(syntax.grain.seed, plan->grain_stride, plan->grain_h,
-                             &plan->grain_template);
-      for (int i = 0; i < 32; ++i) {
-        plan->grain_lut[i] = syntax.grain.lut[i];
-        plan->grain_lut[32 + i] = syntax.grain.lut[i];
-      }
-      const int tile = 128;
+    /* film grain is added to the *output* picture, i.e. after the upscaling, so
+     * the noise is cut for the display size. The sequential half of the
+     * synthesis happens here, on the host (see src/core/grain.cpp); the plan
+     * carries the finished noise image. */
+    if (syntax.grain.apply) {
+      const bool identity = syntax.color.matrix == ColorMatrix::Identity;
+      build_grain(syntax.grain, geom.bit_depth, geom.ss_x, geom.ss_y, identity, g.out_w[0],
+                  g.out_h[0], &plan->grain_noise);
       for (int plane = 0; plane < 3; ++plane) {
-        /* film grain is added to the *output* frame, i.e. after the upscaling */
-        const int pw = g.out_w[plane];
-        const int ph = g.out_h[plane];
-        for (int y = 0; y < ph; y += tile) {
-          for (int x = 0; x < pw; x += tile) {
-            Av1gGrainJob job;
-            std::memset(&job, 0, sizeof(job));
-            job.dst_off = at(plane, x, y);
-            job.dst_stride = g.stride[plane];
-            job.x = x;
-            job.y = y;
-            job.w = std::min(tile, pw - x);
-            job.h = std::min(tile, ph - y);
-            job.bitdepth = geom.bit_depth;
-            job.grain_stride = plan->grain_stride;
-            job.grain_h = plan->grain_h;
-            job.overlap = syntax.grain.overlap;
-            plan->grain.push_back(job);
-          }
-        }
+        append_grain_jobs(plan->grain_noise, plane, g.out_w[plane], g.out_h[plane],
+                          g.plane_off[plane], g.stride[plane], /*luma_off=*/g.plane_off[0],
+                          g.stride[0], g.out_w[0], geom.ss_x, geom.ss_y, &plan->grain_chroma,
+                          &plan->grain_luma);
       }
     }
 

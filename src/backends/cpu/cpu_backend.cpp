@@ -154,9 +154,10 @@ class CpuBackend final : public Backend {
       }
       std::fprintf(stderr,
                    "PLAN waves=%zu intra=%zu itx=%zu residual=%zu inter=%zu deblock=%zu/%zu "
-                   "cdef=%zu grain=%zu\n",
+                   "cdef=%zu upscale=%zu grain=%zu/%zu\n",
                    plan.waves.size(), ni, nt, nr, nx, plan.deblock_v.size(),
-                   plan.deblock_h.size(), plan.cdef.size(), plan.grain.size());
+                   plan.deblock_h.size(), plan.cdef.size(), plan.upscale.size(),
+                   plan.grain_chroma.size(), plan.grain_luma.size());
     }
 
     /* ---- prediction, transform, residual --------------------------------- */
@@ -353,13 +354,24 @@ class CpuBackend final : public Backend {
     }
 
     {
-      const int n = static_cast<int>(plan.grain.size());
+      const int n = static_cast<int>(plan.grain_chroma.size());
 #if defined(AV1GPU_HAVE_OPENMP)
 #pragma omp parallel for schedule(dynamic, 8)
 #endif
-      for (int i = 0; i < n; ++i)
-        av1g_grain_block(&plan.grain[static_cast<size_t>(i)], frame,
-                         plan.grain_template.data(), plan.grain_lut, maxv);
+      for (int i = 0; i < n; ++i) {
+        const Av1gGrainJob& job = plan.grain_chroma[static_cast<size_t>(i)];
+        av1g_grain_block(&job, frame, frame, plan.grain_noise.noise.data(), plan.grain_noise.lut,
+                         maxv);
+      }
+      const int nl = static_cast<int>(plan.grain_luma.size());
+#if defined(AV1GPU_HAVE_OPENMP)
+#pragma omp parallel for schedule(dynamic, 8)
+#endif
+      for (int i = 0; i < nl; ++i) {
+        const Av1gGrainJob& job = plan.grain_luma[static_cast<size_t>(i)];
+        av1g_grain_block(&job, frame, frame, plan.grain_noise.noise.data(), plan.grain_noise.lut,
+                         maxv);
+      }
     }
 
     if (std::getenv("AV1GPU_MCDUMP")) {

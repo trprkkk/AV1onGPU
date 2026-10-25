@@ -12,20 +12,22 @@
  *   - KEY, INTRA_ONLY, INTER and SWITCH frame headers, complete up to the tile
  *     data, plus show_existing_frame,
  *   - tile layout, quantiser, segmentation, delta Q / delta LF, deblocking,
- *     CDEF, transform set, reference and skip mode, global motion, film grain
- *     presence.
+ *     CDEF, superres, transform set, reference and skip mode, global motion,
+ *     and the complete film grain parameters (including the ones a frame
+ *     inherits from a reference).
  *
  * Reference frames: inter frame sizes and skip mode depend on the frames a
  * stream has decoded before, so `parse_frame_header` takes the `RefPool` the
  * caller maintains and `refresh_ref_pool()` applies each frame's refresh flags.
  *
  * Deliberately rejected with a clear message (never silently misparsed)
- *   - superres, restoration filters and film grain *data*.
+ *   - the restoration filter parameters (the decoder does not implement the
+ *     loop restoration process at all).
  *
- * The field order and the derived values follow the AV1 specification; where a
- * value is derived from a reference frame (loop filter deltas, segmentation
- * data, film grain of a non-updating frame) the parser says so instead of
- * guessing.
+ * The field order and the derived values follow the AV1 specification, and a
+ * value derived from a reference frame (loop filter deltas, segmentation data,
+ * film grain parameters, the frame size) is taken from the slot the header
+ * names, so the caller must keep the pool up to date with `refresh_ref_pool()`.
  */
 #ifndef AV1GPU_FRONTEND_HEADERS_HPP
 #define AV1GPU_FRONTEND_HEADERS_HPP
@@ -36,6 +38,7 @@
 #include <string>
 #include <vector>
 
+#include "av1gpu/av1gpu.hpp"
 #include "frontend/cdf.hpp"
 
 namespace av1gpu {
@@ -325,6 +328,10 @@ struct RefSlot {
   /* The frame's global motion model per reference type, which the next frame
    * reads to decode its own model differentially. */
   GlobalMotion global_motion[8];
+  /* The film grain parameters this picture was decoded (or re-stated) with: a
+   * later frame whose update_grain is 0 names this slot and takes them from
+   * here, keeping only its own seed (5.9.30). */
+  FilmGrainParams grain;
   /* The order hints of the seven frames *this* frame referenced. Projecting a
    * stored vector needs both ends of its trajectory, so the next frame reads
    * them together with the grid itself. */
@@ -351,6 +358,10 @@ struct RefSlot {
 struct RefPool {
   RefSlot slots[8];
 };
+
+/* film_grain_params() (5.9.30) is a public type: the engine needs all of it,
+ * so the parser fills the same struct a caller can hand to a decoder. */
+using FilmGrainParams = ::av1gpu::FilmGrainParams;
 
 struct FrameHeader {
   bool show_existing_frame = false;
@@ -448,8 +459,9 @@ struct FrameHeader {
   bool tx_mode_select = false;
   bool reduced_tx_set = false;
 
-  bool film_grain_present = false;
-  int film_grain_seed = 0;
+  /* film grain: `grain.apply` is the syntax's apply_grain, and the parameters
+   * are either coded here or inherited from a reference (update_grain == 0). */
+  FilmGrainParams grain;
 
   /* Byte offset into the OBU payload where the tile data starts. */
   size_t tile_data_offset = 0;

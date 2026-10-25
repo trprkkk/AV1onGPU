@@ -118,13 +118,17 @@ extern "C" __global__ void av1g_k_upscale(const Av1gUpscaleJob *jobs,
                   elem / job.upscaled_w, maxv);
 }
 
+/* Film grain: one thread per sample. `luma` is the same picture (the chroma
+ * blend reads the luma samples before any grain was added, which is why the
+ * chroma jobs are launched first). */
 extern "C" __global__ void av1g_k_grain(const Av1gGrainJob *jobs,
                                         const int *joff, int njobs, int total,
-                                        av1g_px *dst, const signed char *grain,
+                                        av1g_px *dst, const av1g_px *luma,
+                                        const signed char *noise,
                                         const int *lut, int maxv) {
   AV1G_JOB_LOOKUP(job_idx, elem);
   Av1gGrainJob job = jobs[job_idx];
-  av1g_grain_px(&job, dst, grain, lut, elem % job.w, elem / job.w, maxv);
+  av1g_grain_px(&job, dst, luma, noise, lut, elem % job.w, elem / job.w, maxv);
 }
 
 extern "C" __global__ void av1g_k_color(const Av1gColorJob *jobs,

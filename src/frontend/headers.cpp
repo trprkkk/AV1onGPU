@@ -306,6 +306,8 @@ void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
       slot.cdf = cdf;
       slot.seg_map = seg_map;
       slot.segmentation = frame.segmentation;
+      /* save_grain_params(): a later frame with update_grain == 0 reads these */
+      slot.grain = frame.grain;
     }
   }
 }
@@ -523,6 +525,7 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
   }
 
   if (!seq.monochrome) seq.separate_uv_delta_q = r.read_bit();
+  const size_t pos_film_grain_present = r.bits_read();
   seq.film_grain_params_present = r.read_bit();
 
   const ParseStatus status = check_trailing_bits(&r, error);
@@ -532,9 +535,10 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
   if (hdrpos_enabled()) {
     std::fprintf(stderr,
                  "HDRPOS seq max_frame_width=%zu max_frame_height=%zu enable_superres=%zu "
-                 "width_bits=%d\n",
+                 "width_bits=%d film_grain=%zu mono=%d ss_x=%d ss_y=%d\n",
                  pos_max_frame_width, pos_max_frame_width + static_cast<size_t>(seq.width_n_bits),
-                 pos_enable_superres, seq.width_n_bits);
+                 pos_enable_superres, seq.width_n_bits, pos_film_grain_present,
+                 seq.monochrome ? 1 : 0, seq.ss_x, seq.ss_y);
   }
   return ParseStatus::Ok;
 }
@@ -662,6 +666,77 @@ void set_frame_refs(const SequenceHeader& seq, FrameHeader* h, const RefPool& po
   for (int i = 0; i < refs_per_frame; ++i) {
     if (h->ref_frame_idx[i] < 0) h->ref_frame_idx[i] = fallback;
   }
+}
+
+/* film_grain_params() (5.9.30) after apply_grain, grain_seed and the
+ * update_grain decision: the pointwise scaling curves, the auto-regressive
+ * filter that shapes the noise, and how it is added back. */
+ParseStatus read_film_grain_params(const SequenceHeader& seq, FilmGrainParams* g, BitReader* r,
+                                   std::string* error) {
+  g->num_y_points = static_cast<int>(r->read(4));
+  for (int i = 0; i < g->num_y_points; ++i) {
+    g->point_y_value[i] = static_cast<int>(r->read(8));
+    /* the values are coded in increasing order and the scaling curve is
+     * interpolated between them, so a decreasing pair is an error */
+    if (i > 0 && g->point_y_value[i] <= g->point_y_value[i - 1]) {
+      return invalid("film grain luma points are not strictly increasing", error);
+    }
+    g->point_y_scaling[i] = static_cast<int>(r->read(8));
+  }
+  const bool mono = seq.monochrome;
+  g->chroma_scaling_from_luma = !mono && r->read_bit() != 0;
+  /* With 4:2:0 and no luma points the chroma grain would have nothing to be
+   * correlated with, so the syntax does not code any chroma points at all. */
+  if (mono || g->chroma_scaling_from_luma || (seq.ss_x && seq.ss_y && g->num_y_points == 0)) {
+    g->num_cb_points = 0;
+    g->num_cr_points = 0;
+  } else {
+    g->num_cb_points = static_cast<int>(r->read(4));
+    for (int i = 0; i < g->num_cb_points; ++i) {
+      g->point_cb_value[i] = static_cast<int>(r->read(8));
+      g->point_cb_scaling[i] = static_cast<int>(r->read(8));
+    }
+    g->num_cr_points = static_cast<int>(r->read(4));
+    for (int i = 0; i < g->num_cr_points; ++i) {
+      g->point_cr_value[i] = static_cast<int>(r->read(8));
+      g->point_cr_scaling[i] = static_cast<int>(r->read(8));
+    }
+  }
+  g->grain_scaling_minus_8 = static_cast<int>(r->read(2));
+  g->ar_coeff_lag = static_cast<int>(r->read(2));
+  const int num_pos_luma = 2 * g->ar_coeff_lag * (g->ar_coeff_lag + 1);
+  int num_pos_chroma = num_pos_luma;
+  if (g->num_y_points) {
+    /* one coefficient per chroma position that reads the *luma* grain follows
+     * the luma ones, so the chroma filter has one position more */
+    num_pos_chroma = num_pos_luma + 1;
+    for (int i = 0; i < num_pos_luma; ++i) g->ar_coeffs_y[i] = static_cast<int>(r->read(8)) - 128;
+  }
+  if (g->chroma_scaling_from_luma || g->num_cb_points) {
+    for (int i = 0; i < num_pos_chroma; ++i) {
+      g->ar_coeffs_cb[i] = static_cast<int>(r->read(8)) - 128;
+    }
+  }
+  if (g->chroma_scaling_from_luma || g->num_cr_points) {
+    for (int i = 0; i < num_pos_chroma; ++i) {
+      g->ar_coeffs_cr[i] = static_cast<int>(r->read(8)) - 128;
+    }
+  }
+  g->ar_coeff_shift_minus_6 = static_cast<int>(r->read(2));
+  g->grain_scale_shift = static_cast<int>(r->read(2));
+  if (g->num_cb_points) {
+    g->cb_mult = static_cast<int>(r->read(8));
+    g->cb_luma_mult = static_cast<int>(r->read(8));
+    g->cb_offset = static_cast<int>(r->read(9));
+  }
+  if (g->num_cr_points) {
+    g->cr_mult = static_cast<int>(r->read(8));
+    g->cr_luma_mult = static_cast<int>(r->read(8));
+    g->cr_offset = static_cast<int>(r->read(9));
+  }
+  g->overlap_flag = r->read_bit() != 0;
+  g->clip_to_restricted_range = r->read_bit() != 0;
+  return ParseStatus::Ok;
 }
 
 ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, size_t size,
@@ -1298,13 +1373,32 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
 
   /* ---- film grain -------------------------------------------------------- */
   if (seq.film_grain_params_present && (h.show_frame || h.showable_frame)) {
-    h.film_grain_present = r.read_bit();
-    if (h.film_grain_present) {
-      h.film_grain_seed = static_cast<int>(r.read(16));
-      *out = h;
-      return unsupported("film grain parameters are parsed, applying them from a real "
-                         "bitstream is not implemented",
-                         error);
+    FilmGrainParams& g = h.grain;
+    g.apply = r.read_bit();
+    if (g.apply) {
+      g.seed = static_cast<int>(r.read(16));
+      bool update_grain = true;
+      if (h.type == FrameType::Inter) update_grain = r.read_bit();
+      if (!update_grain) {
+        /* The frame re-uses a reference's grain parameters and codes only its
+         * own seed (5.9.30): the rest comes from the slot it names, the way
+         * that slot was stored. */
+        const int idx = static_cast<int>(r.read(3));
+        if (!refs || !refs->slots[idx].valid) {
+          *out = h;
+          return invalid("film grain parameters taken from an empty reference slot", error);
+        }
+        const int seed = g.seed;
+        g = refs->slots[idx].grain;
+        g.apply = true;
+        g.seed = seed;
+      } else {
+        ParseStatus status = read_film_grain_params(seq, &g, &r, error);
+        if (status != ParseStatus::Ok) {
+          *out = h;
+          return status;
+        }
+      }
     }
   }
 

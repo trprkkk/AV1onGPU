@@ -48,9 +48,10 @@ inline bool write_plan(const std::string& path, const av1gpu::internal::FramePla
   const av1gpu::internal::PlanLayout& g = plan.layout;
 
   const char magic[8] = {'A', 'V', '1', 'G', 'P', 'L', 'A', 'N'};
-  /* 4: the display geometry and the upscale jobs join, 3 added tmp_size, 2 the
-   * palette colour map */
-  const int32_t version = 4;
+  /* 5: the film grain noise image and its two passes replace the noise
+   * template, 4 added the display geometry and the upscale jobs, 3 tmp_size, 2
+   * the palette colour map */
+  const int32_t version = 5;
   const int32_t geom[5] = {g.frame.width, g.frame.height, g.frame.bit_depth,
                            g.frame.ss_x, g.frame.ss_y};
   bool ok = write_all(file, magic, sizeof(magic)) &&
@@ -77,13 +78,15 @@ inline bool write_plan(const std::string& path, const av1gpu::internal::FramePla
   ok = ok && write_all(file, &buffer_size, sizeof(buffer_size)) &&
        write_all(file, &tmp_size, sizeof(tmp_size)) &&
        write_all(file, plan.ref_slot, sizeof(plan.ref_slot)) &&
-       write_all(file, &plan.grain_stride, sizeof(plan.grain_stride)) &&
-       write_all(file, &plan.grain_h, sizeof(plan.grain_h)) &&
-       write_all(file, plan.grain_lut, sizeof(plan.grain_lut));
+       /* the film grain noise image: the host builds it (the synthesis is
+        * sequential) and the jobs index it per plane */
+       write_all(file, plan.grain_noise.noise_off, sizeof(plan.grain_noise.noise_off)) &&
+       write_all(file, plan.grain_noise.noise_stride, sizeof(plan.grain_noise.noise_stride)) &&
+       write_all(file, plan.grain_noise.lut, sizeof(plan.grain_noise.lut));
 
   const int32_t counts[4] = {static_cast<int32_t>(plan.coefficients.size()),
                              static_cast<int32_t>(plan.residual.size()),
-                             static_cast<int32_t>(plan.grain_template.size()),
+                             static_cast<int32_t>(plan.grain_noise.noise.size()),
                              static_cast<int32_t>(plan.palette_map.size())};
   ok = ok && write_all(file, counts, sizeof(counts));
 
@@ -96,15 +99,15 @@ inline bool write_plan(const std::string& path, const av1gpu::internal::FramePla
   }
   ok = ok && write_vector(file, plan.deblock_v) && write_vector(file, plan.deblock_h) &&
        write_vector(file, plan.cdef) && write_vector(file, plan.upscale) &&
-       write_vector(file, plan.grain);
+       write_vector(file, plan.grain_chroma) && write_vector(file, plan.grain_luma);
 
   if (ok && !plan.coefficients.empty())
     ok = write_all(file, plan.coefficients.data(),
                    plan.coefficients.size() * sizeof(int32_t));
   if (ok && !plan.residual.empty())
     ok = write_all(file, plan.residual.data(), plan.residual.size() * sizeof(int32_t));
-  if (ok && !plan.grain_template.empty())
-    ok = write_all(file, plan.grain_template.data(), plan.grain_template.size());
+  if (ok && !plan.grain_noise.noise.empty())
+    ok = write_all(file, plan.grain_noise.noise.data(), plan.grain_noise.noise.size());
   if (ok && !plan.palette_map.empty())
     ok = write_all(file, plan.palette_map.data(), plan.palette_map.size());
 

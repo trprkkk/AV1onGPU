@@ -460,14 +460,22 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
 
   /* ---- film grain -------------------------------------------------------- */
   if (cfg.grain) {
-    syntax.apply_grain = true;
-    syntax.grain.seed = cfg.seed + frame_index;
-    syntax.grain.overlap = 0;
-    syntax.grain.template_size = 128;
-    for (int i = 0; i < 32; ++i) {
-      const double v = 0.12 * (1.0 - i / 31.0); /* less grain in the highlights */
-      syntax.grain.lut[i] = static_cast<int>(std::floor(v * 64.0 + 0.5));
-    }
+    /* A two point curve: more grain in the shadows than in the highlights,
+     * which is how film behaves and what the synthetic clip's ground truth
+     * (the same filter, applied by this decoder) encodes. */
+    FilmGrainParams& g = syntax.grain;
+    g.apply = true;
+    g.seed = cfg.seed + frame_index;
+    g.num_y_points = 2;
+    g.point_y_value[0] = 0;
+    g.point_y_scaling[0] = 32;
+    g.point_y_value[1] = 255;
+    g.point_y_scaling[1] = 4;
+    g.chroma_scaling_from_luma = true;
+    g.ar_coeff_lag = 2;
+    g.ar_coeff_shift_minus_6 = 1;
+    g.overlap_flag = true;
+    g.clip_to_restricted_range = false;
   }
 
   /* the reference the *decoder* will use has the loop filters applied, so the

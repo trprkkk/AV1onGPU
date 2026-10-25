@@ -418,31 +418,40 @@ class CudaBackend final : public Backend {
       ++launches;
     }
 
-    if (!plan.grain.empty()) {
-      if (!ensure(&grain_, &grain_cap_, plan.grain_template.size()) ||
-          !ensure(&lut_, &lut_cap_, sizeof(plan.grain_lut)))
+    if (!plan.grain_chroma.empty() || !plan.grain_luma.empty()) {
+      /* The noise image is built on the host (the sequential half of the
+       * synthesis) and uploaded once; the two passes below only launch. */
+      const size_t noise_size = plan.grain_noise.noise.size();
+      if (!ensure(&grain_, &grain_cap_, noise_size) ||
+          !ensure(&lut_, &lut_cap_, sizeof(plan.grain_noise.lut)))
         return fail(error, "out of device memory for the film grain tables");
-      if (driver_.MemcpyHtoD(grain_, plan.grain_template.data(),
-                             plan.grain_template.size()) != cuda::CUDA_SUCCESS ||
-          driver_.MemcpyHtoD(lut_, plan.grain_lut, sizeof(plan.grain_lut)) !=
+      if (driver_.MemcpyHtoD(grain_, plan.grain_noise.noise.data(), noise_size) !=
+              cuda::CUDA_SUCCESS ||
+          driver_.MemcpyHtoD(lut_, plan.grain_noise.lut, sizeof(plan.grain_noise.lut)) !=
               cuda::CUDA_SUCCESS)
         return fail(error, "film grain table upload failed");
-      int total = 0;
-      CUdeviceptr job_mem = 0, pref_mem = 0;
-      if (!upload_jobs(plan.grain, &job_mem, &pref_mem, &total,
-                       [](const Av1gGrainJob& j) { return j.w * j.h; }))
-        return fail(error, "grain job upload failed");
-      Launcher a;
-      add_mem(a, job_mem);
-      add_mem(a, pref_mem);
-      add_int(a, static_cast<int>(plan.grain.size()));
-      add_int(a, total);
-      add_mem(a, frame_);
-      add_mem(a, grain_);
-      add_mem(a, lut_);
-      add_int(a, maxv);
-      if (!launch("av1g_k_grain", total, a)) return fail(error, "av1g_k_grain failed");
-      ++launches;
+      /* chroma first: its noise is scaled by the luma of the picture before any
+       * grain was added, so the luma pass has to come after it */
+      for (const std::vector<Av1gGrainJob>* pass : {&plan.grain_chroma, &plan.grain_luma}) {
+        if (pass->empty()) continue;
+        int total = 0;
+        CUdeviceptr job_mem = 0, pref_mem = 0;
+        if (!upload_jobs(*pass, &job_mem, &pref_mem, &total,
+                         [](const Av1gGrainJob& j) { return j.w * j.h; }))
+          return fail(error, "grain job upload failed");
+        Launcher a;
+        add_mem(a, job_mem);
+        add_mem(a, pref_mem);
+        add_int(a, static_cast<int>(pass->size()));
+        add_int(a, total);
+        add_mem(a, frame_);
+        add_mem(a, frame_);
+        add_mem(a, grain_);
+        add_mem(a, lut_);
+        add_int(a, maxv);
+        if (!launch("av1g_k_grain", total, a)) return fail(error, "av1g_k_grain failed");
+        ++launches;
+      }
     }
 
     /* The single point where a device side fault becomes visible. OpenCL's

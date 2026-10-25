@@ -109,14 +109,18 @@ __kernel void av1g_k_cdef(__global const Av1gCdefJob *jobs,
   av1g_cdef_block(&job, src, dst, src, maxv);
 }
 
+/* Film grain: one work item per sample. `luma` is the same picture (the chroma
+ * blend reads the luma samples before any grain was added, which is why the
+ * chroma jobs are launched first). */
 __kernel void av1g_k_grain(__global const Av1gGrainJob *jobs,
                            __global const int *joff, int njobs, int total,
                            __global av1g_px *dst,
-                           __global const signed char *grain,
+                           __global const av1g_px *luma,
+                           __global const signed char *noise,
                            __global const int *lut, int maxv) {
   AV1G_JOB_LOOKUP(job_idx, elem);
   Av1gGrainJob job = jobs[job_idx];
-  av1g_grain_px(&job, dst, grain, lut, elem % job.w, elem / job.w, maxv);
+  av1g_grain_px(&job, dst, luma, noise, lut, elem % job.w, elem / job.w, maxv);
 }
 
 /* Superres: one work item per output sample. The source and the target are two

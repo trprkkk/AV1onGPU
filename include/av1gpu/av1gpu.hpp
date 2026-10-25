@@ -354,13 +354,46 @@ struct CdefBlock {
   int dir = 0;
 };
 
-/* Film grain parameters. The template is generated from the seed by the
- * engine, in the same pseudo random sequence the AV1 spec uses. */
-struct GrainSyntax {
+/* film_grain_params() (5.9.30): the parameters of the film grain synthesis
+ * filter (7.18.3). Everything the filter needs is here, so a frame carries its
+ * own copy - and a reference slot keeps the one its picture was decoded with,
+ * because a later frame may re-use it (update_grain == 0).
+ *
+ * `ar_coeffs_*` hold the signed coefficients, i.e. the coded value minus 128. */
+struct FilmGrainParams {
+  bool apply = false;
   int seed = 0;
-  int overlap = 1;
-  int template_size = 73;
-  int lut[32] = {0}; /* Q6 gain per luma bucket */
+  /* The scaling curve: a list of (sample value, grain strength) points, up to
+   * sixteen of them, strictly increasing in value. */
+  int num_y_points = 0;
+  int point_y_value[16] = {0};
+  int point_y_scaling[16] = {0};
+  bool chroma_scaling_from_luma = false;
+  int num_cb_points = 0;
+  int point_cb_value[16] = {0};
+  int point_cb_scaling[16] = {0};
+  int num_cr_points = 0;
+  int point_cr_value[16] = {0};
+  int point_cr_scaling[16] = {0};
+  int grain_scaling_minus_8 = 0;
+  /* The auto-regressive filter that shapes the noise: a lag of 0 to 3 samples
+   * and one coefficient per position (plus, for chroma, one that reads the
+   * luma grain). */
+  int ar_coeff_lag = 0;
+  int ar_coeffs_y[24] = {0};
+  int ar_coeffs_cb[25] = {0};
+  int ar_coeffs_cr[25] = {0};
+  int ar_coeff_shift_minus_6 = 0;
+  int grain_scale_shift = 0;
+  /* How the chroma strength follows the luma and chroma values. */
+  int cb_mult = 0;
+  int cb_luma_mult = 0;
+  int cb_offset = 0;
+  int cr_mult = 0;
+  int cr_luma_mult = 0;
+  int cr_offset = 0;
+  bool overlap_flag = false;
+  bool clip_to_restricted_range = false;
 };
 
 struct ColorSyntax {
@@ -410,8 +443,8 @@ struct FrameSyntax {
   std::vector<DeblockEdge> deblock;
   std::vector<CdefBlock> cdef;
 
-  bool apply_grain = false;
-  GrainSyntax grain;
+  /* Film grain: `grain.apply` is the syntax's apply_grain. */
+  FilmGrainParams grain;
   ColorSyntax color;
 };
 

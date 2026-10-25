@@ -470,42 +470,6 @@ bool gm_setup_shear(const int32_t* params, int* alpha, int* beta, int* gamma, in
 }
 
 /* ------------------------------------------------------------------------- */
-/* film grain template                                                       */
-/* ------------------------------------------------------------------------- */
-
-namespace {
-
-/* xorshift, matching the distribution the AV1 film grain model expects (zero
- * mean, roughly gaussian tails). */
-uint32_t rng_state = 1u;
-
-uint32_t rng_next() {
-  rng_state ^= rng_state << 13;
-  rng_state ^= rng_state >> 17;
-  rng_state ^= rng_state << 5;
-  return rng_state;
-}
-
-} /* namespace */
-
-void grain_template(int seed, int stride, int rows, std::vector<signed char>* out) {
-  out->assign(static_cast<size_t>(stride) * rows, 0);
-  rng_state = static_cast<uint32_t>(seed) * 2654435761u + 12345u;
-  if (rng_state == 0) rng_state = 1;
-  for (int y = 0; y < rows; ++y) {
-    for (int x = 0; x < stride; ++x) {
-      /* sum of two uniforms gives a triangular, zero mean distribution */
-      const int a = static_cast<int>(rng_next() % 129) - 64;
-      const int b = static_cast<int>(rng_next() % 129) - 64;
-      int v = (a + b) / 2;
-      if (v < -64) v = -64;
-      if (v > 63) v = 63;
-      (*out)[static_cast<size_t>(y) * stride + x] = static_cast<signed char>(v);
-    }
-  }
-}
-
-/* ------------------------------------------------------------------------- */
 /* colour                                                                    */
 /* ------------------------------------------------------------------------- */
 

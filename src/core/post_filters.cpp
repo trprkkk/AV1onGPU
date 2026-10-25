@@ -78,37 +78,26 @@ void apply_post_filters_host(Frame* frame, const FrameSyntax& syntax) {
   }
 
   /* ---- film grain ------------------------------------------------------- */
-  if (syntax.apply_grain && syntax.grain.template_size > 0) {
-    const int grain_stride = std::max(64, syntax.grain.template_size);
-    const int grain_h = grain_stride;
-    std::vector<signed char> temp;
-    tables::grain_template(syntax.grain.seed, grain_stride, grain_h, &temp);
-    int lut[64] = {0};
-    for (int i = 0; i < 32; ++i) {
-      lut[i] = syntax.grain.lut[i];
-      lut[32 + i] = syntax.grain.lut[i];
-    }
-    const int tile = 128;
+  if (syntax.grain.apply) {
+    /* The sequential half of the synthesis, exactly as the plan build runs it;
+     * the blend itself is the kernels' per sample map. */
+    GrainNoise noise;
+    build_grain(syntax.grain, frame->bit_depth, syntax.ss_x, syntax.ss_y,
+                syntax.color.matrix == ColorMatrix::Identity, frame->width, frame->height, &noise);
+    std::vector<Av1gGrainJob> chroma, luma;
     for (int plane = 0; plane < 3; ++plane) {
-      const int pw = frame->plane_width(plane);
-      const int ph = frame->plane_height(plane);
-      for (int y = 0; y < ph; y += tile) {
-        for (int x = 0; x < pw; x += tile) {
-          Av1gGrainJob job;
-          std::memset(&job, 0, sizeof(job));
-          job.dst_off = at(plane, x, y);
-          job.dst_stride = frame->stride[plane];
-          job.x = x;
-          job.y = y;
-          job.w = std::min(tile, pw - x);
-          job.h = std::min(tile, ph - y);
-          job.bitdepth = frame->bit_depth;
-          job.grain_stride = grain_stride;
-          job.grain_h = grain_h;
-          job.overlap = syntax.grain.overlap;
-          av1g_grain_block(&job, frame->plane(plane), temp.data(), lut, maxv);
-        }
-      }
+      append_grain_jobs(noise, plane, frame->plane_width(plane), frame->plane_height(plane), 0,
+                        frame->stride[plane], 0, frame->stride[0], frame->width, syntax.ss_x,
+                        syntax.ss_y, &chroma, &luma);
+    }
+    /* chroma first: it blends against the luma the picture has before any grain */
+    for (const Av1gGrainJob& job : chroma) {
+      av1g_grain_block(&job, frame->plane(job.plane), frame->plane(0), noise.noise.data(), noise.lut,
+                       frame->max_value());
+    }
+    for (const Av1gGrainJob& job : luma) {
+      av1g_grain_block(&job, frame->plane(0), frame->plane(0), noise.noise.data(), noise.lut,
+                       frame->max_value());
     }
   }
 }

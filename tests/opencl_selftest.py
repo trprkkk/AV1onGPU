@@ -264,10 +264,17 @@ int main() {
   F(Av1gUpscaleJob, step_x); F(Av1gUpscaleJob, initial_subpel_x);
   F(Av1gUpscaleJob, bitdepth);
   S(Av1gGrainJob);
-  F(Av1gGrainJob, dst_off); F(Av1gGrainJob, dst_stride); F(Av1gGrainJob, x);
-  F(Av1gGrainJob, y); F(Av1gGrainJob, w); F(Av1gGrainJob, h);
-  F(Av1gGrainJob, bitdepth); F(Av1gGrainJob, grain_off); F(Av1gGrainJob, grain_stride);
-  F(Av1gGrainJob, grain_h); F(Av1gGrainJob, lut_off); F(Av1gGrainJob, overlap);
+  F(Av1gGrainJob, dst_off); F(Av1gGrainJob, dst_stride);
+  F(Av1gGrainJob, noise_off); F(Av1gGrainJob, noise_stride);
+  F(Av1gGrainJob, x); F(Av1gGrainJob, y); F(Av1gGrainJob, w); F(Av1gGrainJob, h);
+  F(Av1gGrainJob, plane); F(Av1gGrainJob, ss_x); F(Av1gGrainJob, ss_y);
+  F(Av1gGrainJob, bitdepth); F(Av1gGrainJob, scaling_shift);
+  F(Av1gGrainJob, num_y_points); F(Av1gGrainJob, num_cb_points); F(Av1gGrainJob, num_cr_points);
+  F(Av1gGrainJob, chroma_scaling_from_luma);
+  F(Av1gGrainJob, cb_mult); F(Av1gGrainJob, cb_luma_mult); F(Av1gGrainJob, cb_offset);
+  F(Av1gGrainJob, cr_mult); F(Av1gGrainJob, cr_luma_mult); F(Av1gGrainJob, cr_offset);
+  F(Av1gGrainJob, min_value); F(Av1gGrainJob, max_value);
+  F(Av1gGrainJob, luma_off); F(Av1gGrainJob, luma_stride); F(Av1gGrainJob, luma_w);
   S(Av1gColorJob);
   F(Av1gColorJob, dst_off); F(Av1gColorJob, dst_stride); F(Av1gColorJob, w);
   F(Av1gColorJob, h); F(Av1gColorJob, y_off); F(Av1gColorJob, y_stride);
@@ -722,27 +729,48 @@ def main():
           int(np.abs(cdef_block - edge.reshape(size, stride)[8:16, 8:16]).max()) > 0,
           True)
 
-    grain = np.full(64 * 64, 40, dtype=np.int8)
+    # ------------------------------------------------------------ film grain
+    # The noise image is built on the host; the kernel scales one noise sample by
+    # the plane's curve at that sample's value and adds it.
+    print("film grain")
+    noise = np.full(64 * 64, 40, dtype=np.int8)
     g = GrainJob()
     g.dst_off = 8 * stride + 8
     g.dst_stride = stride
+    g.noise_off = 0
+    g.noise_stride = 64
+    g.x = 0
+    g.y = 0
     g.w = 8
     g.h = 8
+    g.plane = 0
     g.bitdepth = 8
-    g.grain_stride = 64
-    g.grain_h = 64
+    g.scaling_shift = 8
+    g.num_y_points = 1
+    g.min_value = 0
+    g.max_value = 255
+    g.luma_w = 8
     gbuf = upload(np.frombuffer(g, dtype=np.uint8).copy())
     gpref, gtotal = prefix([64])
     gpref_buf = upload(gpref)
-    grain_buf = upload(grain)
-    lut_buf = upload(np.zeros(64, dtype=np.int32))
-    flat_buf = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR,
-                         hostbuf=flat)
+    noise_buf = upload(noise)
+    flat_buf = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=flat)
     launch(None, program.av1g_k_grain, gtotal, gbuf, gpref_buf, np.int32(1),
-           np.int32(gtotal), flat_buf, grain_buf, lut_buf, np.int32(255))
+           np.int32(gtotal), flat_buf, flat_buf, noise_buf, upload(np.zeros(768, dtype=np.int32)),
+           np.int32(255))
     queue.finish()
     out = download(flat_buf, flat.shape)
-    check("grain with a zero gain LUT is a no-op", bool((out == flat).all()), True)
+    check("grain with a zero scaling table is a no-op", bool((out == flat).all()), True)
+
+    # a curve of 256 is a gain of one: the noise (40) is added as it stands
+    launch(None, program.av1g_k_grain, gtotal, gbuf, gpref_buf, np.int32(1),
+           np.int32(gtotal), flat_buf, flat_buf, noise_buf,
+           upload(np.full(768, 256, dtype=np.int32)), np.int32(255))
+    queue.finish()
+    out = download(flat_buf, flat.shape)
+    got = out.reshape(size, stride)[8:16, 8:16].astype(int)
+    want = flat.reshape(size, stride)[8:16, 8:16].astype(int) + 40
+    check("grain adds the noise the curve scales it by", bool((got == want).all()), True)
 
     # ---------------------------------------------------------------- colour
     print("colour conversion")

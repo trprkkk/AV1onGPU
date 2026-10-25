@@ -43,7 +43,7 @@ sys.path.insert(0, HERE)
 import opencl_selftest as selftest  # noqa: E402  (probe, kernel source, helpers)
 
 MAGIC = b"AV1GPLAN"
-FORMAT_VERSION = 4       # 2 the palette map, 3 the itx scratch size,
+FORMAT_VERSION = 5       # 2 the palette map, 3 the itx scratch size,
                          # 4 the display geometry and the upscale jobs
 REFERENCE_SLOTS = 9      # kReferenceSlots in the backends
 CDEF_DIM = 8             # AV1G_CDEF_DIM
@@ -121,12 +121,14 @@ def read_plan(path, layouts):
     # job needs w * h ints, which is more than its coefficient area
     plan["tmp_size"] = r.i64()
     plan["ref_slot"] = r.ints(2)
-    plan["grain_stride"] = r.i32()
-    plan["grain_h"] = r.i32()
-    plan["grain_lut"] = r.ints(64)
+    # the film grain noise image: built on the host (the synthesis is sequential)
+    # and indexed per plane by the jobs' noise_off / noise_stride
+    plan["noise_off"] = r.ints(3)
+    plan["noise_stride"] = r.ints(3)
+    plan["grain_lut"] = r.ints(768)
     plan["coef_count"] = r.i32()
     plan["residual_count"] = r.i32()
-    plan["grain_count"] = r.i32()
+    plan["noise_count"] = r.i32()
     plan["palette_count"] = r.i32()
 
     plan["waves"] = []
@@ -139,13 +141,12 @@ def read_plan(path, layouts):
         plan["waves"].append(wave)
     for key, name in (("deblock_v", "DeblockJob"), ("deblock_h", "DeblockJob"),
                       ("cdef", "CdefJob"), ("upscale", "UpscaleJob"),
-                      ("grain", "GrainJob")):
+                      ("grain_chroma", "GrainJob"), ("grain_luma", "GrainJob")):
         plan[key] = r.jobs(layouts["Av1g" + name], r.i32())
 
     plan["coefficients"] = r.ints(plan["coef_count"])
     plan["residual"] = r.ints(plan["residual_count"])
-    plan["grain_template"] = list(struct.unpack(
-        "<%db" % plan["grain_count"], r.raw(plan["grain_count"])))
+    plan["noise"] = struct.unpack("<%db" % plan["noise_count"], r.raw(plan["noise_count"]))
     plan["palette_map"] = np_frombytes(r.raw(plan["palette_count"]))
     return plan
 
@@ -384,14 +385,20 @@ class Replay:
                          frame, filter_buf, np.int32(maxv)))
 
         # ---- film grain ----------------------------------------------------
-        if plan["grain"]:
-            jobs = plan["grain"]
-            job_buf, pref, total = self.jobs(jobs, [j.w * j.h for j in jobs])
-            grain_buf = self.buffer(np.array(plan["grain_template"], dtype=np.int8))
+        # Two passes: the chroma planes scale their noise by the luma of the
+        # picture *before* any grain was added, so they run first and the luma
+        # jobs second. Both pass the same picture as `dst` and `luma`.
+        if plan["grain_chroma"] or plan["grain_luma"]:
+            noise_buf = self.buffer(np.array(plan["noise"], dtype=np.int8))
             lut_buf = self.buffer(np.array(plan["grain_lut"], dtype=np.int32))
-            self.launch("av1g_k_grain", total,
-                        (job_buf, pref, np.int32(len(jobs)), np.int32(total), frame,
-                         grain_buf, lut_buf, np.int32(maxv)))
+            for key in ("grain_chroma", "grain_luma"):
+                jobs = plan[key]
+                if not jobs:
+                    continue
+                job_buf, pref, total = self.jobs(jobs, [j.w * j.h for j in jobs])
+                self.launch("av1g_k_grain", total,
+                            (job_buf, pref, np.int32(len(jobs)), np.int32(total), frame,
+                             frame, noise_buf, lut_buf, np.int32(maxv)))
 
         return frame
 

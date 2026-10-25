@@ -77,6 +77,7 @@ set(AV1GPU_SOURCES
     src/core/factory.cpp
     src/core/synthetic.cpp
     src/core/post_filters.cpp
+    src/core/grain.cpp
     src/core/kernel_source.cpp
     src/frontend/cdf.cpp
     src/frontend/ivf.cpp

@@ -325,6 +325,10 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
   out->base_q_idx = frame.base_q_idx;
   out->sharpness = frame.loop_filter.sharpness;
   out->enable_intra_edge_filter = seq.enable_intra_edge_filter;
+  /* film grain: the frame's own parameters, or the ones it inherits from a
+   * reference (update_grain == 0). The synthesis runs on the output picture, so
+   * it is the engine that applies them. */
+  out->grain = frame.grain;
 
   /* The seven reference types' backend slots, which every inter block's `ref`
    * indexes. A frame that needs none of them (an intra frame, or an inter frame

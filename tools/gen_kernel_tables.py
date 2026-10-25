@@ -2,8 +2,8 @@
 
 The device kernels need a handful of normative tables: the cosine table the
 inverse transforms are built from, the mode to angle map, the directional
-derivative table, the smooth prediction weights, the intra edge filter kernel
-and the filter intra taps. They are read out of the specification markdown so
+derivative table, the smooth prediction weights, the intra edge filter kernel,
+the filter intra taps, the inter/intra blend taper and the film grain noise. They are read out of the specification markdown so
 that not a single value is retyped.
 
     python3 tools/gen_kernel_tables.py /tmp/av1-spec-master
@@ -118,6 +118,29 @@ for mode in range(5):
         row = values[mode * 8 + tap]
         w('        {' + ', '.join(str(v) for v in row) + '},')
     w('    },')
+w('};')
+w('')
+
+# ---- inter/intra blend taper ----------------------------------------------
+ii = numbers_after(r'Ii_Weights_1d\[MAX_SB_SIZE\] = \{(.*?)\n\}', 128)
+w('/* Ii_Weights_1d (7.11.3.13): the taper of an inter/intra blend, indexed by the')
+w(' * distance from the edge the intra half is predicted from, scaled by the block')
+w(' * size. 60 at the edge and 1 far from it, so the intra prediction fades out')
+w(' * across the block instead of meeting the inter one at a hard line. */')
+w('AV1G_TBL int av1g_tbl_ii_weights[128] = {')
+for i in range(0, 128, 16):
+    w('    ' + ', '.join(str(v) for v in ii[i:i + 16]) + ',')
+w('};')
+w('')
+
+# ---- gaussian sequence ----------------------------------------------------
+gauss = numbers_after(r'Gaussian_Sequence\[ 2048 \] = \{(.*?)\n~~~~~', 2048)
+w('/* Gaussian_Sequence (10.5): the white noise list the film grain generator')
+w(' * draws from, zero mean with a standard deviation of about 512, clipped to')
+w(' * [-2048, 2047] and rounded to a multiple of four. */')
+w('AV1G_TBL int av1g_tbl_gaussian_sequence[2048] = {')
+for i in range(0, 2048, 12):
+    w('    ' + ', '.join('%5d' % v for v in gauss[i:i + 12]) + ',')
 w('};')
 w('')
 
