@@ -150,8 +150,11 @@ the first symbol of the fixture's key frame.
      samples. `tests/data/odd_size.ivf` (130x100, six frames) is bit exact
      against dav1d and through the OpenCL replay, and the sweep behind it is
      listed in `docs/ACCURACY.md`, together with the one place that is still not
-     exact - the loop filter reading the border of such a frame, off by one on a
-     single sample in the cases measured.
+     exact: where the loop filter runs on the last row or column band it reads
+     samples just outside the picture, which only the reconstruction defines.
+     That is one sample off by one in the cases the sweep measured, and up to a
+     few dozen at a very low quantiser (a 160x116 clip at `-crf 18` differs in 25
+     and 36 samples, all by one, all in the chroma rows near the bottom).
 
    Two bugs the block level trace found on the way, worth recording because
    both are the kind that decodes plausibly and then desynchronises: the single
@@ -235,13 +238,17 @@ the first symbol of the fixture's key frame.
    at 160x96, a 64-wide unit with a 32-wide last one at 96x72, and 32x24 and
    16x16, both smaller than a unit). The same clip with identity filters also
    has to come back bit identical to the same clip with restoration switched off.
-   Of the eight mutations tried, seven are caught - the stripe starting at the
-   frame edge (54 samples), `unitRow` without the `+ 8` (572), the last unit not
-   stretched to the plane edge (315), always taking the CDEF picture (11), never
-   borrowing below a stripe (26), no clamp at the borrowed row (6) and the two
-   pictures swapped (1575) - and the eighth, removing the intermediate clip, is
-   not observable through any output (the final `Clip1` hides it); the table is
-   in `docs/ACCURACY.md`.
+   The border case runs with CDEF *on* as well: there the two pictures really
+   differ (110 samples along the borders of that clip, which the test asserts),
+   which is what makes the choice between them observable - with CDEF off they
+   are the same picture and swapping them is a no-op.
+   Of the nine mutations tried, eight are caught - the stripe starting at the
+   frame edge (225 samples), `unitRow` without the `+ 8` (572), the last unit not
+   stretched to the plane edge (315), always taking the CDEF picture (31), never
+   borrowing below a stripe (26), no clamp at the borrowed row (6), the two
+   pictures swapped (1575) and the pre-CDEF snapshot never upscaled (120) - and
+   the ninth, removing the intermediate clip, is not observable through any
+   output (the final `Clip1` hides it); the table is in `docs/ACCURACY.md`.
 
    The whole fixture set, `lr` and its two higher depths included, also decodes
    through an ASan/UBSan build (`-DAV1GPU_SANITIZE=ON`): 46/46 tests pass and no

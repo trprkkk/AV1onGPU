@@ -1003,6 +1003,13 @@ extends two samples past the picture, so the taps that reach there read samples
 the reference decoder filled in its own way. 128x68 is the same story with one
 to three samples. The samples that are left are exactly the ones the
 specification derives from a padded picture whose padding it does not define.
+
+One negative result is worth keeping: the taps themselves must *not* be clamped
+to the visible plane. Doing that (treating samples the mi grid says are available
+as unavailable) took the same 160x116 clip from 25 and 36 wrong samples to 101 and
+145, and 128x68 from one to 588 - the specification makes availability an mi unit
+question (7.15.3's `is_inside_filter_region` against `MiCols`/`MiRows`), not a
+picture size one.
 This is why `odd_size.ivf`'s frames code a zero luma level - the fixture pins the
 grid, the CDEF halo and the clamps, which are fully defined, and not the samples
 the specification leaves to the implementation's border handling.
