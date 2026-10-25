@@ -279,19 +279,22 @@ class TileParser {
       : seq_(seq), frame_(frame), refs_(refs), data_(data), size_(size), out_(out),
         error_(error), trace_(std::getenv("AV1GPU_TRACE") != nullptr) {}
 
-  ParseStatus run() {
-    if (!frame_.tiles.col_start_sb.empty()) {
-      /* one tile: its extent is the frame */
-      tile_col_start_ = 0;
-      tile_col_end_ = mi_cols();
-      tile_row_start_ = 0;
-      tile_row_end_ = mi_rows();
-    }
+  /* Reads one tile of the frame. The frame's maps - block sizes, references,
+   * segmentation ids, the CDEF index, the motion field - live in this parser
+   * across calls, because the tiles of a frame fill one picture and the filters
+   * and the motion field are derived from the whole of it. `publish()` runs
+   * once, after the last tile. What starts over at every tile is the range
+   * decoder, the CDF tables and the above/left contexts of the entropy coder,
+   * because a tile is coded independently: 7.11 resets them to the tables the
+   * frame started from, and 9.x's exit_symbol copies the tile named by
+   * `context_update_tile_id` out as the context a following frame inherits. */
+  ParseStatus run_tile(int tile_col, int tile_row, const uint8_t* data, size_t size) {
     const int sb4 = seq_.use_128x128_superblock ? 32 : 16;
     const BlockSize sb_size = seq_.use_128x128_superblock ? kBlock128x128 : kBlock64x64;
-    if (frame_.restoration_type[0] || frame_.restoration_type[1] ||
-        frame_.restoration_type[2])
-      init_restoration();
+    tile_col_ = tile_col;
+    tile_row_ = tile_row;
+    set_tile_extent(tile_col, tile_row);
+    reset_tile_state(data, size);
     for (int r = tile_row_start_; r < tile_row_end_; r += sb4) {
       /* clear_left_context: the segment prediction contexts live per 4x4 row,
        * so they start over at every superblock row, like the coefficient ones. */
@@ -307,6 +310,19 @@ class TileParser {
         if (status != ParseStatus::Ok) return status;
       }
     }
+    /* The tables a following frame inherits: those of one named tile. With one
+     * tile that is always this one, and the copy is what a single tile frame
+     * has always published. */
+    const int tile_num = tile_col + tile_row * frame_.tiles.cols;
+    if (frame_.refresh_frame_context && tile_num == frame_.tiles.context_update_tile_id) {
+      saved_cdf_ = cdf_;
+      have_saved_cdf_ = true;
+    }
+    return ParseStatus::Ok;
+  }
+
+  /* The frame level outputs, once every tile is in. */
+  void publish() {
     out_->complete = true;
     if (frame_.type == FrameType::Inter || frame_.type == FrameType::Switch) {
       auto store = std::make_shared<RefMvs>();
@@ -331,7 +347,7 @@ class TileParser {
       out_->seg_map = std::move(map);
     }
     auto published = std::make_shared<CdfContext>(
-        frame_.refresh_frame_context ? cdf_ : start_cdf_);
+        frame_.refresh_frame_context ? (have_saved_cdf_ ? saved_cdf_ : cdf_) : start_cdf_);
     if (frame_.refresh_frame_context) {
       std::memcpy(published->mode.kfym, start_cdf_.mode.kfym, sizeof(published->mode.kfym));
       std::memcpy(published->mode.intrabc, start_cdf_.mode.intrabc,
@@ -339,6 +355,13 @@ class TileParser {
       reset_cdf_counts(published.get());
     }
     out_->cdf = std::move(published);
+  }
+
+  /* A tile that is the whole frame: the single tile entry points use this. */
+  ParseStatus run() {
+    const ParseStatus status = run_tile(0, 0, data_, size_);
+    if (status != ParseStatus::Ok) return status;
+    publish();
     return ParseStatus::Ok;
   }
 
@@ -2208,7 +2231,11 @@ class TileParser {
       if (scanned >= kWarpSamplesMax) return;
       const int mv_row = row + delta_row;
       const int mv_col = col + delta_col;
-      if (mv_row < 0 || mv_row >= mi_rows() || mv_col < 0 || mv_col >= mi_cols()) return;
+      /* is_inside( mvRow, mvCol ): a sample in another tile is not a neighbour,
+       * even though the frame's maps still hold what that tile decoded. */
+      if (mv_row < tile_row_start_ || mv_row >= tile_row_end_ || mv_col < tile_col_start_ ||
+          mv_col >= tile_col_end_)
+        return;
       const MiRef& edge = mi_at(mv_row, mv_col);
       if (edge.intra || edge.ref[0] != ref || edge.ref[1] != kRefIntra || edge.interintra) return;
       const BlockSize cand_size = block_size_at(mv_row, mv_col);
@@ -4346,6 +4373,11 @@ class TileParser {
 
   RangeDecoder decoder_;
   CdfContext cdf_;
+  /* The tile the frame hands its tables on from (9.x's exit_symbol), kept when
+   * that tile is the one being decoded. */
+  CdfContext saved_cdf_;
+  bool have_saved_cdf_ = false;
+  int tile_col_ = 0, tile_row_ = 0;
   /* the tables the frame started from, see run() */
   CdfContext start_cdf_;
 
@@ -4444,6 +4476,11 @@ class TileParser {
       coef_[plane].left_dc.assign(plane_rows, 0);
     }
     setup_temporal_mvs();
+    /* The restoration grid, allocated once for the whole frame: which unit a
+     * superblock codes is decided by the tile that owns it. */
+    if (frame_.restoration_type[0] || frame_.restoration_type[1] ||
+        frame_.restoration_type[2])
+      init_restoration();
     /* The frame's starting probabilities: its primary reference's tables when it
      * names one, the specification's defaults otherwise. A frame that resets
      * (error resilient, or a key frame) always falls back to the defaults. */
@@ -4475,11 +4512,148 @@ class TileParser {
         if (map && map->mi_cols == cols && map->mi_rows == rows) prev_seg_map_ = map;
       }
     }
-    decoder_.init(data_, size_, !frame_.disable_cdf_update);
+  }
+
+  /* The mi extent of one tile of the frame's grid (5.9.1's MiColStarts /
+   * MiRowStarts). The grid is always filled in by the frame header, but a
+   * caller may hand in a frame whose tiles were never parsed; then the tile is
+   * the whole frame, which is what a single tile frame is. */
+  void set_tile_extent(int tile_col, int tile_row) {
+    const int sb4 = seq_.use_128x128_superblock ? 32 : 16;
+    const TileInfo& tiles = frame_.tiles;
+    const int cols = std::max(tiles.cols, 1);
+    const int rows = std::max(tiles.rows, 1);
+    tile_col = std::clamp(tile_col, 0, cols - 1);
+    tile_row = std::clamp(tile_row, 0, rows - 1);
+    if (static_cast<int>(tiles.col_start_sb.size()) == cols + 1) {
+      tile_col_start_ = tiles.col_start_sb[static_cast<size_t>(tile_col)] * sb4;
+      tile_col_end_ = std::min(mi_cols(), tiles.col_start_sb[static_cast<size_t>(tile_col) + 1] * sb4);
+    } else {
+      tile_col_start_ = 0;
+      tile_col_end_ = mi_cols();
+    }
+    if (static_cast<int>(tiles.row_start_sb.size()) == rows + 1) {
+      tile_row_start_ = tiles.row_start_sb[static_cast<size_t>(tile_row)] * sb4;
+      tile_row_end_ = std::min(mi_rows(), tiles.row_start_sb[static_cast<size_t>(tile_row) + 1] * sb4);
+    } else {
+      tile_row_start_ = 0;
+      tile_row_end_ = mi_rows();
+    }
+  }
+
+  /* clear_above_context / clear_left_context (5.11.3, 5.11.4): the entropy
+   * contexts a block reads from the row above and the column to its left. The
+   * above ones are per column and the left ones per row, and both are only
+   * ever written by blocks at their own row, so the ones the first block of a
+   * tile reads are the ones the neighbouring tile left there - which is exactly
+   * what a tile boundary says is not a neighbour. Zeroing them makes a tile
+   * start from the state a single tile frame starts from. */
+  void clear_tile_contexts() {
+    std::fill(above_seg_pred_.begin(), above_seg_pred_.end(), 0);
+    std::fill(left_seg_pred_.begin(), left_seg_pred_.end(), 0);
+    std::fill(above_tx_lw_.begin(), above_tx_lw_.end(), 0);
+    std::fill(left_tx_lh_.begin(), left_tx_lh_.end(), 0);
+    for (int plane = 0; plane < 2; ++plane) {
+      const std::array<uint8_t, kPaletteColors> no_colors = {0, 0, 0, 0, 0, 0, 0, 0};
+      std::fill(pal_above_sz_[plane].begin(), pal_above_sz_[plane].end(), 0);
+      std::fill(pal_above_col_[plane].begin(), pal_above_col_[plane].end(), no_colors);
+      std::fill(pal_left_sz_[plane].begin(), pal_left_sz_[plane].end(), 0);
+      std::fill(pal_left_col_[plane].begin(), pal_left_col_[plane].end(), no_colors);
+    }
+    for (int plane = 0; plane < 3; ++plane) {
+      std::fill(coef_[plane].above_level.begin(), coef_[plane].above_level.end(), 0);
+      std::fill(coef_[plane].above_dc.begin(), coef_[plane].above_dc.end(), 0);
+      std::fill(coef_[plane].left_level.begin(), coef_[plane].left_level.end(), 0);
+      std::fill(coef_[plane].left_dc.begin(), coef_[plane].left_dc.end(), 0);
+    }
+  }
+
+  /* What a tile starts from, on top of the frame level state init_state set up:
+   * the range decoder over the tile's own bytes, the frame's starting CDF
+   * tables (a tile adapts its own copy and never sees another tile's), the
+   * frame's base quantiser (CurrentQIndex = base_q_idx in the tile group
+   * syntax, 5.11.1), DeltaLF back to zero, and the above/left contexts cleared.
+   * The restoration unit predictors go back to their midpoint values too, which
+   * 5.11.3 does per tile. */
+  void reset_tile_state(const uint8_t* data, size_t size) {
+    cdf_ = start_cdf_;
+    current_q_ = frame_.base_q_idx;
+    for (int i = 0; i < 4; ++i) delta_lf_[i] = 0;
+    read_deltas_ = frame_.delta_q_present;
+    clear_tile_contexts();
+    reset_lr_predictors();
+    decoder_.init(data, size, !frame_.disable_cdf_update);
+  }
+
+  /* RefSgrXqd / RefLrWiener at the values 5.11.3 starts a tile with. */
+  void reset_lr_predictors() {
+    for (int plane = 0; plane < 3; ++plane) {
+      for (int pass = 0; pass < 2; ++pass) {
+        for (int i = 0; i < 3; ++i) lr_wiener_[plane][pass][i] = kWienerTapsMid[i];
+        lr_sgr_xqd_[plane][pass] = kSgrXqdMid[pass];
+      }
+    }
   }
 };
 
 } /* namespace */
+
+/* Decodes every tile of a frame. The tiles may arrive in any order; each one
+ * reads its own bytes with its own range decoder and its own CDF tables, and
+ * writes into the frame's shared maps (block sizes, references, segment ids,
+ * CDEF index, the motion field) that the post-processing stages read as one
+ * picture. A tile group that does not cover the frame is not decoded: the maps
+ * it would leave behind are the maps of a picture with holes. */
+ParseStatus decode_tiles(const SequenceHeader& seq, const FrameHeader& frame,
+                         const RefPool* refs, const TileExtent* tiles, size_t tile_count,
+                         const uint8_t* data, size_t size, TileDecodeResult* out,
+                         std::string* error) {
+  if (error) error->clear();
+  if (!out) return fail(error, "tile: no output");
+  *out = TileDecodeResult();
+  if (!data || size == 0) return fail(error, "tile: no tile data");
+  if (!tiles || tile_count == 0) return fail(error, "tile: no tiles");
+  const bool intra_frame = frame.type == FrameType::Key || frame.type == FrameType::IntraOnly;
+  if (!intra_frame && !refs) {
+    if (error) *error = "tile: an inter frame needs its reference frames";
+    return ParseStatus::Unsupported;
+  }
+  const int total = std::max(frame.tiles.cols, 1) * std::max(frame.tiles.rows, 1);
+  if (static_cast<int>(tile_count) != total) {
+    if (error)
+      *error = "tile: a tile group that covers only part of the frame is not decoded so far";
+    return ParseStatus::Unsupported;
+  }
+
+  ++g_frame_ordinal;
+  if (trace_enabled()) {
+    std::fprintf(stderr, "FR %d oh=%d type=%d show=%d\n", g_frame_ordinal, frame.order_hint,
+                 static_cast<int>(frame.type), frame.show_frame ? 1 : 0);
+  }
+  TileDecodeResult frame_out;
+  TileParser parser(seq, frame, refs, data, size, &frame_out, error);
+  parser.init_state();
+  size_t used = 0;
+  bool overrun = false;
+  for (const TileExtent* tile = tiles; tile != tiles + tile_count; ++tile) {
+    if (tile->index < 0 || tile->index >= total)
+      return fail(error, "tile: tile index out of range");
+    if (tile->size == 0 || tile->offset >= size || tile->size > size - tile->offset)
+      return fail(error, "tile: tile bytes outside the payload");
+    const ParseStatus status = parser.run_tile(tile->col, tile->row, data + tile->offset,
+                                               tile->size);
+    if (status != ParseStatus::Ok) return status;
+    if (parser.failed()) return fail(error, "tile: the range coder lost synchronisation");
+    used += parser.bytes_used();
+    overrun = overrun || parser.overrun();
+  }
+  parser.publish();
+  frame_out.cdef_idx = parser.cdef_index();
+  frame_out.bytes_used = used;
+  frame_out.overrun = overrun;
+  *out = std::move(frame_out);
+  return ParseStatus::Ok;
+}
 
 ParseStatus decode_intra_tile(const SequenceHeader& seq, const FrameHeader& frame,
                               const uint8_t* data, size_t size, TileDecodeResult* out,

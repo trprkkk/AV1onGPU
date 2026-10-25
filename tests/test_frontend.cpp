@@ -7,6 +7,8 @@
  * that it comes back, and checks that broken or unsupported input is reported
  * as such instead of being misparsed.
  */
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2663,6 +2665,112 @@ void test_tile_decoder() {
 
 } /* namespace */
 
+/* A frame cut into four tiles (tests/data/tiles.ivf, 256x160, 2x2).
+ *
+ * Tiles are decoded independently: each starts from the frame's own CDF tables
+ * with its above/left contexts cleared, and they write into one set of frame
+ * maps. Two properties are worth pinning without pixels. First, a tile group
+ * has to cover the frame - a decoder that accepts three of four tiles silently
+ * leaves a quarter of the picture to whatever was in the maps before. Second,
+ * the tiles are order independent: the picture, the block list and the maps do
+ * not depend on which tile was decoded first, because nothing a tile codes reads
+ * another tile. */
+void test_multi_tile_frame() {
+  std::printf("multi-tile frame (2x2, real key frame)\n");
+  const std::string path = std::string(AV1GPU_TEST_DATA_DIR) + "/tiles.ivf";
+  std::vector<uint8_t> payload;
+  CHECK(read_ivf_frame(path, 0, &payload));
+  if (payload.empty()) return;
+
+  SequenceHeader seq;
+  FrameHeader header;
+  TileGroup group;
+  std::vector<Obu> obus;
+  std::string error;
+  CHECK(split_obus(payload.data(), payload.size(), &obus, &error));
+  const uint8_t* frame_data = nullptr;
+  size_t frame_size = 0;
+  for (const Obu& obu : obus) {
+    if (obu.type == ObuType::SequenceHeader) {
+      CHECK(parse_sequence_header(obu.data, obu.size, &seq, &error) == ParseStatus::Ok);
+    } else if (obu.type == ObuType::Frame || obu.type == ObuType::FrameHeader) {
+      CHECK(parse_frame_header(seq, obu.data, obu.size, &header, &error) == ParseStatus::Ok);
+      CHECK(parse_tile_group(seq, header, obu.data, obu.size, &group, &error) ==
+            ParseStatus::Ok);
+      frame_data = obu.data;
+      frame_size = obu.size;
+    }
+  }
+  CHECK(frame_data != nullptr);
+  if (!frame_data) return;
+
+  CHECK_EQ(header.tiles.cols, 2);
+  CHECK_EQ(header.tiles.rows, 2);
+  CHECK_EQ(static_cast<int>(group.tiles.size()), 4);
+  CHECK(tile_group_is_complete(header, group));
+
+  TileDecodeResult whole;
+  CHECK(decode_tiles(seq, header, nullptr, group.tiles.data(), group.tiles.size(),
+                     frame_data, frame_size, &whole, &error) == ParseStatus::Ok);
+  CHECK(whole.complete);
+  CHECK(!whole.blocks.empty());
+  /* every tile reconstructs something: the four luma rectangles are all
+   * non-empty in this stream, so a decoder that dropped one would lose blocks */
+  const TileExtent* extents[4] = {nullptr, nullptr, nullptr, nullptr};
+  for (const TileExtent& tile : group.tiles) {
+    if (tile.index >= 0 && tile.index < 4) extents[tile.index] = &tile;
+    CHECK_EQ(tile.w > 0 && tile.h > 0, true);
+  }
+  for (int i = 0; i < 4; ++i) {
+    CHECK(extents[i] != nullptr);
+    if (!extents[i]) continue;
+    int inside = 0;
+    for (const TileBlock& block : whole.blocks) {
+      if (block.mi_col * 4 >= extents[i]->x && block.mi_col * 4 < extents[i]->x + extents[i]->w &&
+          block.mi_row * 4 >= extents[i]->y && block.mi_row * 4 < extents[i]->y + extents[i]->h)
+        ++inside;
+    }
+    CHECK(inside > 0);
+  }
+
+  /* A group that does not cover the frame is refused (Unsupported: this layer
+   * does not decode partial pictures), not decoded as if the missing tiles were
+   * blank. */
+  TileDecodeResult partial;
+  error.clear();
+  CHECK(decode_tiles(seq, header, nullptr, group.tiles.data(), group.tiles.size() - 1,
+                     frame_data, frame_size, &partial, &error) == ParseStatus::Unsupported);
+  CHECK(!error.empty());
+
+  /* The same frame with its tiles decoded back to front is the same frame. */
+  std::vector<TileExtent> reversed(group.tiles.rbegin(), group.tiles.rend());
+  TileDecodeResult other;
+  CHECK(decode_tiles(seq, header, nullptr, reversed.data(), reversed.size(), frame_data,
+                     frame_size, &other, &error) == ParseStatus::Ok);
+  CHECK_EQ(other.blocks.size(), whole.blocks.size());
+  CHECK_EQ(other.complete, true);
+  /* the two runs visit the tiles in opposite orders, so the block *lists* are in
+   * different orders by construction: compare them as multisets, one entry per
+   * (position, size, modes) */
+  const auto signature = [](const TileDecodeResult& result) {
+    std::vector<std::array<int, 7>> rows;
+    rows.reserve(result.blocks.size());
+    for (const TileBlock& block : result.blocks) {
+      rows.push_back({block.mi_row,
+                      block.mi_col,
+                      static_cast<int>(block.size),
+                      block.y_mode,
+                      block.uv_mode,
+                      block.skip ? 1 : 0,
+                      block.is_inter ? 1 : 0});
+    }
+    std::sort(rows.begin(), rows.end());
+    return rows;
+  };
+  CHECK(signature(other) == signature(whole));
+  CHECK(other.cdef_idx == whole.cdef_idx);
+}
+
 int main() {
   test_bit_reader();
   test_obu_framing();
@@ -2684,6 +2792,7 @@ int main() {
   test_tile_group();
   test_tile_decoder();
   test_intrabc_frame();
+  test_multi_tile_frame();
   test_skip_mode_header();
   test_real_stream();
   return testing::finish("test_frontend");

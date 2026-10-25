@@ -149,6 +149,13 @@ struct PlanState {
 
   int sb_col = -1; /* the superblock whose BlockDecoded this is */
   int sb_row = -1;
+
+  /* The tile the superblock being planned belongs to, in luma 4x4 units. The
+   * map above is the frame's, so it also holds the blocks of the tiles that
+   * were decoded before this one - and a tile boundary says its neighbours are
+   * not neighbours. Every BlockDecoded question is therefore asked inside these
+   * bounds. */
+  int tile_col0 = 0, tile_col1 = 0, tile_row0 = 0, tile_row1 = 0;
 };
 
 /* clear_block_decoded_flags: at the start of each superblock the map is reset,
@@ -176,6 +183,38 @@ inline void clear_block_decoded(PlanState* st, int r4, int c4) {
   }
   st->sb_col = c4;
   st->sb_row = r4;
+}
+
+/* The tile holding the superblock at (r4, c4), in luma 4x4 units. A frame whose
+ * tile grid was never parsed has one tile: the whole frame. */
+inline void set_tile_bounds(PlanState* st, const FrameHeader& frame, int mi_cols, int mi_rows,
+                            int r4, int c4) {
+  const int cols = frame.tiles.cols > 0 ? frame.tiles.cols : 1;
+  const int rows = frame.tiles.rows > 0 ? frame.tiles.rows : 1;
+  const auto& col_sb = frame.tiles.col_start_sb;
+  const auto& row_sb = frame.tiles.row_start_sb;
+  st->tile_col0 = 0;
+  st->tile_col1 = mi_cols;
+  st->tile_row0 = 0;
+  st->tile_row1 = mi_rows;
+  if (static_cast<int>(col_sb.size()) == cols + 1) {
+    for (int i = 0; i < cols; ++i) {
+      if (c4 >= col_sb[i] * st->sb4 && c4 < col_sb[i + 1] * st->sb4) {
+        st->tile_col0 = col_sb[i] * st->sb4;
+        st->tile_col1 = std::min(mi_cols, col_sb[i + 1] * st->sb4);
+        break;
+      }
+    }
+  }
+  if (static_cast<int>(row_sb.size()) == rows + 1) {
+    for (int i = 0; i < rows; ++i) {
+      if (r4 >= row_sb[i] * st->sb4 && r4 < row_sb[i + 1] * st->sb4) {
+        st->tile_row0 = row_sb[i] * st->sb4;
+        st->tile_row1 = std::min(mi_rows, row_sb[i + 1] * st->sb4);
+        break;
+      }
+    }
+  }
 }
 
 /* is_smooth, on the luma mi grid: did the block covering this mi unit use one
@@ -407,7 +446,10 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
 
     const int sb_c = block.mi_col & ~(st.sb4 - 1);
     const int sb_r = block.mi_row & ~(st.sb4 - 1);
-    if (sb_c != st.sb_col || sb_r != st.sb_row) clear_block_decoded(&st, sb_r, sb_c);
+    if (sb_c != st.sb_col || sb_r != st.sb_row) {
+      set_tile_bounds(&st, frame, mi_cols, mi_rows, sb_r, sb_c);
+      clear_block_decoded(&st, sb_r, sb_c);
+    }
 
     /* YModes / UVModes are written when the mode info is parsed, i.e. before
      * the residual: a later block's edge filter type reads them, and so does a
@@ -429,8 +471,11 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
       avail_u_chroma = false;
       avail_l_chroma = false;
     } else {
-      if (ss_y && bh4 == 1) avail_u_chroma = avail_u && block.mi_row >= 2;
-      if (ss_x && bw4 == 1) avail_l_chroma = avail_l && block.mi_col >= 2;
+      /* is_inside(r - 2, c) / is_inside(r, c - 2): the neighbouring chroma
+       * sample of a four sample wide (or high) block is two mi units away, and
+       * what it has to be inside is the *tile*, not the frame. */
+      if (ss_y && bh4 == 1) avail_u_chroma = avail_u && block.mi_row - 2 >= st.tile_row0;
+      if (ss_x && bw4 == 1) avail_l_chroma = avail_l && block.mi_col - 2 >= st.tile_col0;
     }
 
     /* ---- inter prediction ------------------------------------------------
@@ -829,8 +874,21 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
 
       bs.have_left = (plane == 0 ? avail_l : avail_l_chroma) || start_x > block_x;
       bs.have_above = (plane == 0 ? avail_u : avail_u_chroma) || start_y > block_y;
-      bs.have_above_right = st.decoded[plane].at(grid_x + step_x, grid_y - 1) ? 1 : 0;
-      bs.have_below_left = st.decoded[plane].at(grid_x - 1, grid_y + step_y) ? 1 : 0;
+      /* BlockDecoded's border answers these, but the map is the frame's: a
+       * sample across a tile boundary is in a tile that may already have been
+       * decoded, which is not what the question asks. */
+      const int tile_x0 = st.tile_col0 >> sub_x, tile_x1 = st.tile_col1 >> sub_x;
+      const int tile_y0 = st.tile_row0 >> sub_y, tile_y1 = st.tile_row1 >> sub_y;
+      bs.have_above_right =
+          (grid_y - 1 >= tile_y0 && grid_x + step_x < tile_x1 &&
+           st.decoded[plane].at(grid_x + step_x, grid_y - 1))
+              ? 1
+              : 0;
+      bs.have_below_left =
+          (grid_x - 1 >= tile_x0 && grid_y + step_y < tile_y1 &&
+           st.decoded[plane].at(grid_x - 1, grid_y + step_y))
+              ? 1
+              : 0;
       bs.filter_type = intra_filter_type(st, block.mi_row, block.mi_col, plane,
                                          plane == 0 ? avail_u : avail_u_chroma,
                                          plane == 0 ? avail_l : avail_l_chroma);

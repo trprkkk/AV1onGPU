@@ -43,6 +43,7 @@
 #include "frontend/block_size.hpp"
 #include "frontend/cdf.hpp"
 #include "frontend/headers.hpp"
+#include "frontend/tiles.hpp"
 #include "frontend/tx_size.hpp"
 
 namespace av1gpu {
@@ -360,6 +361,19 @@ ParseStatus decode_intra_tile(const SequenceHeader& seq, const FrameHeader& fram
 ParseStatus decode_tile(const SequenceHeader& seq, const FrameHeader& frame,
                         const RefPool* refs, const uint8_t* data, size_t size,
                         TileDecodeResult* out, std::string* error);
+
+/* Decodes every tile of a frame into one result.
+ *
+ * `tiles` is the frame's tile group as parse_tile_group reports it (each entry
+ * carries the byte range it occupies inside `data`/`size`), and must cover the
+ * frame's grid completely. The maps in the result - block sizes, references,
+ * segment ids, the CDEF index, the motion field - are the frame's, assembled
+ * from all the tiles; the tables the frame hands on are the ones of the tile
+ * `context_update_tile_id` names (5.9.2's frame_end_update_cdf). */
+ParseStatus decode_tiles(const SequenceHeader& seq, const FrameHeader& frame,
+                         const RefPool* refs, const TileExtent* tiles, size_t tile_count,
+                         const uint8_t* data, size_t size, TileDecodeResult* out,
+                         std::string* error);
 
 } /* namespace frontend */
 } /* namespace av1gpu */

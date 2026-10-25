@@ -448,6 +448,45 @@ plans through the device kernels; dav1d and ffmpeg agree with us on every sample
 `tests/data/make_edge_grid.py` writes the stream back byte for byte
 (`python3 tests/data/make_edge_grid.py tests/data/edge_grid.ivf`).
 
+`tiles.ivf` is the only stream whose frames are cut into more than one tile: four
+frames of 256x160, 72 KB, `-cpu-used 3 -crf 28 -lag-in-frames 0 -g 4 -tiles 2x2`
+(libaom needs row-mt on, which ffmpeg's `-tiles` turns on, to honour more than
+one tile row). The grid divides 256 into 128 + 128 samples across and 160 into
+128 + 32 down, so the tile row boundary is not at the frame's middle and the
+bottom two tiles are only 32 samples high - three of the four tiles have a
+neighbour from another tile on two sides. Four frames, the first a key frame, so
+three code inter prediction across the tile edges.
+
+It exists for the two things a single tile frame cannot show. First, what starts
+over at a tile (5.11.2): its own range decoder over its own bytes, its own copy
+of the frame's CDF tables, cleared above/left contexts, `CurrentQIndex` back to
+`BaseQIdx`, `DeltaLF` zero and the restoration predictors back to their mid
+points - while `MiSizes`, the references, the motion field, the segment ids, the
+CDEF index grid and the restoration units stay the frame's, and the tile group
+must cover all of them. Second, `is_inside` meaning the tile rather than the
+frame, which two places had wrong: `AvailUChroma`/`AvailLChroma` for a block one
+4x4 wide in a subsampled frame (they reach two mi units out, into the
+neighbouring luma block's chroma) and `find_warp_samples`' `add_sample` for a
+locally warped block on a tile edge. Putting either back leaves 18,447 and 3,676
+of the frame's 245,760 bytes one level off against dav1d - and nothing
+desynchronises, so both decode plausibly and are only visible by comparison.
+
+The content is what makes the encoder produce the shapes the bugs need: a
+smoothed random texture that the four frames pan and zoom over, i.e. global
+motion, which is what makes libaom code local warped motion (699 blocks of the
+four frames), fresh noise on every frame, hard edged panels on the right and
+bottom edges so the loop filter, CDEF and restoration work there, a dark band
+across the tile row boundary in the noisy area where the encoder spends 4x4
+blocks - the size whose chroma is coded the sub-8x8 way - and gradients on
+chroma.
+
+`tiles.hash` holds the per frame hashes, `stream_tiles` checks them and
+`opencl_tiles` replays the same plans through the device kernels; dav1d and
+ffmpeg agree with us on every sample.
+
+`tests/data/make_tiles_clip.py` writes the stream back byte for byte
+(`python3 tests/data/make_tiles_clip.py tests/data/tiles.ivf`).
+
 The three `aom_*` fixtures are the ones that are not 8 bit 4:2:0: twelve frames
 of a 320x240 ramp each, encoded with libaom through ffmpeg's `libaom-av1` at
 `-crf 40 -cpu-used 8 -lag-in-frames 0`.

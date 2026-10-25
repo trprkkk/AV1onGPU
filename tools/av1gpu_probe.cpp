@@ -246,6 +246,26 @@ void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const RefPoo
       std::printf("    tile %d: %zu bytes at offset %zu (%dx%d at %d,%d)\n", tile.index,
                   tile.size, tile.offset, tile.w, tile.h, tile.x, tile.y);
     }
+    /* Every tile is decoded with its own range decoder into the frame's shared
+     * maps, which is also the only way to tell whether the grid and the tile
+     * sizes agree with the bytes. */
+    if (!tile_group_is_complete(hdr, group)) return;
+    TileDecodeResult decoded;
+    const ParseStatus status = decode_tiles(seq, hdr, refs, group.tiles.data(),
+                                            group.tiles.size(), payload, payload_size, &decoded,
+                                            &tile_error);
+    if (status == ParseStatus::Ok) {
+      std::printf("  tiles decoded: %zu block(s), %d transform block(s), %zu coefficient(s)\n",
+                  decoded.blocks.size(), decoded.transform_blocks, decoded.coefficients);
+      if (produced) *produced = decoded.ref_mvs;
+      if (cdf) *cdf = decoded.cdf;
+      if (seg_map) *seg_map = decoded.seg_map;
+    } else if (status == ParseStatus::Unsupported) {
+      std::printf("  tiles: %zu block(s) parsed, then: %s\n", decoded.blocks.size(),
+                  decoded.stop_reason.empty() ? tile_error.c_str() : decoded.stop_reason.c_str());
+    } else {
+      std::printf("  tiles: %s\n", tile_error.c_str());
+    }
   }
 }
 

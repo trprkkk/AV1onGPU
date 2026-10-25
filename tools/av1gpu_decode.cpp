@@ -521,17 +521,17 @@ int main(int argc, char** argv) {
         status = 1;
         break;
       }
-      if (group.tiles.size() != 1) {
-        std::printf("frame %zu: %zu tiles, multi-tile decoding is not implemented\n", index,
-                    group.tiles.size());
+      if (!tile_group_is_complete(frame, group)) {
+        std::printf("frame %zu: the tile group covers %zu of the frame's %dx%d tiles\n", index,
+                    group.tiles.size(), frame.tiles.cols, frame.tiles.rows);
         status = 1;
         break;
       }
 
-      const TileExtent& tile = group.tiles[0];
       TileDecodeResult decoded;
-      const ParseStatus tile_status = decode_tile(seq, frame, &refs, obu.data + tile.offset,
-                                                  tile.size, &decoded, &tile_error);
+      const ParseStatus tile_status =
+          decode_tiles(seq, frame, &refs, group.tiles.data(), group.tiles.size(), obu.data,
+                       obu.size, &decoded, &tile_error);
       if (tile_status != ParseStatus::Ok) {
         std::printf("frame %zu: tile: %s\n", index,
                     decoded.stop_reason.empty() ? tile_error.c_str()

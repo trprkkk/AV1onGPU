@@ -173,6 +173,16 @@ then walks the partition tree of every superblock, so what comes out is the
 syntax of a whole frame - which is why `av1gpu_decode` decodes the fixtures
 without a second parser.
 
+A frame may be cut into a grid of tiles and each tile is coded independently, so
+`decode_tiles` decodes every tile of a parsed tile group - in any order - into
+the frame wide maps: the range decoder, the CDF tables, the above/left contexts,
+`CurrentQIndex` and the restoration predictors start over at each tile (5.11.2),
+while the block sizes, references, motion field, segment ids, CDEF index grid and
+restoration units are the frame's, and the tables it hands on are those of the
+tile `context_update_tile_id` names (5.9.2). Neighbour availability is the tile
+everywhere 7.10 asks, which is where two boundary bugs lived until
+`tests/data/tiles.ivf` (2x2) pinned them - `docs/ACCURACY.md` has both.
+
 The parser is checked against a real stream (`tests/data/svt_av1_320x240.ivf`,
 encoded with SVT-AV1) whose fields were cross-checked with FFmpeg's
 `trace_headers` bitstream filter, and it was fuzz-compared against dav1d's
@@ -321,7 +331,9 @@ upscaled after CDEF (`tests/data/superres.ivf`), loop restoration, both filters
 and the per unit switchable form, which reads the two pictures 7.17 keeps
 (`tests/data/lr.ivf`, and the same clip at 4:4:4 and 4:2:2 as `lr_444` /
 `lr_422`), and film grain, whose generator, auto-regressive filter
-and stripe blending follow 7.18.3 sample for sample (`tests/data/grain.ivf`).
+and stripe blending follow 7.18.3 sample for sample (`tests/data/grain.ivf`), and frames cut into tiles, which `decode_tiles`
+decodes tile by tile into one picture (`tests/data/tiles.ivf`, 2x2, checked
+against dav1d and through the OpenCL replay).
 `av1gpu::synthetic_encode` is a small closed loop test encoder that produces
 valid syntax from a generated clip and does not need any of those.
 

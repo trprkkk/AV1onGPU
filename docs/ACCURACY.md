@@ -976,7 +976,7 @@ one restoring the old numbers when reverted:
 
 | mutation | samples wrong |
 | --- | --- |
-| the stripe starts at the frame edge instead of eight rows above | 225 / 158 / 30 / 26 / 37 / 35, and 227 across a border |
+| the stripe starts at the frame edge instead of eight rows above | 39 / 9 / 30 / 26 / 37 / 35 (176 in all), and 227 across a border |
 | `unitRow` drops the `+ 8` of 7.17.1 | 572 / 561, and 558 across a border |
 | the last unit is not stretched to the plane edge | 315 (160x96) |
 | every row is taken from the CDEF picture | 31 (the border case, CDEF on) |
@@ -1069,6 +1069,80 @@ available as unavailable - with everything else fixed turns 0 wrong samples into
 160 and 199 on the 160x116 clip, 588 on 128x68 and 75 over the four frames of
 `edge_grid`: the specification makes availability an mi unit question (7.15.3's
 `is_inside_filter_region` against `MiCols`/`MiRows`), not a picture size one.
+
+## Frames cut into tiles
+
+Until this fixture, every stream in `tests/data` coded one tile per frame, and
+the decoder said so: `decode_tile` returned `Unsupported` for any frame whose
+`tiles.cols` or `tiles.rows` was not one. The tile *group* parser had split
+payloads into tiles from the start, so what was missing was the per tile state
+and the merge of the frame's maps.
+
+**What starts over at a tile.** 5.11.2's `decode_tile` is explicit about it,
+and each of these was a bug waiting to happen: the range decoder reads the
+tile's own bytes; the CDF tables are the ones the *frame* started from (a tile
+adapts its own copy and never sees another tile's adaptations); `CurrentQIndex`
+is `BaseQIdx` again; `DeltaLF` is zero; `clear_above_context` runs once and
+`clear_left_context` at every superblock row; and `RefSgrXqd`/`RefLrWiener` go
+back to their mid points. **What does not**: `MiSizes`, `RefFrames`, the motion
+field, the segment ids, the CDEF index grid and the restoration units are the
+frame's, and each restoration unit is coded by the tile that holds its top left
+corner. The temporal motion vector grid is saved once, at the end of the frame.
+
+**Which tile's tables are kept** is not "the last one decoded": 9.x's
+`frame_end_update_cdf` copies the tables of the tile whose index is
+`context_update_tile_id` (5.9.2), and only when `disable_frame_end_update_cdf`
+is 0. A frame with one tile names tile 0, so a single tile frame publishes
+exactly what it always did.
+
+**Two boundary bugs, both the same mistake.** `is_inside` means the tile, and
+the frame's maps are frame wide, so a sample across a tile boundary is a real
+reconstructed sample that the bitstream says is *not* a neighbour. Two places
+read the frame where the specification means the tile:
+
+  * `AvailUChroma`/`AvailLChroma`. For a block one 4x4 wide (or high) in a
+    subsampled frame the chroma is shared with the neighbouring luma block, so
+    5.11.5 asks `is_inside(r - 2, c)` / `is_inside(r, c - 2)` - two mi units
+    away. The planner tested `mi_row >= 2` and `mi_col >= 2`, i.e. the frame's
+    origin, so the second column of chroma in a tile predicted from the tile to
+    its left. It shows as a constant offset per chroma block (an error in the
+    average luma a chroma-from-luma block subtracts) that then propagates
+    through the blocks that predict from it: 18,447 of `tiles.ivf`'s 245,760
+    bytes.
+  * `find_warp_samples`' `add_sample` (7.10.4.2) starts with
+    `is_inside(mvRow, mvCol)`. It tested the frame's bounds instead, so a
+    locally warped block on a tile edge fitted its affine model to a motion
+    vector from the next tile - and only blocks that use `LOCALWARP` notice:
+    3,676 of those bytes.
+
+Both were invisible in every single tile fixture, and both *decode*: the range
+coder stays in sync because nothing about the syntax changes, so the frame comes
+out plausible and slightly wrong. Reverting either one makes `tiles.ivf` differ
+from dav1d again by the numbers above, which is how the fixture is known to pin
+them.
+
+`tests/data/tiles.ivf` is 256x160 cut into 2x2 tiles - 128 + 128 across and
+128 + 32 down, so the bottom two tiles are only 32 samples high and three of the
+four tiles have a neighbour from another tile on two sides. Four frames, the
+first a key frame, at `-crf 28`; the content pans and zooms, which is what makes
+libaom code local warped motion (699 blocks of the four frames), and the tile row
+boundary runs through a dark band where the encoder spends 4x4 blocks - the
+sizes whose chroma is coded the sub-8x8 way. It is bit exact against dav1d and
+ffmpeg, through the CPU backend and through the OpenCL replay, and
+`tests/test_frontend.cpp` checks the two properties that do not need pixels: a
+tile group that covers only three of the four tiles is refused rather than
+decoded with a quarter of the maps left as they were, and decoding the same
+frame's tiles back to front produces the same blocks and the same CDEF index
+grid.
+
+The sweep behind it: 2x2, 2x1, 1x2 and 4x2 layouts; 130x66, 192x128, 256x144,
+320x240 and 512x288; `-crf` 24, 30, 36 and 40; a lossless stream (`-crf 0`, so
+no loop filter, CDEF or restoration at all); one with `-enable-restoration 0`;
+one with `-enable-cdef 0`; and an all-intra stream (`-g 1`). Every one of them is
+bit exact against dav1d. A 10 bit stream was checked the same way but not added:
+`av1gpu_decode -o` writes 16 bit samples for those and dav1d's yuv muxer writes
+them too, so the comparison needs `--yuv16` on our side (see the README), and
+the 10 bit path is what `aom_10bit_320x240` already pins.
 
 ## Film grain
 

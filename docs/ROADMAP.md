@@ -158,6 +158,27 @@ the first symbol of the fixture's key frame.
      walks the four sample grid now, `tests/data/edge_grid.ivf` (130x66, where
      both planes end inside that grid) pins it, and the sweep in
      `docs/ACCURACY.md` is clean: no size in it differs against dav1d any more.
+   * *A frame cut into tiles*, done: `decode_tiles` (`tile_decoder.cpp`) takes
+     the tiles of a parsed tile group - in any order - and decodes each one into
+     the frame wide maps, because 5.11.2 restarts the range decoder, the CDF
+     tables, the above/left contexts, `CurrentQIndex` and the restoration
+     predictors at every tile, while `MiSizes`, the references, the motion
+     field, the segment ids, the CDEF index grid and the restoration units stay
+     the frame's. A tile group that does not cover the frame is refused rather
+     than decoded into a picture with holes, and the tables the frame hands on
+     are those of the tile `context_update_tile_id` names (5.9.2). The rest is
+     `is_inside` meaning the tile rather than the frame, and two places read the
+     frame: chroma availability for a 4x4 wide block (`AvailUChroma` /
+     `AvailLChroma` reach two mi units out) and `find_warp_samples`' sample scan
+     for a locally warped block on a tile edge. `tests/data/tiles.ivf` (256x160,
+     2x2, four frames) pins both: reverting either one leaves 18,447 and 3,676
+     of its 245,760 bytes wrong against dav1d while the range coder stays in
+     sync. `av1gpu_probe` and `av1gpu_decode` decode every tile of a group now,
+     and `tests/test_frontend.cpp` checks the tiling itself (four tiles, a
+     three tile group refused, tiles decoded back to front giving the same
+     blocks and the same CDEF grid). A 2x1, 1x2 and 4x2 layout, five sizes and
+     five encoder settings are bit exact against dav1d too; see
+     `docs/ACCURACY.md`.
 
    Two bugs the block level trace found on the way, worth recording because
    both are the kind that decodes plausibly and then desynchronises: the single
@@ -246,7 +267,7 @@ the first symbol of the fixture's key frame.
    which is what makes the choice between them observable - with CDEF off they
    are the same picture and swapping them is a no-op.
    Of the nine mutations tried, eight are caught - the stripe starting at the
-   frame edge (225 samples), `unitRow` without the `+ 8` (572), the last unit not
+   frame edge (176 samples over six of the eight geometries), `unitRow` without the `+ 8` (572), the last unit not
    stretched to the plane edge (315), always taking the CDEF picture (31), never
    borrowing below a stripe (26), no clamp at the borrowed row (6), the two
    pictures swapped (1575) and the pre-CDEF snapshot never upscaled (120) - and
