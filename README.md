@@ -337,8 +337,10 @@ and the per unit switchable form, which reads the two pictures 7.17 keeps
 (`tests/data/lr.ivf`, and the same clip at 4:4:4 and 4:2:2 as `lr_444` /
 `lr_422`), and film grain, whose generator, auto-regressive filter
 and stripe blending follow 7.18.3 sample for sample (`tests/data/grain.ivf`), and frames cut into tiles, which `decode_tiles`
-decodes tile by tile into one picture (`tests/data/tiles.ivf`, 2x2, checked
-against dav1d and through the OpenCL replay).
+decodes tile by tile into one picture (`tests/data/tiles.ivf`, 2x2, and
+`tiles_grid.ivf`, 4x2 with unequal tile widths on a frame whose height is not a
+superblock multiple - both checked against dav1d and through the OpenCL
+replay).
 `av1gpu::synthetic_encode` is a small closed loop test encoder that produces
 valid syntax from a generated clip and does not need any of those.
 

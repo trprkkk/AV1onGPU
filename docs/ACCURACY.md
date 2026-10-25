@@ -1135,7 +1135,21 @@ decoded with a quarter of the maps left as they were, and decoding the same
 frame's tiles back to front produces the same blocks and the same CDEF index
 grid.
 
-The sweep behind it: 2x2, 2x1, 1x2 and 4x2 layouts; 130x66, 192x128, 256x144,
+**The grid has to divide the frame, and it usually does not.** 5.9.1's
+`tile_log2` distributes the superblock columns over the tile columns, so a frame
+that is not a multiple of the tile width ends with a wider tile - and the mi
+extent of the last tile row or column stops at the *coded* grid
+(`MiRows = 2 * ((FrameHeight + 7) >> 3)`), which for a picture that is not a
+multiple of eight is past the picture. `tests/data/tiles_grid.ivf` is 320x188 in
+4x2 tiles: the tile columns are 64, 64, 64 and 128 samples wide, the tile rows 64
+and 124, and the last row's extent is 192 luma samples for a 188 sample picture.
+It is bit exact against dav1d and ffmpeg through the CPU backend and through the
+OpenCL replay, and `tests/test_frontend.cpp` checks the eight rectangles and the
+mi grid they are cut on (`mi_dim(188) == 48`). `tiles.ivf` cannot show any of
+this: its four tiles are equal rectangles on a frame that is a superblock
+multiple in both directions.
+
+The sweep behind both: 2x2, 2x1, 1x2 and 4x2 layouts; 130x66, 192x128, 256x144,
 320x240 and 512x288; `-crf` 24, 30, 36 and 40; a lossless stream (`-crf 0`, so
 no loop filter, CDEF or restoration at all); one with `-enable-restoration 0`;
 one with `-enable-cdef 0`; and an all-intra stream (`-g 1`). Every one of them is
@@ -1233,7 +1247,7 @@ export ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1
 ctest --test-dir build-san -j
 ```
 
-The normal and the sanitizer build are both expected to stay at 51/51 (`ctest -N`
+The normal and the sanitizer build are both expected to stay at 53/53 (`ctest -N`
 prints the list), and neither is allowed to print a `runtime error` line.
 The option compiles with `-fno-sanitize-recover=all` for exactly that reason:
 UBSan recovers by default, so without it a finding is a line on stderr and a

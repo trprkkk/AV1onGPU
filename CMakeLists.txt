@@ -178,15 +178,16 @@ if(AV1GPU_BUILD_TESTS)
   # end *inside* the four sample grid the loop filter walks (66 luma rows and 33
   # chroma rows: the filter covers 68 and 36, which is neither the picture size
   # nor the eight sample grid, and CDEF and restoration read the difference),
-  # and tiles the only one cut into more than one tile per frame (2x2, at
-  # 128 + 128 samples across and 128 + 32 down, so every one of the four tiles
-  # has a neighbour of another tile on two sides).
-  # Every frame of all twenty one is bit exact.
+  # and tiles / tiles_grid the only ones cut into more than one tile per frame
+  # (2x2 on 256x160, and 4x2 on a 320x188 frame whose tile widths are 64 + 64 +
+  # 64 + 128 and whose tile rows are 64 + 124 samples, so the last row ends at
+  # the coded extent, two samples past the picture).
+  # Every frame of all twenty two is bit exact.
   if(TARGET av1gpu_decode)
     foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra seg_altq superres grain
                  grain_inherit lr lr_10bit lr_12bit lr_444 lr_422 lossless
-                 odd_size edge_grid tiles aom_10bit_320x240 aom_444_10bit_320x240
-                 aom_12bit_320x240)
+                 odd_size edge_grid tiles tiles_grid aom_10bit_320x240
+                 aom_444_10bit_320x240 aom_12bit_320x240)
       set(frames 30)
       # deeper than 8 bit: the hashes are over the samples themselves, so the
       # decoder has to write them at full precision
@@ -229,6 +230,12 @@ if(AV1GPU_BUILD_TESTS)
         # exercises the per tile range decoder, CDF and contexts, the
         # context_update_tile_id copy, and is_inside being the tile rather than
         # the frame in chroma availability and in the warp sample scan
+        set(frames 4)
+      elseif(stream STREQUAL "tiles_grid")
+        # 320x188 in 4x2 tiles: unequal tile widths (64, 64, 64, 128 from
+        # tile_log2) and a last tile row that is clamped to the coded extent
+        # (192 luma samples for a 188 sample picture), which is what the mi
+        # grid of the tile decoder and of the planner have to agree on
         set(frames 4)
       elseif(stream STREQUAL "lr_10bit")
         # the same clip at 10 bit, where the restoration filters' bit depth
@@ -346,13 +353,15 @@ if(AV1GPU_BUILD_TESTS)
     #   tiles           the only one cut into more than one tile, so the only one
     #                   whose plans carry blocks from four independently coded
     #                   tiles and whose CDEF and restoration tests follow them
+    #   tiles_grid      the same with an unequal grid (4x2, 64/64/64/128 wide)
+    #                   on a frame whose height is not a superblock multiple
     #   svt_av1_320x240 a different encoder, so a different mix of tools
     # All of it on a machine with no GPU at all.
     if(TARGET av1gpu_decode)
       foreach(stream palette_sc intrabc lw_t2 lw_t3 inter_intra seg_altq
                      superres lr lr_10bit lr_12bit lr_444 lr_422 lossless
-                     odd_size edge_grid tiles grain grain_inherit aom_10bit_320x240
-                     aom_444_10bit_320x240 aom_12bit_320x240
+                     odd_size edge_grid tiles tiles_grid grain grain_inherit
+                     aom_10bit_320x240 aom_444_10bit_320x240 aom_12bit_320x240
                      svt_av1_320x240)
         set(frames 30)
         if(stream STREQUAL "palette_sc")
@@ -370,6 +379,8 @@ if(AV1GPU_BUILD_TESTS)
         elseif(stream STREQUAL "edge_grid")
           set(frames 4)
         elseif(stream STREQUAL "tiles")
+          set(frames 4)
+        elseif(stream STREQUAL "tiles_grid")
           set(frames 4)
         elseif(stream STREQUAL "grain_inherit")
           set(frames 10)

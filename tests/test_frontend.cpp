@@ -2771,6 +2771,100 @@ void test_multi_tile_frame() {
   CHECK(other.cdef_idx == whole.cdef_idx);
 }
 
+/* The second tile geometry (tests/data/tiles_grid.ivf, 320x188, 4x2).
+ *
+ * `tiles.ivf` cuts a frame that is a superblock multiple into four equal
+ * tiles. This one does not: 320 is five superblock columns, which the tile grid
+ * of 5.9.1 distributes as 64 + 64 + 64 + 128 (its `tile_log2` does not divide
+ * evenly), and 188 is two superblock rows plus 60 samples, so the bottom tile
+ * row is 124 samples high and its *mi* extent ends at the coded grid (192 luma
+ * samples) instead of at the picture. The tile decoder walks that extent and
+ * writes only the picture, and `plan_from_tile` has to put the same bounds on
+ * the planned blocks; the hash tests are what check the pixels, and this one
+ * checks the geometry those bounds come from. */
+void test_tile_grid_frame() {
+  std::printf("tile grid (4x2 on a 320x188 frame)\n");
+  const std::string path = std::string(AV1GPU_TEST_DATA_DIR) + "/tiles_grid.ivf";
+  std::vector<uint8_t> payload;
+  CHECK(read_ivf_frame(path, 0, &payload));
+  if (payload.empty()) return;
+
+  SequenceHeader seq;
+  FrameHeader header;
+  TileGroup group;
+  std::vector<Obu> obus;
+  std::string error;
+  CHECK(split_obus(payload.data(), payload.size(), &obus, &error));
+  const uint8_t* frame_data = nullptr;
+  size_t frame_size = 0;
+  for (const Obu& obu : obus) {
+    if (obu.type == ObuType::SequenceHeader) {
+      CHECK(parse_sequence_header(obu.data, obu.size, &seq, &error) == ParseStatus::Ok);
+    } else if (obu.type == ObuType::Frame || obu.type == ObuType::FrameHeader) {
+      CHECK(parse_frame_header(seq, obu.data, obu.size, &header, &error) == ParseStatus::Ok);
+      CHECK(parse_tile_group(seq, header, obu.data, obu.size, &group, &error) ==
+            ParseStatus::Ok);
+      frame_data = obu.data;
+      frame_size = obu.size;
+    }
+  }
+  CHECK(frame_data != nullptr);
+  if (!frame_data) return;
+
+  /* the size the frame codes blocks on is rounded up to eight samples, so the
+   * mi grid is 192 luma rows for a picture that is 188 high */
+  CHECK_EQ(header.width, 320);
+  CHECK_EQ(header.height, 188);
+  CHECK_EQ(mi_dim(header.width), 80);
+  CHECK_EQ(mi_dim(header.height), 48);
+  CHECK_EQ(header.tiles.cols, 4);
+  CHECK_EQ(header.tiles.rows, 2);
+  CHECK_EQ(static_cast<int>(group.tiles.size()), 8);
+  CHECK(tile_group_is_complete(header, group));
+
+  /* the rectangles libaom produced: four columns of 64, 64, 64 and 128 samples,
+   * and two rows of 64 and 124 */
+  struct Expect {
+    int x, y, w, h;
+  };
+  const Expect expected[8] = {
+      {0, 0, 64, 64},    {64, 0, 64, 64},   {128, 0, 64, 64},   {192, 0, 128, 64},
+      {0, 64, 64, 124},  {64, 64, 64, 124}, {128, 64, 64, 124}, {192, 64, 128, 124},
+  };
+  const TileExtent* extents[8] = {nullptr, nullptr, nullptr, nullptr,
+                                  nullptr, nullptr, nullptr, nullptr};
+  for (const TileExtent& tile : group.tiles) {
+    CHECK(tile.index >= 0 && tile.index < 8);
+    if (tile.index < 0 || tile.index >= 8) continue;
+    extents[tile.index] = &tile;
+    CHECK_EQ(tile.x, expected[tile.index].x);
+    CHECK_EQ(tile.y, expected[tile.index].y);
+    CHECK_EQ(tile.w, expected[tile.index].w);
+    CHECK_EQ(tile.h, expected[tile.index].h);
+  }
+  for (int i = 0; i < 8; ++i) CHECK(extents[i] != nullptr);
+  if (!extents[0]) return;
+
+  TileDecodeResult result;
+  CHECK(decode_tiles(seq, header, nullptr, group.tiles.data(), group.tiles.size(),
+                     frame_data, frame_size, &result, &error) == ParseStatus::Ok);
+  CHECK(result.complete);
+  CHECK(!result.blocks.empty());
+  /* every tile reconstructs something, including the bottom row whose mi extent
+   * runs past the picture */
+  for (int i = 0; i < 8; ++i) {
+    int inside = 0;
+    for (const TileBlock& block : result.blocks) {
+      if (block.mi_col * 4 >= expected[i].x &&
+          block.mi_col * 4 < expected[i].x + expected[i].w &&
+          block.mi_row * 4 >= expected[i].y &&
+          block.mi_row * 4 < expected[i].y + expected[i].h)
+        ++inside;
+    }
+    CHECK(inside > 0);
+  }
+}
+
 int main() {
   test_bit_reader();
   test_obu_framing();
@@ -2793,6 +2887,7 @@ int main() {
   test_tile_decoder();
   test_intrabc_frame();
   test_multi_tile_frame();
+  test_tile_grid_frame();
   test_skip_mode_header();
   test_real_stream();
   return testing::finish("test_frontend");

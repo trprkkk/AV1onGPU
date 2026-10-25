@@ -487,6 +487,31 @@ ffmpeg agree with us on every sample.
 `tests/data/make_tiles_clip.py` writes the stream back byte for byte
 (`python3 tests/data/make_tiles_clip.py tests/data/tiles.ivf`).
 
+`tiles_grid.ivf` is the second tile geometry: 320x188, four tile columns and two
+tile rows, 79 KB, `-cpu-used 4 -crf 38 -lag-in-frames 0 -g 4 -tiles 4x2`. Both
+of its dimensions are the point. 320 is five superblock columns, and the tile
+grid of 5.9.1 does not divide them evenly - libaom gives the tile columns 64,
+64, 64 and 128 samples - so the tiles are not equal and the last one is twice as
+wide as the others. 188 is two superblock rows plus 60 samples: the tile rows
+are 64 and 124 samples high, and the bottom row's *mi* extent ends at the coded
+grid (192 luma samples, `MiRows = 2 * ((188 + 7) >> 3) = 48`) rather than at the
+picture. A decoder that walks that extent and writes the picture, and a planner
+that bounds its blocks with the same number, is what the fixture pins; the two
+tiles of `tiles.ivf` are four equal rectangles on a frame that is a multiple of
+the superblock in both directions, so none of this is visible there.
+
+The content is the same idea as `tiles.ivf` - a panning, noisier random texture
+with fresh noise on every frame, hard edged panels on the right and bottom, a
+dark band just above the tile row boundary for the 4x4 blocks - at the size the
+grid needs.
+
+`tiles_grid.hash` holds the per frame hashes, `stream_tiles_grid` checks them
+and `opencl_tiles_grid` replays the same plans through the device kernels; dav1d
+and ffmpeg agree with us on every sample.
+
+`tests/data/make_tile_grid_clip.py` writes the stream back byte for byte
+(`python3 tests/data/make_tile_grid_clip.py tests/data/tiles_grid.ivf`).
+
 The three `aom_*` fixtures are the ones that are not 8 bit 4:2:0: twelve frames
 of a 320x240 ramp each, encoded with libaom through ffmpeg's `libaom-av1` at
 `-crf 40 -cpu-used 8 -lag-in-frames 0`.
