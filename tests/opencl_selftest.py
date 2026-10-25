@@ -733,7 +733,7 @@ def main():
     # The noise image is built on the host; the kernel scales one noise sample by
     # the plane's curve at that sample's value and adds it.
     print("film grain")
-    noise = np.full(64 * 64, 40, dtype=np.int8)
+    noise = np.full(64 * 64, 40, dtype=np.int16)
     g = GrainJob()
     g.dst_off = 8 * stride + 8
     g.dst_stride = stride

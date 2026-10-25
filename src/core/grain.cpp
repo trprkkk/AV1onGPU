@@ -84,9 +84,9 @@ void build_grain(const FilmGrainParams& params, int bit_depth, int ss_x, int ss_
    * chroma size, which is what an unqualified reading of "chroma" suggests. */
   const int chroma_w = av1g_grain_array_w(1, ss_x);
   const int chroma_h = av1g_grain_array_h(1, ss_y);
-  std::vector<signed char> luma_grain(static_cast<size_t>(AV1G_GRAIN_LUMA_W) * AV1G_GRAIN_LUMA_H);
-  std::vector<signed char> cb_grain;
-  std::vector<signed char> cr_grain;
+  std::vector<short> luma_grain(static_cast<size_t>(AV1G_GRAIN_LUMA_W) * AV1G_GRAIN_LUMA_H);
+  std::vector<short> cb_grain;
+  std::vector<short> cr_grain;
   if (chroma_grain) {
     cb_grain.assign(static_cast<size_t>(chroma_w) * chroma_h, 0);
     cr_grain.assign(static_cast<size_t>(chroma_w) * chroma_h, 0);
@@ -124,9 +124,9 @@ void build_grain(const FilmGrainParams& params, int bit_depth, int ss_x, int ss_
     /* The stripes are a scratch buffer, not part of the picture: they hold the
      * grain blocks before they are blended into the noise image. */
     const size_t scratch_size = av1g_grain_scratch_size(luma_w, luma_h, ss_x, ss_y, plane);
-    std::vector<signed char> scratch(scratch_size);
-    const signed char* source = plane == 0 ? luma_grain.data()
-                                           : (plane == 1 ? cb_grain.data() : cr_grain.data());
+    std::vector<short> scratch(scratch_size);
+    const short* source =
+        plane == 0 ? luma_grain.data() : (plane == 1 ? cb_grain.data() : cr_grain.data());
     av1g_grain_noise_plane(&k, source, plane, luma_w, luma_h, ss_x, ss_y,
                            out->noise.data() + out->noise_off[plane], scratch.data());
     av1g_grain_scaling_lut(&k, plane, out->lut + 256 * plane);

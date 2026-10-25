@@ -154,9 +154,12 @@ if(AV1GPU_BUILD_TESTS)
   # the only one that codes a picture narrower than it displays (so the
   # upscaling process and reference scaling both run) and grain the only one
   # that carries film grain parameters (so the generator, the AR filter and the
-  # stripe blending run); every frame of all eight is bit exact.
+  # stripe blending run) and grain_inherit the only one where the grain
+  # parameters are re-used from a reference (update_grain = 0); every frame of
+  # all nine is bit exact.
   if(TARGET av1gpu_decode)
-    foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra seg_altq superres grain)
+    foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra seg_altq superres grain
+                 grain_inherit)
       set(frames 30)
       if(stream STREQUAL "palette_sc")
         set(frames 10)
@@ -164,6 +167,8 @@ if(AV1GPU_BUILD_TESTS)
         set(frames 16)
       elseif(stream STREQUAL "inter_intra")
         set(frames 110)
+      elseif(stream STREQUAL "grain_inherit")
+        set(frames 10)
       endif()
       add_test(NAME stream_${stream}
                COMMAND av1gpu_decode --backend cpu --frames ${frames}
@@ -224,11 +229,13 @@ if(AV1GPU_BUILD_TESTS)
     #                   noise image and the per plane curves reach the device
     #                   kernels, and the chroma planes have to be blended before
     #                   the luma ones
+    #   grain_inherit   the only one where a frame re-uses a reference's grain
+    #                   parameters instead of coding them
     #   svt_av1_320x240 a different encoder, so a different mix of tools
     # All of it on a machine with no GPU at all.
     if(TARGET av1gpu_decode)
       foreach(stream palette_sc intrabc lw_t2 lw_t3 inter_intra seg_altq
-                     superres grain svt_av1_320x240)
+                     superres grain grain_inherit svt_av1_320x240)
         set(frames 30)
         if(stream STREQUAL "palette_sc")
           set(frames 10)
@@ -238,6 +245,8 @@ if(AV1GPU_BUILD_TESTS)
           set(frames 110)
         elseif(stream STREQUAL "svt_av1_320x240")
           set(frames 6)
+        elseif(stream STREQUAL "grain_inherit")
+          set(frames 10)
         endif()
         add_test(NAME opencl_${stream}
                  COMMAND ${AV1GPU_TEST_PY}

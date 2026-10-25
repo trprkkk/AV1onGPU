@@ -979,7 +979,7 @@ void test_filters() {
   {
     const int w = 32;
     std::vector<uint16_t> dst(static_cast<size_t>(w) * w, 77);
-    std::vector<signed char> noise(64 * 64, 40);
+    std::vector<short> noise(64 * 64, 40);
     int lut[AV1G_GRAIN_LUT_ENTRIES] = {0};
     Av1gGrainJob job;
     std::memset(&job, 0, sizeof(job));
@@ -1015,6 +1015,53 @@ void test_filters() {
     CHECK(dst[static_cast<size_t>(4 * w + 4)] == 235);
   }
 
+  /* film grain deeper than 8 bit: the grain range is +/-512 at 10 bit, so a
+   * noise sample does not fit in a signed byte - the noise image is 16 bit and
+   * a large sample has to survive the trip */
+  {
+    const int w = 32;
+    std::vector<uint16_t> dst(static_cast<size_t>(w) * w, 500);
+    std::vector<short> noise(64 * 64, 300);
+    int lut[AV1G_GRAIN_LUT_ENTRIES];
+    for (int i = 0; i < AV1G_GRAIN_LUT_ENTRIES; ++i) lut[i] = 256; /* gain of one */
+    Av1gGrainJob job;
+    std::memset(&job, 0, sizeof(job));
+    job.dst_off = 4 * w + 4;
+    job.dst_stride = w;
+    job.noise_stride = 64;
+    job.w = 8;
+    job.h = 8;
+    job.plane = 0;
+    job.bitdepth = 10;
+    job.scaling_shift = 8;
+    job.num_y_points = 1;
+    job.min_value = 64;
+    job.max_value = 940;
+    job.luma_w = 8;
+    av1g_grain_block(&job, dst.data(), dst.data(), noise.data(), lut, 1023);
+    CHECK(dst[static_cast<size_t>(4 * w + 4)] == 800);
+    /* and the clip is the 10 bit one, not the 8 bit one */
+    std::fill(dst.begin(), dst.end(), static_cast<uint16_t>(900));
+    av1g_grain_block(&job, dst.data(), dst.data(), noise.data(), lut, 1023);
+    CHECK(dst[static_cast<size_t>(4 * w + 4)] == 940);
+
+    /* the generator: at 10 bit the template holds values a signed byte cannot
+     * represent, which is the regression this guards */
+    Av1gGrainParams params;
+    std::memset(&params, 0, sizeof(params));
+    params.seed = 1234;
+    params.bitdepth = 10;
+    params.num_y_points = 1;
+    params.y_value[0] = 0;
+    params.y_scaling[0] = 40;
+    std::vector<short> luma_grain(static_cast<size_t>(AV1G_GRAIN_LUMA_W) * AV1G_GRAIN_LUMA_H, 0);
+    av1g_grain_generate(&params, luma_grain.data(), nullptr, nullptr, AV1G_GRAIN_CHROMA_W,
+                        AV1G_GRAIN_CHROMA_H, 1, 1);
+    int peak = 0;
+    for (short v : luma_grain) peak = std::max(peak, std::abs(static_cast<int>(v)));
+    CHECK(peak > 127);
+  }
+
   /* chroma grain from luma: with chroma_scaling_from_luma the curve is indexed
    * by the average of the luma samples the chroma sample covers */
   {
@@ -1026,7 +1073,7 @@ void test_filters() {
     const int chroma_off = 8 * w;
     for (int y = 0; y < 8; ++y)
       for (int x = 0; x < 8; ++x) buf[static_cast<size_t>(chroma_off + y * w + x)] = 100;
-    std::vector<signed char> noise(64 * 64, 40);
+    std::vector<short> noise(64 * 64, 40);
     /* one table per plane, each indexed by an 8 bit sample value */
     int lut[AV1G_GRAIN_LUT_ENTRIES];
     for (int i = 0; i < AV1G_GRAIN_LUT_ENTRIES; ++i) lut[i] = i % 256;

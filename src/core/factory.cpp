@@ -183,6 +183,26 @@ Psnr frame_psnr(const Frame& a, const Frame& b) {
   return out;
 }
 
+void frame_to_yuv16(const Frame& frame, std::vector<uint8_t>* out) {
+  const int w = frame.width;
+  const int h = frame.height;
+  size_t samples = static_cast<size_t>(w) * h;
+  samples += 2 * static_cast<size_t>(frame.plane_width(1)) * frame.plane_height(1);
+  out->resize(samples * 2);
+  size_t pos = 0;
+  for (int p = 0; p < 3; ++p) {
+    const int pw = frame.plane_width(p);
+    const int ph = frame.plane_height(p);
+    for (int y = 0; y < ph; ++y) {
+      const uint16_t* row = frame.plane(p) + static_cast<size_t>(y) * frame.stride[p];
+      for (int x = 0; x < pw; ++x) {
+        (*out)[pos++] = static_cast<uint8_t>(row[x] & 0xff);
+        (*out)[pos++] = static_cast<uint8_t>(row[x] >> 8);
+      }
+    }
+  }
+}
+
 void frame_to_yuv8(const Frame& frame, std::vector<uint8_t>* out) {
   const int w = frame.width;
   const int h = frame.height;

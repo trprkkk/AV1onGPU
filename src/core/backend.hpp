@@ -82,9 +82,10 @@ constexpr int kPlanePadding = 64;
 struct GrainNoise {
   /* The parameters the noise was built from, in the kernels' layout. */
   Av1gGrainParams params;
-  /* The three noise images, back to back, one byte per sample: the plane
+  /* The three noise images, back to back, one 16 bit sample each (the grain
+   * range is +/-128 at 8 bit, so a deeper stream needs more than a byte): the plane
    * offsets and row pitches the jobs index them with. */
-  std::vector<signed char> noise;
+  std::vector<short> noise;
   int noise_off[3] = {0, 0, 0};
   int noise_stride[3] = {0, 0, 0};
   /* ScalingLut[ plane ][ 8 bit sample value ], the curve each plane's noise is

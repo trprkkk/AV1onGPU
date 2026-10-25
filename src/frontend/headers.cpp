@@ -1428,11 +1428,19 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
     std::fprintf(stderr,
                  "HDRPOS frame type=%d show=%d override=%d found=%d size_w=%zu "
                  "use_superres=%zu intrabc=%zu header_bits=%zu tile_data_offset=%zu "
-                 "upscaled=%d coded=%d superres=%d denom=%d\n",
+                 "upscaled=%d coded=%d superres=%d denom=%d "
+                 "ref0=%d ref1=%d ref2=%d ref3=%d ref4=%d ref5=%d ref6=%d\n",
                  static_cast<int>(h.type), h.show_frame ? 1 : 0, h.frame_size_override ? 1 : 0,
                  h.size_from_reference ? 1 : 0, pos_frame_size_width, pos_use_superres,
                  pos_allow_intrabc, header_bits, h.tile_data_offset,
-                 h.upscaled_width, h.width, h.superres ? 1 : 0, h.superres_denominator);
+                 h.upscaled_width, h.width, h.superres ? 1 : 0, h.superres_denominator,
+                 h.type == FrameType::Inter ? h.ref_frame_idx[0] : -1,
+                 h.type == FrameType::Inter ? h.ref_frame_idx[1] : -1,
+                 h.type == FrameType::Inter ? h.ref_frame_idx[2] : -1,
+                 h.type == FrameType::Inter ? h.ref_frame_idx[3] : -1,
+                 h.type == FrameType::Inter ? h.ref_frame_idx[4] : -1,
+                 h.type == FrameType::Inter ? h.ref_frame_idx[5] : -1,
+                 h.type == FrameType::Inter ? h.ref_frame_idx[6] : -1);
   }
   return ParseStatus::Ok;
 }

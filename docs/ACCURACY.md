@@ -34,8 +34,23 @@ not disagreements between backends.
   one `Round2` and one `Clip3` per sample. The sequential half runs on the host
   because neither the AR filter nor the stripe stitching parallelises across
   samples, and the per sample map runs in the kernels, so every backend adds the
-  same noise. `tests/data/grain.ivf` pins it against dav1d: 30 frames, every
-  sample equal.
+  same noise. Chroma is filtered before luma because 7.18.3.6 reads `OutY` as it
+  was *before* the luma grain went in, and the noise image is carried as 16 bit
+  samples: the grain range is `1 << (BitDepth - 1)` either side of zero, which
+  stops fitting in a byte at 10 bit (plan format 6). `tests/data/grain.ivf` pins
+  the coded form against dav1d: 30 frames, every sample equal.
+* **Inherited film grain parameters.** An inter frame may code `update_grain = 0`
+  and name a reference slot instead of a parameter set (5.9.30); 7.18.3.1 then
+  loads that slot's copy - the parameters the frame that filled the slot decoded
+  with - and keeps only the new `grain_seed`, so the noise differs while the
+  curve does not. The syntax has a conformance requirement that the coded index
+  is one of the frame's own `ref_frame_idx[]`, and dav1d rejects a frame that
+  breaks it (it is a header parse error), so `make_grain.py --inherit-from`
+  takes the slot from the probe's trace rather than guessing. The slot's stored
+  parameters are per *output order* slot: a frame whose `apply_grain` is 0
+  clears them, i.e. a slot filled by a grained frame hands grain on and a slot
+  filled by a plain frame hands nothing on. `tests/data/grain_inherit.ivf` pins
+  that path: 10 frames, every sample equal to dav1d's.
 * **Colour conversion.** One integer matrix per (matrix, range, bit depth),
   Q16 coefficients with the level/range offsets folded into the constant term,
   so limited-range black is (0,0,0) and limited-range white is 255.
@@ -151,7 +166,9 @@ three layers, all of them runnable on a machine with no GPU driver:
 
    Film grain is where the plan turned into more than job arrays. The noise image
    and the three 256 entry scaling curves are built on the host (plan format 5
-   carries them as `noise`/`grain_lut` with a per plane offset and stride),
+   carries them as `noise`/`grain_lut` with a per plane offset and stride; format
+   6 widens the noise samples from one byte to two, so a 10 or 12 bit stream's
+   grain is not clipped by the container),
    because the generator and the auto-regressive filter are sequential; the
    replay uploads them and runs the same two passes the backends do, chroma
    first. It also has to copy a frame into its reference pool *before* those

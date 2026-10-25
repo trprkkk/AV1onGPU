@@ -439,7 +439,7 @@ class CudaBackend final : public Backend {
     if (!plan.grain_chroma.empty() || !plan.grain_luma.empty()) {
       /* The noise image is built on the host (the sequential half of the
        * synthesis) and uploaded once; the two passes below only launch. */
-      const size_t noise_size = plan.grain_noise.noise.size();
+      const size_t noise_size = plan.grain_noise.noise.size() * sizeof(short);
       if (!ensure(&grain_, &grain_cap_, noise_size) ||
           !ensure(&lut_, &lut_cap_, sizeof(plan.grain_noise.lut)))
         return fail(error, "out of device memory for the film grain tables");

@@ -43,9 +43,10 @@ sys.path.insert(0, HERE)
 import opencl_selftest as selftest  # noqa: E402  (probe, kernel source, helpers)
 
 MAGIC = b"AV1GPLAN"
-FORMAT_VERSION = 5       # 2 the palette map, 3 the itx scratch size,
+FORMAT_VERSION = 6       # 2 the palette map, 3 the itx scratch size,
                          # 4 the display geometry and the upscale jobs,
-                         # 5 the film grain noise image and its two passes
+                         # 5 the film grain noise image and its two passes,
+                         # 6 that noise image as 16 bit samples
 REFERENCE_SLOTS = 9      # kReferenceSlots in the backends
 CDEF_DIM = 8             # AV1G_CDEF_DIM
 MASK_DIFFWTD = 2         # AV1G_MASK_DIFFWTD
@@ -147,7 +148,8 @@ def read_plan(path, layouts):
 
     plan["coefficients"] = r.ints(plan["coef_count"])
     plan["residual"] = r.ints(plan["residual_count"])
-    plan["noise"] = struct.unpack("<%db" % plan["noise_count"], r.raw(plan["noise_count"]))
+    plan["noise"] = struct.unpack("<%dh" % plan["noise_count"],
+                                  r.raw(2 * plan["noise_count"]))
     plan["palette_map"] = np_frombytes(r.raw(plan["palette_count"]))
     return plan
 
@@ -401,7 +403,7 @@ class Replay:
         # picture *before* any grain was added, so they run first and the luma
         # jobs second. Both pass the same picture as `dst` and `luma`.
         if plan["grain_chroma"] or plan["grain_luma"]:
-            noise_buf = self.buffer(np.array(plan["noise"], dtype=np.int8))
+            noise_buf = self.buffer(np.array(plan["noise"], dtype=np.int16))
             lut_buf = self.buffer(np.array(plan["grain_lut"], dtype=np.int32))
             for key in ("grain_chroma", "grain_luma"):
                 jobs = plan[key]

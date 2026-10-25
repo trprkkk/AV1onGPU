@@ -116,7 +116,7 @@ __kernel void av1g_k_grain(__global const Av1gGrainJob *jobs,
                            __global const int *joff, int njobs, int total,
                            __global av1g_px *dst,
                            __global const av1g_px *luma,
-                           __global const signed char *noise,
+                           __global const short *noise,
                            __global const int *lut, int maxv) {
   AV1G_JOB_LOOKUP(job_idx, elem);
   Av1gGrainJob job = jobs[job_idx];

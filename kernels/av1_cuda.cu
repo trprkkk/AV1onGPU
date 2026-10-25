@@ -124,7 +124,7 @@ extern "C" __global__ void av1g_k_upscale(const Av1gUpscaleJob *jobs,
 extern "C" __global__ void av1g_k_grain(const Av1gGrainJob *jobs,
                                         const int *joff, int njobs, int total,
                                         av1g_px *dst, const av1g_px *luma,
-                                        const signed char *noise,
+                                        const short *noise,
                                         const int *lut, int maxv) {
   AV1G_JOB_LOOKUP(job_idx, elem);
   Av1gGrainJob job = jobs[job_idx];

@@ -504,8 +504,13 @@ struct Psnr {
 /* Per plane PSNR of two frames of the same geometry (99 dB when identical). */
 Psnr frame_psnr(const Frame& a, const Frame& b);
 
-/* Packs a frame into planar YUV420p / 4:4:4 at 8 bits per sample. */
+/* Packs a frame into planar YUV420p / 4:4:4 at 8 bits per sample. A stream
+ * deeper than 8 bits is shifted down; the samples keep their own plane size. */
 void frame_to_yuv8(const Frame& frame, std::vector<uint8_t>* out);
+
+/* The same packing with the samples *as they are*, little endian 16 bit, so a
+ * 10 or 12 bit stream can be compared bit for bit instead of after a shift. */
+void frame_to_yuv16(const Frame& frame, std::vector<uint8_t>* out);
 
 /* ------------------------------------------------------------------ decode */
 

@@ -48,10 +48,12 @@ inline bool write_plan(const std::string& path, const av1gpu::internal::FramePla
   const av1gpu::internal::PlanLayout& g = plan.layout;
 
   const char magic[8] = {'A', 'V', '1', 'G', 'P', 'L', 'A', 'N'};
-  /* 5: the film grain noise image and its two passes replace the noise
+  /* 6: the film grain noise image is one 16 bit sample per entry (a stream
+   *    deeper than 8 bit has grain outside the signed char range)
+   * 5: the film grain noise image and its two passes replace the noise
    * template, 4 added the display geometry and the upscale jobs, 3 tmp_size, 2
    * the palette colour map */
-  const int32_t version = 5;
+  const int32_t version = 6;
   const int32_t geom[5] = {g.frame.width, g.frame.height, g.frame.bit_depth,
                            g.frame.ss_x, g.frame.ss_y};
   bool ok = write_all(file, magic, sizeof(magic)) &&
@@ -107,7 +109,8 @@ inline bool write_plan(const std::string& path, const av1gpu::internal::FramePla
   if (ok && !plan.residual.empty())
     ok = write_all(file, plan.residual.data(), plan.residual.size() * sizeof(int32_t));
   if (ok && !plan.grain_noise.noise.empty())
-    ok = write_all(file, plan.grain_noise.noise.data(), plan.grain_noise.noise.size());
+    ok = write_all(file, plan.grain_noise.noise.data(),
+                   plan.grain_noise.noise.size() * sizeof(plan.grain_noise.noise[0]));
   if (ok && !plan.palette_map.empty())
     ok = write_all(file, plan.palette_map.data(), plan.palette_map.size());
 

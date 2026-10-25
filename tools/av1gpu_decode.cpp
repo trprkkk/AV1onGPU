@@ -63,6 +63,7 @@ struct Options {
   bool require_device = false;
   int frames = -1;
   bool verbose = false;
+  bool out16 = false;
 };
 
 void usage() {
@@ -70,6 +71,8 @@ void usage() {
       "usage: av1gpu_decode [options] FILE\n"
       "  FILE              an .ivf file or a raw OBU stream\n"
       "  -o, --output F    write the decoded frames to F as planar 8 bit YUV\n"
+      "  --yuv16           write the samples as they are, little endian 16 bit, and\n"
+      "                    hash those bytes (a 10 or 12 bit stream compared exactly)\n"
       "  --compare F       compare against a planar 8 bit YUV file\n"
       "  --hash-out F      write one hash per shown frame to F\n"
       "  --hash-check F    compare the output against the hashes in F\n"
@@ -224,6 +227,10 @@ int main(int argc, char** argv) {
       opt.require_device = true;
       continue;
     }
+    if (arg == "--yuv16") {
+      opt.out16 = true;
+      continue;
+    }
     if (arg == "--frames" && i + 1 < argc) {
       opt.frames = std::atoi(argv[++i]);
       continue;
@@ -373,9 +380,14 @@ int main(int argc, char** argv) {
   /* Writes one picture to the output and compares it with the reference, if
    * there is one. A frame that is shown twice (show_existing_frame) goes
    * through here twice, which is what the reference decoder's output has. */
+  const bool out16 = opt.out16;
   auto emit_picture = [&](const Frame& picture, int ss_x, int ss_y) {
     std::vector<uint8_t> yuv;
-    frame_to_yuv8(picture, &yuv);
+    if (out16) {
+      frame_to_yuv16(picture, &yuv);
+    } else {
+      frame_to_yuv8(picture, &yuv);
+    }
     if (hash_file && !yuv.empty()) {
       std::fprintf(hash_file, "frame %zu: 0x%016llx\n", hashes_written++,
                    static_cast<unsigned long long>(frame_hash(yuv)));

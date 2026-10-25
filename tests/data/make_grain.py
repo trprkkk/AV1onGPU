@@ -24,8 +24,13 @@ in one place - the parser - instead of a second copy here.
 
     python3 tests/data/make_grain.py in.ivf out.ivf [--probe path] [--seed 1234]
 
-The base stream must not use `show_existing_frame` (its grain parameters would
-have to be inherited instead of coded) and must be 4:2:0, 8 bit.
+The base stream must not use `show_existing_frame`: its grain parameters would
+have to be coded in the show_existing branch instead of the frame header, which
+this fixture does not need yet.
+
+`--inherit-from N` makes the inter frames from index N code `update_grain = 0`
+and re-use a reference slot's parameters, which is the path a real encoder takes
+whenever the grain settings do not change (5.9.30); the seed stays per frame.
 """
 
 import argparse
@@ -114,14 +119,24 @@ def u(value, bits):
     return list(f"{value:0{bits}b}")
 
 
-def film_grain_params(frame_type, seed, seq):
-    """film_grain_params() (5.9.30), with update_grain = 1."""
+def film_grain_params(frame_type, seed, seq, inherit_from=None):
+    """film_grain_params() (5.9.30).
+
+    With `inherit_from` the frame codes update_grain = 0 and the index of the
+    reference slot whose parameters it re-uses: only the seed is its own, which
+    is what makes the noise differ between two frames that share a parameter set.
+    """
     mono = seq["mono"]
     bits = []
     bits += u(1, 1)               # apply_grain
     bits += u(seed & 0xFFFF, 16)  # grain_seed
     if frame_type == INTER_FRAME:
-        bits += u(1, 1)           # update_grain: the parameters are coded here
+        if inherit_from is None:
+            bits += u(1, 1)       # update_grain: the parameters are coded here
+        else:
+            bits += u(0, 1)                    # update_grain: inherited
+            bits += u(inherit_from, 3)         # film_grain_params_ref_idx
+            return bits
     bits += u(len(GRAIN["y"]), 4)
     for value, scaling in GRAIN["y"]:
         bits += u(value, 8) + u(scaling, 8)
@@ -172,6 +187,12 @@ def main():
                     help="grain_seed of the first frame; later frames step it")
     ap.add_argument("--profile", default="full", choices=sorted(PROFILES),
                     help="which parts of the synthesis to switch on (default full)")
+    ap.add_argument("--inherit-from", type=int, default=None, metavar="N",
+                    help="inter frames from index N on code update_grain = 0 and "
+                         "re-use the parameters of a reference slot instead")
+    ap.add_argument("--inherit-slot", type=int, default=None, metavar="SLOT",
+                    help="reference slot the inheriting frames name (default: the "
+                         "frame's LAST reference, from the probe's trace)")
     args = ap.parse_args()
     GRAIN.update(PROFILES[args.profile])
     # A profile only names the parts it changes, so the coefficient lists still
@@ -215,8 +236,26 @@ def main():
                 # append the parameters at the end of the header, then realign:
                 # the padding between the last field and the tile data is byte
                 # alignment, which the patch has to redo from where it now ends
+                inherit = None
+                if (args.inherit_from is not None and frame_index >= args.inherit_from
+                        and pos["type"] == INTER_FRAME):
+                    inherit = args.inherit_slot
+                    if inherit is None:
+                        # the conformance requirement is that the index names one
+                        # of this frame's references (5.9.30), so take LAST when
+                        # the frame codes it and otherwise the first one it does
+                        refs = [pos["ref%d" % i] for i in range(7)]
+                        used = [r for r in refs if r >= 0]
+                        if not used:
+                            raise SystemExit(f"frame {frame_index}: the probe reported no "
+                                             f"reference slots to inherit grain from")
+                        inherit = refs[0] if refs[0] >= 0 else used[0]
+                    elif inherit not in [pos["ref%d" % i] for i in range(7)]:
+                        raise SystemExit(f"frame {frame_index}: slot {inherit} is not one of "
+                                         f"the frame's references, which 5.9.30 requires")
                 ticket = list(bits[:pos["header_bits"]])
-                ticket += film_grain_params(pos["type"], args.seed + 31 * frame_index, seq)
+                ticket += film_grain_params(pos["type"], args.seed + 31 * frame_index, seq,
+                                            inherit_from=inherit)
                 while len(ticket) % 8:
                     ticket.append("0")
                 body = bytes_of("".join(ticket)) + body[pos["tile_data_offset"]:]
@@ -232,6 +271,11 @@ def main():
     write_ivf(args.output, header, patched_frames)
     print(f"wrote {args.output}: {len(patched_frames)} temporal units, grain seed "
           f"{args.seed} (+{31} per frame)")
+    if args.inherit_from is not None:
+        slot = ("slot %d" % args.inherit_slot if args.inherit_slot is not None
+                else "the frame's LAST reference")
+        print(f"  inter frames from index {args.inherit_from} inherit {slot} "
+              f"(update_grain = 0)")
 
 
 if __name__ == "__main__":

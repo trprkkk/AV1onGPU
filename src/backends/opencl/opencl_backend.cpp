@@ -439,7 +439,7 @@ class OpenCLBackend final : public Backend {
     if (!plan.grain_chroma.empty() || !plan.grain_luma.empty()) {
       /* The noise image is built on the host (the sequential half of the
        * synthesis) and uploaded once; the two passes below only launch. */
-      const size_t noise_size = plan.grain_noise.noise.size();
+      const size_t noise_size = plan.grain_noise.noise.size() * sizeof(short);
       ensure(&grain_, &grain_cap_, noise_size);
       api_.EnqueueWriteBuffer(queue_, grain_, opencl::CL_TRUE, 0, noise_size,
                               plan.grain_noise.noise.data(), 0, nullptr, nullptr);

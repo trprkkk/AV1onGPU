@@ -24,6 +24,11 @@ then record our own output:
 ./build/bin/av1gpu_decode lw_t2.ivf --hash-out lw_t2.hash
 ```
 
+A stream deeper than 8 bit is compared with `--yuv16` on both sides: dav1d's
+yuv muxer writes 16 bit little endian for those, `av1gpu_decode --yuv16` writes
+the samples unchanged, and the hash is taken over those bytes - so a 10 bit
+stream is checked sample for sample instead of after a shift.
+
 `palette_sc.ivf` is the screen content fixture: 10 frames of 320x240, 6.7 KB,
 encoded with libaom at `-cpu-used 4 -crf 30 --lag-in-frames 0 -g 10` and
 `-aom-params "tune-content=screen:enable-restoration=0:tile-columns=0:tile-rows=0:enable-intrabc=0"`.
@@ -262,6 +267,27 @@ bisected against dav1d; each profile is bit exact on its own. `grain.hash` holds
 the per frame hashes and `stream_grain` checks them, while `opencl_grain` replays
 the same frames through the device kernels. Every sample of every frame is equal
 to dav1d's (see `docs/ACCURACY.md`).
+
+`grain_inherit.ivf` is the same idea for the *inherited* parameters: the
+`palette_sc` stream with every inter frame from index 3 on coding
+`update_grain = 0` and naming a reference slot instead of a parameter set, which
+is what an encoder does whenever the grain settings do not change (5.9.30) and
+the only way to reach `load_grain_params()` in 7.18.3.1. The frame keeps its own
+`grain_seed`, so its noise is still its own; the curve, the AR coefficients and
+the chroma coupling are the slot's copy. Ten frames, 6.7 KB, and `grain_inherit.hash`
+holds the per frame hashes.
+
+```
+python3 tests/data/make_grain.py palette_sc.ivf grain_inherit.ivf --seed 900 \
+    --inherit-from 3
+```
+
+The coded index has to be one of the frame's own reference slots - the
+specification makes that a conformance requirement and dav1d fails the frame if
+it is violated - so `--inherit-from` takes the slot from the probe's trace (the
+frame's LAST reference) instead of assuming one; `--inherit-slot` overrides it.
+`stream_grain_inherit` checks the hashes. Every sample of every frame is equal to
+dav1d's.
 
 `svt_av1_320x240.ivf` is a real AV1 stream, not a hand written header: six frames
 of a 320x240 gradient at 8 bit 4:2:0, encoded with SVT-AV1 (crf 40, preset 10)
