@@ -440,10 +440,10 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
     std::vector<BlockSyntax> inter_regions[3];
     bool inter_used[3] = {false, false, false};
     if (inter) {
-      if (block.interintra) {
-        *error = "reconstruct: inter/intra compound prediction is not implemented";
-        return false;
-      }
+      /* An inter/intra block codes one reference and one intra mode, so the
+       * compound of two references is off and the intra half is a property of
+       * the block: which mode, which wedge (if any), and the neighbours it
+       * predicts from. The plane loop below carries it into every region. */
       const bool two_refs = block.compound_type != kCompoundNone;
       for (int i = 0; i < (two_refs ? 2 : 1); ++i) {
         const int type = block.ref_frame[i] - 1; /* kRefLast (1) -> index 0 */
@@ -507,6 +507,18 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
         bs.blend[1] = blend[1];
         bs.wedge_index = block.wedge_index;
         bs.mask_sign = block.mask_sign;
+        /* Inter/intra compound (7.11.4): the intra half is predicted once per
+         * plane, over the whole block, with the block's own availability - not
+         * with the per transform block availability an intra block uses,
+         * because there are no transform blocks of its own to be past the left
+         * or top edge of. */
+        bs.interintra = block.interintra;
+        bs.interintra_mode = block.interintra_mode;
+        bs.interintra_wedge = block.interintra && block.interintra_wedge;
+        if (block.interintra) {
+          bs.have_left = plane == 0 ? avail_l : avail_l_chroma;
+          bs.have_above = plane == 0 ? avail_u : avail_u_chroma;
+        }
         bs.obmc.clear();
         inter_used[plane] = false;
         if (block.motion_mode == kMotionObmc) {

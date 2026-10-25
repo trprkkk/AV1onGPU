@@ -145,7 +145,7 @@ unsigned RangeDecoder::decode_bool_equi() {
   if (above) {
     v += r - 2 * v;
     normalize(dif - threshold, v);
-    if (symtrace) std::fprintf(stderr, "Y 0 %llu %u %d 0\n",
+    if (symtrace) std::fprintf(stderr, "Y 0 %llu %u %d 0 0\n",
                                static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt);
     hash_symbol(0);
     trace_bool("E", 0, 0);
@@ -153,7 +153,7 @@ unsigned RangeDecoder::decode_bool_equi() {
     return 0;
   }
   normalize(dif, v);
-  if (symtrace) std::fprintf(stderr, "Y 0 %llu %u %d 1\n",
+  if (symtrace) std::fprintf(stderr, "Y 0 %llu %u %d 1 0\n",
                              static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt);
   hash_symbol(1);
   trace_bool("E", 1, 0);
@@ -175,16 +175,18 @@ unsigned RangeDecoder::decode_bool(unsigned probability) {
   if (above) {
     v += r - 2 * v;
     normalize(dif - threshold, v);
-    if (symtrace) std::fprintf(stderr, "Y 1 %llu %u %d 0\n",
-                               static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt);
+    if (symtrace) std::fprintf(stderr, "Y 1 %llu %u %d 0 %u\n",
+                               static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt,
+                               probability);
     hash_symbol(0);
     trace_bool("B", 0, probability);
     trace_state(dif_, rng_, cnt_);
     return 0;
   }
   normalize(dif, v);
-  if (symtrace) std::fprintf(stderr, "Y 1 %llu %u %d 1\n",
-                             static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt);
+  if (symtrace) std::fprintf(stderr, "Y 1 %llu %u %d 1 %u\n",
+                             static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt,
+                             probability);
   hash_symbol(1);
   trace_bool("B", 1, probability);
   trace_state(dif_, rng_, cnt_);
@@ -236,9 +238,9 @@ unsigned RangeDecoder::decode_symbol(uint16_t* cdf, int nsymbols) {
     for (int i = 0; i <= nsymbols; ++i) std::fprintf(stderr, " %u", before[i]);
     std::fprintf(stderr, " %d\n", symbol);
   }
-  if (symtrace) std::fprintf(stderr, "Y 2 %llu %u %d %d\n",
+  if (symtrace) std::fprintf(stderr, "Y 2 %llu %u %d %d %d\n",
                              static_cast<unsigned long long>(trace_dif), trace_rng, trace_cnt,
-                             symbol);
+                             symbol, nsymbols);
   hash_symbol(static_cast<unsigned>(symbol));
 
   if (tracing) {

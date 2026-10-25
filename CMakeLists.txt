@@ -146,13 +146,16 @@ if(AV1GPU_BUILD_TESTS)
   # Bit exact streams: the whole front end plus the CPU backend against hashes
   # of the reference decoder's output (see tests/data/README.md). lw_t2 and
   # lw_t3 are the only fixtures that code local warped motion and OBMC,
-  # palette_sc the only screen content one (palette coded blocks); every frame
-  # of all three is bit exact.
+  # palette_sc the only screen content one (palette coded blocks) and
+  # inter_intra the only one that codes inter/intra compound, with the taper and
+  # with wedge masks; every frame of all four is bit exact.
   if(TARGET av1gpu_decode)
-    foreach(stream lw_t2 lw_t3 palette_sc)
+    foreach(stream lw_t2 lw_t3 palette_sc inter_intra)
       set(frames 30)
       if(stream STREQUAL "palette_sc")
         set(frames 10)
+      elseif(stream STREQUAL "inter_intra")
+        set(frames 110)
       endif()
       add_test(NAME stream_${stream}
                COMMAND av1gpu_decode --backend cpu --frames ${frames}
@@ -198,13 +201,17 @@ if(AV1GPU_BUILD_TESTS)
     #                   palette prediction runs through the device kernels
     #   lw_t2, lw_t3    the only ones that code local warped motion and OBMC,
     #                   whose overlap candidates carry their own reference slot
+    #   inter_intra     the only one that codes inter/intra compound, so every
+    #                   blend runs through the device kernels too
     #   svt_av1_320x240 a different encoder, so a different mix of tools
     # All of it on a machine with no GPU at all.
     if(TARGET av1gpu_decode)
-      foreach(stream palette_sc lw_t2 lw_t3 svt_av1_320x240)
+      foreach(stream palette_sc lw_t2 lw_t3 inter_intra svt_av1_320x240)
         set(frames 30)
         if(stream STREQUAL "palette_sc")
           set(frames 10)
+        elseif(stream STREQUAL "inter_intra")
+          set(frames 110)
         elseif(stream STREQUAL "svt_av1_320x240")
           set(frames 6)
         endif()

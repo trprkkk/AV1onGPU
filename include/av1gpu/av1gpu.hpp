@@ -284,6 +284,16 @@ struct BlockSyntax {
    * weighted mask leans. */
   int wedge_index = 0;
   int mask_sign = 0;
+  /* Inter/intra compound (7.11.4): this block's inter prediction is blended
+   * with an intra prediction of the same region, predicted from the
+   * *reconstructed* neighbours of the frame being decoded. `interintra_mode` is
+   * the specification's interintra_mode (0 DC, 1 V, 2 H, 3 smooth); with
+   * `interintra_wedge` the blend uses the wedge `wedge_index` of the codebook
+   * instead of the mode's own taper, and the mask sign is always zero. Such a
+   * block has one reference, so `compound` stays None. */
+  bool interintra = false;
+  int interintra_mode = 0;
+  bool interintra_wedge = false;
   /* Global warped motion: this reference is predicted by projecting the
    * sample's position through the frame's affine model instead of displacing
    * it by the block's vector (`warp` per reference list). The parameters are

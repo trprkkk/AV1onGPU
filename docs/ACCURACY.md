@@ -123,7 +123,8 @@ three layers, all of them runnable on a machine with no GPU driver:
    and inter, all filters on: **bit identical**. With `--input` the plans come
    from `av1gpu_decode --dump-plans` for a real stream instead, so the reference
    pool slots are the decoder's own: `lw_t2` and `lw_t3` (local warped motion and
-   OBMC, 30 frames each), `palette_sc` (102 palette blocks, 10 frames) and
+   OBMC, 30 frames each), `palette_sc` (102 palette blocks, 10 frames),
+   `inter_intra` (23 inter/intra compound blocks, 110 frames) and
    `svt_av1_320x240` (a different encoder, 6 frames) are all **bit identical**
    too.
 
@@ -286,6 +287,7 @@ was built for.)
 | `lwn2`, `lwn3` | 30 each | local warped motion (`motion_mode = LOCALWARP`) |
 | `lw_t2`, `lw_t3` | 30 each | local warped motion **and** OBMC (in `tests/data/`) |
 | `palette_sc` | 10 | palette coded blocks (screen content, in `tests/data/`) |
+| `inter_intra` | 110 | inter/intra compound: the taper and wedge masks (in `tests/data/`) |
 
 The four local-warp streams are the ROTZOOM clip re-encoded with libaom at
 `--cpu-used=2` and `--cpu-used=3`, `--crf=30`, `--lag-in-frames=25`,
@@ -312,6 +314,41 @@ pictures and not this decoder's. Regenerate one with
 
 but only after checking the stream against dav1d, or the file would record our
 own mistakes.
+
+## Inter/intra compound
+
+An inter block of 8x8 to 32x32 may blend its inter prediction with an intra one
+(7.11.4). Both halves are arithmetic, not approximation, and the CPU and GPU
+backends share the code:
+
+* **The intra half is predicted first**, over the block's full size, from the
+  *reconstructed* neighbours of the frame being decoded - the same edges an
+  intra block of that size reads, and only the plain ones: an inter/intra block
+  cannot use a directional or recursive mode, so the above-right, below-left and
+  corner extensions never affect it.
+* **The mask** is `Ii_Weights_1d[ i * sizeScale ]` with
+  `sizeScale = MAX_SB_SIZE / Max(w, h)`, indexed by the row (`II_V`), the column
+  (`II_H`) or `Min(i, j)` (`II_SMOOTH`), and the constant 32 for `II_DC` - the
+  specification writes that one as a number rather than as a table entry, which
+  is a real trap: indexing the table at 64/2 gives 32 only by coincidence of the
+  rounding, and not at every size. With `wedge_interintra` the mask is the
+  codebook's wedge instead, with a sign of zero because the syntax codes none.
+* **The mask is built per plane.** A chroma plane uses `Mask[y][x]` of an array
+  built over the *plane's* block size, so its `sizeScale` is
+  `128 / Max(w >> subX, h >> subY)`; it is not the luma mask averaged down 2x2,
+  which is the wedge's rule (`interintra && !wedge_interintra` picks the plane's
+  own array in 7.11.3.14).
+* **The blend is `Round2(m * intra + (64 - m) * inter, 6)`** with the inter half
+  clipped and rounded at `InterPostRound` first (zero for a single 8 bit
+  reference), so the pair is rounded once. Scheduling counts an inter/intra
+  block with the intra ones, because its intra half needs its neighbours.
+
+`tests/data/inter_intra.ivf` is the fixture: 23 inter/intra blocks over 110
+frames, `interintra_mode` in its V, H and smooth variants, five of them wedge
+masks (indices 4, 8, 12), on 16x16 up to 32x32 blocks. Every frame is bit exact
+against dav1d and through the device kernels. The DC mode does not appear in any
+encoding of that clip, so `test_kernels` pins all four mask rules and the chroma
+sampling directly.
 
 `tests/data/palette_sc.ivf` is the screen content fixture: a synthetic desktop
 style clip (flat colour panels, thin lines, text-like glyph runs, chroma flat

@@ -268,9 +268,10 @@ ctest --test-dir build -R opencl --output-on-failure
 
 ## What is not here
 
-Inter/intra compound and intrabc are the inter and intra tools that are still
-missing - palette coded blocks, the rest of the screen content toolkit, decode
-bit exactly (`tests/data/palette_sc.ivf`); film grain uses a synthetic template
+Intrabc is the one intra tool that is still missing, and skip mode is parsed and
+refused; everything else in the inter and intra paths decodes bit exactly,
+including palette coded blocks (`tests/data/palette_sc.ivf`) and inter/intra
+compound (`tests/data/inter_intra.ivf`). Film grain uses a synthetic template
 instead of the specification's synthesis filter (see `docs/ROADMAP.md`, sections
 3 and 4).
 `av1gpu::synthetic_encode` is a small closed loop test encoder that produces

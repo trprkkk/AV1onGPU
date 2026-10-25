@@ -143,7 +143,15 @@ the first symbol of the fixture's key frame.
    * OBMC's neighbour test asks whether an odd 4x4 offset along the edge holds
      an *inter* predicted block (`findoddzero` returns true on a zero entry of
      the intra map), not an intra one - inverted, the block skips a symbol;
-   * inter/intra compound is only allowed up to 32x32, not 64x64.
+   * inter/intra compound is only allowed up to 32x32, not 64x64 - and its
+     neighbour scan must not see an inter/intra neighbour as a single reference
+     one, which is what `MiRef::interintra` is for: the specification writes -1
+     in `RefFrames[][][1]` for a single reference block and an inter/intra block
+     keeps INTRA there, so comparing that field alone accepts a neighbour
+     `find_warp_samples` and `find_matching_ref` have to skip;
+   * `needs_interp_filter()` is false for a `LOCALWARP` block: reading a subpel
+     filter there consumes the next block's first symbol, and the desync only
+     shows up as a pixel difference a few frames later.
 2. *A second intra frame to check against.* One reference picture proves a lot
    but it cannot cover filter intra, every transform shape or a 128x128
    superblock; a stream per feature class is cheap insurance and needs an
@@ -252,9 +260,17 @@ Both mistakes produce a difference of a few dozen samples per frame, which reads
 like a rounding difference in the blend itself; that is the trap this took a hunt
 to get out of.
 
-Still missing from the inter path: inter/intra compound. Of the intra tools only
-intrabc is left - palette is decoded and reconstructed (see
-`tests/data/palette_sc.ivf` and `docs/ACCURACY.md`), and intrabc blocks are
+The inter path is now complete apart from skip mode, which is parsed and
+refused. Inter/intra compound came last: the intra half of a block is predicted
+over the block's full size, from the reconstructed neighbours of the frame being
+decoded, and blended with the inter half at the taper (`II_V`, `II_H`,
+`II_SMOOTH`, flat `II_DC`) or the wedge mask of a `wedge_interintra` block, with
+a sign of zero. `tests/data/inter_intra.ivf` pins it: 23 such blocks over 110
+frames, the taper and the wedge, every frame bit exact against dav1d and through
+the device kernels (see `docs/ACCURACY.md`).
+
+Of the intra tools only intrabc is left - palette is decoded and reconstructed
+(see `tests/data/palette_sc.ivf` and `docs/ACCURACY.md`), and intrabc blocks are
 refused by name because they are the one syntax that predicts from inside the
 frame the decoder is still building.
 

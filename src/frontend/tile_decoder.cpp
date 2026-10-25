@@ -47,7 +47,7 @@ void trace_block(const TileBlock& block) {
     std::fprintf(stderr,
                  "B %d %d %d %d cs=%d bs=%d bp=%d intra=0 skip=%d skipmode=%d seg=%d "
                  "refs=%d,%d mvs=%d,%d,%d,%d mode=%d mm=%d ct=%d drl=%d f=%d,%d "
-                 "wedge=%d sign=%d iitype=%d iimode=%d ytx=%d q=%d\n",
+                 "wedge=%d sign=%d iitype=%d iimode=%d iiwedge=%d ytx=%d q=%d\n",
                  block.mi_col, block.mi_row, block_width4(block.size),
                  block_height4(block.size), static_cast<int>(block.size),
                  static_cast<int>(block.size), static_cast<int>(block.partition),
@@ -57,7 +57,8 @@ void trace_block(const TileBlock& block) {
                  block.compound_type, block.drl_index, block.interp_filter[0],
                  block.interp_filter[1], block.wedge_index, block.mask_sign,
                  block.interintra ? 1 : 0, block.interintra_mode,
-                 tx_size_index(block.tx_size), block.qindex);
+                 block.interintra_wedge ? 1 : 0, tx_size_index(block.tx_size),
+                 block.qindex);
     return;
   }
   std::fprintf(stderr, "B %d %d %d %d cs=%d bs=%d bp=%d intra=1 skip=%d seg=%d y=%d uv=%d "
@@ -479,6 +480,11 @@ class TileParser {
    * filled with the same entry. */
   struct MiRef {
     uint8_t intra = 1;                 /* 1: intra predicted (or intrabc)   */
+    /* 1: inter/intra compound. Both it and a single reference block keep
+     * kRefIntra in ref[1], so this flag is what tells them apart - the
+     * candidate scans compare against "no second reference" (-1 in the
+     * specification) and an inter/intra neighbour is not that. */
+    uint8_t interintra = 0;
     uint8_t ref[2] = {kRefIntra, kRefIntra};
     uint8_t inter_mode = kModeNearestMv;
     int16_t mv[2][2] = {{0, 0}, {0, 0}};
@@ -1746,7 +1752,7 @@ class TileParser {
     const auto matches = [&](int r, int c) {
       if (r < 0 || c < 0 || r >= mi_rows() || c >= mi_cols()) return false;
       const MiRef& n = mi_at(r, c);
-      return !n.intra && n.ref[0] == ref && n.ref[1] == kRefIntra;
+      return !n.intra && n.ref[0] == ref && n.ref[1] == kRefIntra && !n.interintra;
     };
     if (top_avail) {
       if (matches(row - 1, col)) {
@@ -1841,7 +1847,7 @@ class TileParser {
       const int mv_col = col + delta_col;
       if (mv_row < 0 || mv_row >= mi_rows() || mv_col < 0 || mv_col >= mi_cols()) return;
       const MiRef& edge = mi_at(mv_row, mv_col);
-      if (edge.intra || edge.ref[0] != ref || edge.ref[1] != kRefIntra) return;
+      if (edge.intra || edge.ref[0] != ref || edge.ref[1] != kRefIntra || edge.interintra) return;
       const BlockSize cand_size = block_size_at(mv_row, mv_col);
       const int cand_w4 = block_width4(cand_size), cand_h4 = block_height4(cand_size);
       /* the candidate's own top left: when the neighbour is larger than this
@@ -2240,13 +2246,16 @@ class TileParser {
      * reference frame pair of a compound block leaves no room for the intra
      * one.
      *
-     * The intra half is not reconstructed yet, but its syntax is short and
-     * reading it is what keeps the range decoder in step: the inter half is
-     * predicted as usual and the intra half is simply missing from the frame. */
+     * The intra mode is read here and the intra half is predicted later, from
+     * the frame being decoded: it needs the reconstructed neighbours of this
+     * block, which do not exist yet while the block's own syntax is read. A
+     * wedge inter/intra reads only the wedge index; its sign is zero by
+     * definition, so the mask is the codebook's and not its complement. */
     if (!block->skip_mode && seq_.enable_interintra_compound && !compound && size >= kBlock8x8 &&
         size <= kBlock32x32) {
       const int group = ymode_size_group(size) - 1;
-      if (decoder_.read_symbol(cdf_.inter.inter_intra[group], 1) != 0) {
+      const int bit = decoder_.read_symbol(cdf_.inter.inter_intra[group], 1);
+      if (bit != 0) {
         block->interintra = true;
         block->interintra_mode =
             static_cast<int>(decoder_.read_symbol(cdf_.inter.inter_intra_mode[group], 3));
@@ -2260,6 +2269,13 @@ class TileParser {
          * what the syntax set RefFrame[1] to and what the block carries */
         ref1 = kRefIntra;
         block->ref_frame[1] = kRefIntra;
+        if (cdf_trace_enabled()) {
+          std::fprintf(stderr, "IIREAD %d %d %d %d type=%d mode=%d wedge=%d idx=%d\n",
+                       block->mi_col, block->mi_row, block_width4(block->size),
+                       block_height4(block->size), block->interintra ? 1 : 0,
+                       block->interintra_mode, block->interintra_wedge ? 1 : 0,
+                       block->wedge_index);
+        }
       }
     }
 
@@ -2280,8 +2296,10 @@ class TileParser {
                               (masks[0] | masks[1]);
       if (trace_enabled()) {
         const RangeDecoder::State mm_state = decoder_.state();
-        std::fprintf(stderr, "MM %d %d bs=%d warp=%d obmc_cdf=%u,%u dif=%llu rng=%u cnt=%d\n", col,
-                     row, static_cast<int>(size), allow_warp ? 1 : 0,
+        std::fprintf(stderr, "MM %d %d bs=%d bw4=%d bh4=%d warp=%d mask=%llx,%llx obmc_cdf=%u,%u dif=%llu rng=%u cnt=%d\n", col,
+                     row, static_cast<int>(size), bw4, bh4, allow_warp ? 1 : 0,
+                     static_cast<unsigned long long>(masks[0]),
+                     static_cast<unsigned long long>(masks[1]),
                      cdf_.inter.use_obmc[size][0], cdf_.inter.use_obmc[size][1],
                      static_cast<unsigned long long>(mm_state.window), mm_state.range,
                      mm_state.count);
@@ -2292,6 +2310,10 @@ class TileParser {
         block->motion_mode =
             decoder_.read_symbol(cdf_.inter.use_obmc[size], 1) ? kMotionObmc : kMotionTranslation;
       }
+      /* needs_interp_filter(): a locally warped block derives its filters from
+       * the warp, so it codes none - reading one here would consume the next
+       * block's first symbol and desynchronise the tile. */
+      if (block->motion_mode == kMotionWarped) has_subpel_filter = false;
       /* Both of the switchable modes only change prediction, never the syntax:
        * OBMC re-derives its vectors from the neighbours, warped motion derives
        * an affine model from them. The block is therefore parsed and counted;
@@ -2415,6 +2437,7 @@ class TileParser {
     const int bw4 = block_width4(size), bh4 = block_height4(size);
     MiRef entry;
     entry.intra = block.is_inter ? 0 : 1;
+    entry.interintra = block.interintra ? 1 : 0;
     entry.ref[0] = static_cast<uint8_t>(block.ref_frame[0]);
     entry.ref[1] = static_cast<uint8_t>(block.ref_frame[1]);
     entry.inter_mode = static_cast<uint8_t>(block.inter_mode);
@@ -2603,6 +2626,12 @@ class TileParser {
   ParseStatus decode_block(int row, int col, BlockSize size, PartitionType partition) {
     TileBlock block;
     decoder_.reset_symbol_hash();
+    if (cdf_trace_enabled()) {
+      const RangeDecoder::State st = decoder_.state();
+      std::fprintf(stderr, "BSTATE %d %d %d %d %llu %u %d\n", col, row, block_width4(size),
+                   block_height4(size), static_cast<unsigned long long>(st.window), st.range,
+                   st.count);
+    }
     block.mi_row = row;
     block.mi_col = col;
     block.size = size;

@@ -67,6 +67,54 @@ for f in range(N):
 open('src.yuv', 'wb').write(bytes(out))
 ```
 
+`inter_intra.ivf` is the inter/intra compound fixture: 110 frames of 320x240
+and 19 KB, cut from a longer encode of the same synthetic clip as `lw_t2`/`lw_t3`
+(SVT-AV1, `preset 1`, `crf 30`, `-g 8`,
+`svtav1-params "enable-restoration=0"`, muxed to IVF with `av`, no re-encode of
+the kept frames - the file is a prefix of the longer one, so the encoder's
+decisions are the ones it really made). It is the only fixture that codes
+inter/intra compound blocks: 23 of them, with `interintra_mode` in its V, H and
+SMOOTH variants and 5 of them as `wedge_interintra` (wedge indices 4, 8 and 12),
+on 16x16, 32x32, 16x32, 32x16 and 16x8 blocks, in frames 1 to 109.
+`inter_intra.hash` holds the per frame hashes and `stream_inter_intra` checks
+them, and the same stream is replayed through the device kernels by
+`opencl_inter_intra`. The DC mode (a flat weight of 32) does not appear in any
+encoding of this clip, so it is covered by `test_kernels`' inter/intra case
+instead, together with the four mask rules and the chroma sampling of the mask.
+
+The clip generator was as follows (all 160 frames; the fixture keeps the first
+110):
+
+```python
+import numpy as np
+
+W, H, N = 320, 240, 160
+yy, xx = np.mgrid[0:H, 0:W]
+base = 80 + xx * 0.35 + yy * 0.2
+for k in range(6):                            # a moving texture
+    base += np.sin(xx * (0.017 + 0.009 * k) + yy * (0.02 + 0.013 * k) + k) * (6 - k)
+out = bytearray()
+for f in range(N):
+    img = base.copy()
+    x0 = 20 + (f * 2) % 240                    # a bright bar that moves
+    img[40:100, x0:x0 + 48] = 210
+    y0 = 120 + int(18 * np.sin(f * 0.35))      # a dark box that slides
+    img[y0:y0 + 40, 200:260] = 30
+    for i in range(30):                        # a ramp
+        img[170 + i, 90 + i:130 + i] = 150
+    y = np.clip(img, 0, 255).astype(np.uint8)
+    u = np.full((H // 2, W // 2), 128, np.uint8)
+    v = np.full((H // 2, W // 2), 128, np.uint8)
+    u[20:50, x0 // 2:(x0 + 48) // 2] = 100     # chroma that follows the bar
+    v[20:50, x0 // 2:(x0 + 48) // 2] = 160
+    out += y.tobytes() + u.tobytes() + v.tobytes()
+open('src160.yuv', 'wb').write(bytes(out))
+```
+
+The truncated file is the first 110 frame records of the 160 frame one; every
+frame of it decodes bit exactly against dav1d, and so does the whole stream
+through the CPU backend and through the OpenCL kernels.
+
 `svt_av1_320x240.ivf` is a real AV1 stream, not a hand written header: six frames
 of a 320x240 gradient at 8 bit 4:2:0, encoded with SVT-AV1 (crf 40, preset 10)
 and muxed into IVF. The front-end tests parse it end to end, so the parser is

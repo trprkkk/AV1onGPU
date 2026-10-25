@@ -148,6 +148,21 @@ AV1G_TBL int av1g_tbl_filter_intra[5][8][7] = {
     },
 };
 
+/* Ii_Weights_1d (7.11.3.13): the taper of an inter/intra blend, indexed by the
+ * distance from the edge the intra half is predicted from, scaled by the block
+ * size. 60 at the edge and 1 far from it, so the intra prediction fades out
+ * across the block instead of meeting the inter one at a hard line. */
+AV1G_TBL int av1g_tbl_ii_weights[128] = {
+    60, 58, 56, 54, 52, 50, 48, 47, 45, 44, 42, 41, 39, 38, 37, 35,
+    34, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 22, 21, 20,
+    19, 19, 18, 18, 17, 16, 16, 15, 15, 14, 14, 13, 13, 12, 12, 12,
+    11, 11, 10, 10, 10, 9, 9, 9, 8, 8, 8, 8, 7, 7, 7, 7,
+    6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4,
+    4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+};
+
 /* The four sine constants the 4 point inverse ADST is built from. */
 #define AV1G_SINPI_1_9 1321
 #define AV1G_SINPI_2_9 2482

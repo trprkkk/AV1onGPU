@@ -238,20 +238,26 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         const BlockSyntax& b = syntax.blocks[bi];
         const int p = b.plane;
         int dep = -1;
-        if (b.is_intra) {
-          /* The edge samples, plus the extensions the specification allows:
-           * the row above by another block width and the column to the left by
-           * another block height. */
-          above_right[bi] = static_cast<char>(
-              b.have_above_right >= 0
-                  ? (b.have_above_right != 0)
-                  : (b.y > 0 && already_decoded(p, b.x + b.w, b.x + 2 * b.w - 1, b.y - 1,
-                                                b.y - 1, bi)));
-          below_left[bi] = static_cast<char>(
-              b.have_below_left >= 0
-                  ? (b.have_below_left != 0)
-                  : (b.x > 0 && already_decoded(p, b.x - 1, b.x - 1, b.y + b.h,
-                                                b.y + 2 * b.h - 1, bi)));
+        /* An inter/intra block belongs here too: its intra half reads the same
+         * edges an intra block of that size does, so it cannot be scheduled with
+         * the other inter work, which always lands in wave 0. The extensions the
+         * specification allows (above-right, below-left, corner) change the
+         * result of the directional and recursive intra modes only, and an
+         * inter/intra block cannot use those, so it waits for the plain edge
+         * alone. */
+        if (b.is_intra || b.interintra) {
+          if (b.is_intra) {
+            above_right[bi] = static_cast<char>(
+                b.have_above_right >= 0
+                    ? (b.have_above_right != 0)
+                    : (b.y > 0 && already_decoded(p, b.x + b.w, b.x + 2 * b.w - 1, b.y - 1,
+                                                  b.y - 1, bi)));
+            below_left[bi] = static_cast<char>(
+                b.have_below_left >= 0
+                    ? (b.have_below_left != 0)
+                    : (b.x > 0 && already_decoded(p, b.x - 1, b.x - 1, b.y + b.h,
+                                                  b.y + 2 * b.h - 1, bi)));
+          }
           const int left_x = b.x - 1;
           const int left_y1 = b.y + (below_left[bi] ? 2 * b.h : b.h) - 1;
           for (int y = b.y; y <= left_y1; ++y) {
@@ -401,6 +407,32 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
             job.luma_ref_w = g.plane_w[0];
             job.luma_ref_h = g.plane_h[0];
           }
+        }
+        /* Inter/intra compound (7.11.4). The intra half is predicted from the
+         * frame being decoded, so the job carries the neighbours it may read and
+         * the same maxX/maxY clamp an intra job carries; a wedge blend comes in
+         * through the codebook entry a masked compound uses, with a sign of zero
+         * because the syntax codes none for an inter/intra block. */
+        job.interintra = b.interintra ? 1 : 0;
+        job.interintra_mode = b.interintra_mode;
+        job.have_left = b.have_left && b.x > 0;
+        job.have_above = b.have_above && b.y > 0;
+        job.max_x = (((geom.width + 7) & ~7) >> (plane ? geom.ss_x : 0)) - 1;
+        job.max_y = (((geom.height + 7) & ~7) >> (plane ? geom.ss_y : 0)) - 1;
+        if (b.interintra && b.interintra_wedge) {
+          const int luma_w = b.w << (plane > 0 ? geom.ss_x : 0);
+          const int luma_h = b.h << (plane > 0 ? geom.ss_y : 0);
+          int dir = AV1G_WEDGE_HORIZONTAL, xoff = 0, yoff = 0, flip = 0;
+          if (!tables::wedge_entry(luma_w, luma_h, b.wedge_index, &dir, &xoff, &yoff,
+                                   &flip)) {
+            *error = "engine: an inter/intra wedge on a block size that has none";
+            return false;
+          }
+          job.interintra_wedge = 1;
+          job.wedge_dir = dir;
+          job.wedge_xoff = xoff;
+          job.wedge_yoff = yoff;
+          job.wedge_flip = flip;
         }
         job.ref0_slot = resolve_slot(syntax, b.ref[0]);
         job.ref1_slot = resolve_slot(syntax, b.ref[1]);

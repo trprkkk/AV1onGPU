@@ -239,6 +239,9 @@ int main() {
   FM(Av1gInterJob, warp_params, 2, 6);
   FM(Av1gInterJob, warp_abcd, 2, 4);
   FA2(Av1gInterJob, mask_warp, 2);
+  F(Av1gInterJob, interintra); F(Av1gInterJob, interintra_mode);
+  F(Av1gInterJob, interintra_wedge); F(Av1gInterJob, have_left);
+  F(Av1gInterJob, have_above); F(Av1gInterJob, max_x); F(Av1gInterJob, max_y);
   S(Av1gDeblockJob);
   F(Av1gDeblockJob, p_off); F(Av1gDeblockJob, stride); F(Av1gDeblockJob, step);
   F(Av1gDeblockJob, len); F(Av1gDeblockJob, level); F(Av1gDeblockJob, sharpness);

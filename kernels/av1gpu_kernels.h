@@ -207,6 +207,19 @@ typedef struct {
    * job (7.11.3.12 prepares the mask for plane 0 only and 7.11.3.14 averages
    * that array down for the chroma samples). */
   int mask_warp[2];
+  /* Inter/intra compound (7.11.4): the prediction above is blended with an
+   * intra prediction of the same region, which reads the *reconstructed*
+   * neighbours of the frame being decoded - the same edges an intra block of
+   * this size and position would read, hence have_left/have_above and the
+   * maxX/maxY clamp the intra path carries. The blend weight is a per sample
+   * taper (`interintra_mode`, AV1G_II_*), or the wedge mask of the codebook
+   * when `interintra_wedge` is set - the same wedge a masked compound uses, so
+   * it comes in through wedge_dir/xoff/yoff/flip, with a sign of zero. */
+  int interintra;
+  int interintra_mode;   /* AV1G_II_*                                     */
+  int interintra_wedge;
+  int have_left, have_above; /* the intra half's neighbours                */
+  int max_x, max_y;          /* last valid sample of this plane (edge clamp) */
 } Av1gInterJob;
 
 /*
@@ -336,6 +349,13 @@ typedef struct {
 #define AV1G_COMPOUND_NONE 0
 #define AV1G_COMPOUND_AVG 1
 #define AV1G_COMPOUND_DIST 2
+
+/* interintra_mode (7.11.4): which intra prediction an inter/intra block mixes
+ * into its inter one. The numbering is the bitstream's. */
+#define AV1G_II_DC 0
+#define AV1G_II_V 1
+#define AV1G_II_H 2
+#define AV1G_II_SMOOTH 3
 
 /* A masked compound block blends its two predictions with a per sample weight
  * instead of one weight for the whole block. */
@@ -1625,6 +1645,111 @@ AV1G_FN int av1g_obmc_mask(int length, int index) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* inter/intra compound (7.11.4)                                      */
+/*                                                                    */
+/* An inter/intra block is one inter prediction blended with an intra */
+/* one. The intra half is predicted from the *reconstructed* frame -   */
+/* the same edges an intra block of that size and position reads -     */
+/* and the blend weight is a taper that follows the intra mode, or a   */
+/* wedge from the codebook. The specification computes the intra half  */
+/* into the frame first and then blends it back (7.11.3.14); for a per */
+/* sample replay predicting it again is the same thing, because the    */
+/* intra half only ever reads samples outside the block.               */
+/* ------------------------------------------------------------------ */
+
+/* AboveRow[i] of an inter/intra block, at this plane's resolution: the
+ * reconstructed row above, or the stand-in 7.11.2.1 asks for when there is no
+ * neighbour. `i` is clamped to the frame the way maxX clamps an intra edge, so
+ * a block that runs past the last sample of the plane repeats it instead of
+ * reading into the row below. */
+AV1G_FN int av1g_ii_above(const Av1gInterJob *job, AV1G_GLOBAL const av1g_px *cur, int i) {
+  AV1G_GLOBAL const av1g_px *p = cur + job->dst_off;
+  const int mid = 1 << (job->bitdepth - 1);
+  if (!job->have_above) return job->have_left ? (int)p[-1] : mid - 1;
+  if (job->ref_x + i > job->max_x) i = job->max_x - job->ref_x;
+  return (int)p[-job->dst_stride + i];
+}
+
+/* LeftCol[i] of an inter/intra block, the same way. */
+AV1G_FN int av1g_ii_left(const Av1gInterJob *job, AV1G_GLOBAL const av1g_px *cur, int i) {
+  AV1G_GLOBAL const av1g_px *p = cur + job->dst_off;
+  const int mid = 1 << (job->bitdepth - 1);
+  if (!job->have_left) return job->have_above ? (int)p[-job->dst_stride] : mid + 1;
+  if (job->ref_y + i > job->max_y) i = job->max_y - job->ref_y;
+  return (int)p[i * job->dst_stride - 1];
+}
+
+/* DC of the intra half: the average of whichever edges exist (7.11.2.2). */
+AV1G_FN int av1g_ii_dc(const Av1gInterJob *job, AV1G_GLOBAL const av1g_px *cur) {
+  const int w = job->w, h = job->h;
+  int sum = 0, k;
+  if (job->have_above && job->have_left) {
+    for (k = 0; k < w; ++k) sum += av1g_ii_above(job, cur, k);
+    for (k = 0; k < h; ++k) sum += av1g_ii_left(job, cur, k);
+    return (sum + ((w + h) >> 1)) / (w + h);
+  }
+  if (job->have_left) {
+    for (k = 0; k < h; ++k) sum += av1g_ii_left(job, cur, k);
+    return (sum + (h >> 1)) >> av1g_log2(h);
+  }
+  if (job->have_above) {
+    for (k = 0; k < w; ++k) sum += av1g_ii_above(job, cur, k);
+    return (sum + (w >> 1)) >> av1g_log2(w);
+  }
+  return 1 << (job->bitdepth - 1);
+}
+
+/* One sample of the intra half. */
+AV1G_FN int av1g_ii_sample(const Av1gInterJob *job, AV1G_GLOBAL const av1g_px *cur, int x,
+                           int y) {
+  if (job->interintra_mode == AV1G_II_V) return av1g_ii_above(job, cur, x);
+  if (job->interintra_mode == AV1G_II_H) return av1g_ii_left(job, cur, y);
+  if (job->interintra_mode == AV1G_II_SMOOTH) {
+    const int wy = av1g_sm_weight(job->h, y), wx = av1g_sm_weight(job->w, x);
+    const int pred = wy * av1g_ii_above(job, cur, x) +
+                     (256 - wy) * av1g_ii_left(job, cur, job->h - 1) +
+                     wx * av1g_ii_left(job, cur, y) +
+                     (256 - wx) * av1g_ii_above(job, cur, job->w - 1);
+    return av1g_round2(pred, 9);
+  }
+  return av1g_ii_dc(job, cur);
+}
+
+/* The blend weight at one sample, on this plane's grid (7.11.3.13 and the mask
+ * blend process of 7.11.3.14). The taper is already defined per plane sample,
+ * so it is taken straight; a wedge is defined on the luma grid, so a subsampled
+ * plane averages the two or four weights under it, exactly like a masked
+ * compound's wedge. */
+AV1G_FN int av1g_ii_mask(const Av1gInterJob *job, int x, int y) {
+  if (job->interintra_wedge) {
+    const int ny = job->sub_y + 1, nx = job->sub_x + 1;
+    const int n = nx * ny;
+    int i, j, sum = 0;
+    for (j = 0; j < ny; ++j)
+      for (i = 0; i < nx; ++i)
+        sum += av1g_wedge_px(job, (y << job->sub_y) + j, (x << job->sub_x) + i);
+    if (n == 1) return sum;
+    return n == 2 ? (sum + 1) >> 1 : (sum + 2) >> 2;
+  }
+  {
+    /* sizeScale = MAX_SB_SIZE / Max(h, w): the taper is defined over 128
+     * samples, so a small block takes every n'th entry and a block of the
+     * largest size the mode allows (32x32) every fourth. DC is the one mode
+     * with a flat weight, and the specification writes it as the number 32
+     * rather than as an index into the table. */
+    int k, scale;
+    if (job->interintra_mode == AV1G_II_DC) return 32;
+    scale = 128 / av1g_max(job->w, job->h);
+    k = 0;
+    if (job->interintra_mode == AV1G_II_V) k = y * scale;
+    else if (job->interintra_mode == AV1G_II_H) k = x * scale;
+    else if (job->interintra_mode == AV1G_II_SMOOTH) k = av1g_min(x, y) * scale;
+    if (k > 127) k = 127;
+    return av1g_tbl_ii_weights[k];
+  }
+}
+
 AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
                            AV1G_GLOBAL const av1g_px *cur,
                            AV1G_GLOBAL const av1g_px *pool,
@@ -1708,6 +1833,16 @@ AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
     }
   }
   out = av1g_clip_px(out, maxv);
+
+  /* Inter/intra compound: the clipped inter prediction is blended with the
+   * intra one at the taper or wedge weight, and that is the block's sample -
+   * 7.11.3.14 rounds the pair here and not before, so no second rounding of the
+   * inter half happens. */
+  if (job->interintra) {
+    const int m = av1g_ii_mask(job, x, y);
+    const int intra = av1g_ii_sample(job, cur, x, y);
+    out = (m * intra + (64 - m) * out + 32) >> 6;
+  }
 
   /* Overlapped block motion compensation: a strip of this block predicted from
    * a neighbour's vector, blended in with the taper. The strips of one pass do

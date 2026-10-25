@@ -676,6 +676,101 @@ void test_inter() {
   CHECK(worst2 <= 1);
 }
 
+/* Inter/intra compound (7.11.4). The inter half is a flat reference with a zero
+ * vector, so it predicts its own value exactly and the only thing under test is
+ * the intra half and the blend: the mask is the specification's Ii_Weights_1d
+ * taper indexed by the plane sample, the intra half reads the reconstructed
+ * edges above and to the left, and the pair is rounded once at 6 bits. */
+void test_inter_intra() {
+  std::printf("inter/intra compound\n");
+  const int stride = 48;
+  const int block = 16;             /* samples from the frame origin       */
+  std::vector<uint16_t> frame(static_cast<size_t>(stride) * 48, 0);
+  std::vector<uint16_t> ref(static_cast<size_t>(stride) * 48, 128);
+  /* the edges the intra half reads: distinct per row and column, so a mask
+   * applied to the wrong sample cannot pass */
+  for (int x = block; x < block + 8; ++x) frame[(block - 1) * stride + x] = static_cast<uint16_t>(100 + x);
+  for (int y = block; y < block + 8; ++y) frame[y * stride + block - 1] = static_cast<uint16_t>(200 - y);
+
+  Av1gInterJob job;
+  std::memset(&job, 0, sizeof(job));
+  job.w = 8;
+  job.h = 8;
+  job.dst_off = block * stride + block;
+  job.dst_stride = stride;
+  job.ref_x = block;
+  job.ref_y = block;
+  job.ref_w = 48;
+  job.ref_h = 48;
+  job.ref0_stride = stride;
+  job.ref1_stride = stride;
+  job.filt = AV1G_FILT_REGULAR;
+  job.filt_v = AV1G_FILT_REGULAR;
+  job.bitdepth = 8;
+  job.have_left = 1;
+  job.have_above = 1;
+  job.max_x = stride - 1;
+  job.max_y = 47;
+  job.interintra = 1;
+
+  /* the mask itself, per mode, on the luma grid: sizeScale is 128 / 8 = 16, so
+   * samples (0, 0), (2, 0) and (4, 0) read Ii_Weights_1d[0], [32] and [64] */
+  struct {
+    int mode;
+    int expect[3][3];
+  } masks[] = {
+      /* DC is the one mode whose weight is a constant, not a table entry */
+      {AV1G_II_DC, {{32, 32, 32}, {32, 32, 32}, {32, 32, 32}}},
+      /* V varies down the rows, H across the columns */
+      {AV1G_II_V, {{60, 60, 60}, {19, 19, 19}, {6, 6, 6}}},
+      {AV1G_II_H, {{60, 19, 6}, {60, 19, 6}, {60, 19, 6}}},
+      /* SMOOTH takes Min(x, y) */
+      {AV1G_II_SMOOTH, {{60, 60, 60}, {60, 19, 19}, {60, 19, 6}}},
+  };
+  for (const auto& m : masks) {
+    job.interintra_mode = m.mode;
+    for (int y = 0; y < 3; ++y)
+      for (int x = 0; x < 3; ++x)
+        CHECK(av1g_ii_mask(&job, x * 2, y * 2) == m.expect[y][x]);
+  }
+
+  /* the blend, sample by sample, for a vertical taper */
+  job.interintra_mode = AV1G_II_V;
+  std::vector<uint16_t> dst(frame);
+  av1g_inter_block(&job, dst.data(), frame.data(), ref.data(), tables::filters().data(), 255);
+  int worst = 0;
+  for (int y = 0; y < 8; ++y) {
+    const int mask = av1g_tbl_ii_weights[y * 16];
+    for (int x = 0; x < 8; ++x) {
+      const int intra = frame[(block - 1) * stride + block + x]; /* AboveRow */
+      const int want = (mask * intra + (64 - mask) * 128 + 32) >> 6;
+      worst = std::max(worst, std::abs(static_cast<int>(dst[job.dst_off + y * stride + x]) - want));
+    }
+  }
+  CHECK(worst == 0);
+
+  /* A chroma plane of an inter/intra block reads Mask[y][x] at its own sample,
+   * with the mask built over the plane's own size - not four averaged luma
+   * weights, which is the wedge's rule (7.11.3.14: `interintra && !wedge` picks
+   * the plane's own array). So the chroma mask of a 8x8 luma block is a 4x4
+   * taper of sizeScale 32, and differs from the luma one at the same sample. */
+  Av1gInterJob chroma = job;
+  chroma.w = 4;
+  chroma.h = 4;
+  chroma.sub_x = 1;
+  chroma.sub_y = 1;
+  chroma.interintra_mode = AV1G_II_V;
+  for (int y = 0; y < 4; ++y) {
+    CHECK(av1g_ii_mask(&chroma, 0, y) == av1g_tbl_ii_weights[y * 32]);
+    CHECK(av1g_ii_mask(&chroma, 0, y) == av1g_ii_mask(&job, 0, y * 2));
+    for (int x = 1; x < 4; ++x) CHECK(av1g_ii_mask(&chroma, x, y) == av1g_ii_mask(&chroma, 0, y));
+  }
+  /* DC stays 32 at any size */
+  chroma.interintra_mode = AV1G_II_DC;
+  for (int y = 0; y < 4; ++y)
+    for (int x = 0; x < 4; ++x) CHECK(av1g_ii_mask(&chroma, x, y) == 32);
+}
+
 void test_filters() {
   std::printf("loop filters\n");
   const int stride = 32;
@@ -813,6 +908,7 @@ int main() {
   test_transform();
   test_intra();
   test_inter();
+  test_inter_intra();
   test_filters();
   test_color();
   return testing::finish("test_kernels");
