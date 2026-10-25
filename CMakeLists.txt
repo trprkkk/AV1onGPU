@@ -185,5 +185,17 @@ if(AV1GPU_BUILD_TESTS)
                        --dumper $<TARGET_FILE:av1gpu_dump>)
       set_tests_properties(opencl_pipeline PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
+
+    # Verification on a machine that really has a GPU: the OpenCL/CUDA backends
+    # against the CPU reference and against a reference decoder's frame hashes.
+    # Off by default because it needs a device; without one the script exits with
+    # 77 and ctest reports a skip. See docs/GPU.md.
+    set(AV1GPU_GPU_TESTS OFF CACHE BOOL "run tests/gpu_verify.py in ctest (needs a GPU)")
+    if(AV1GPU_GPU_TESTS)
+      add_test(NAME gpu_verify
+               COMMAND ${AV1GPU_TEST_PY} ${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_verify.py
+                       --build ${CMAKE_BINARY_DIR})
+      set_tests_properties(gpu_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
+    endif()
   endif()
 endif()

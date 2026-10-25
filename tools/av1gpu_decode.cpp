@@ -17,6 +17,10 @@
  * disabled (AV1GPU_NOLF), so a difference is a reconstruction difference and
  * not a filter difference.
  *
+ * `--require-device` turns a missing GPU into an error instead of a silent fall
+ * back to the CPU reference, which is what a machine that is supposed to have a
+ * device wants: a run that quietly used the CPU proves nothing.
+ *
  * `--hash-out F` writes one FNV-1a 64 hash of each shown frame's 8 bit planar
  * output, in output order; `--hash-check F` decodes and compares against such a
  * file, naming the first frame that differs. A hash list is a couple of
@@ -52,6 +56,8 @@ struct Options {
   std::string hash_out;
   std::string hash_check;
   std::string backend = "auto";
+  int device = 0;
+  bool require_device = false;
   int frames = -1;
   bool verbose = false;
 };
@@ -65,6 +71,8 @@ void usage() {
       "  --hash-out F      write one hash per shown frame to F\n"
       "  --hash-check F    compare the output against the hashes in F\n"
       "  --backend B       auto (default), cpu, opencl or cuda\n"
+      "  --device N        device index for that backend (default 0)\n"
+      "  --require-device  fail instead of falling back to the CPU backend\n"
       "  --frames N        stop after N temporal units\n"
       "  -v, --verbose     print every OBU and every frame\n"
       "\n"
@@ -198,6 +206,14 @@ int main(int argc, char** argv) {
       opt.backend = argv[++i];
       continue;
     }
+    if (arg == "--device" && i + 1 < argc) {
+      opt.device = std::atoi(argv[++i]);
+      continue;
+    }
+    if (arg == "--require-device") {
+      opt.require_device = true;
+      continue;
+    }
     if (arg == "--frames" && i + 1 < argc) {
       opt.frames = std::atoi(argv[++i]);
       continue;
@@ -233,12 +249,23 @@ int main(int argc, char** argv) {
   std::string error;
   BackendOptions backend_options;
   backend_options.kind = kind;
+  backend_options.device_index = opt.device;
+  backend_options.allow_cpu_fallback = !opt.require_device;
   std::unique_ptr<Decoder> decoder = Decoder::create(backend_options, &error);
   if (!decoder) {
     std::fprintf(stderr, "av1gpu_decode: no backend: %s\n", error.c_str());
     return 1;
   }
-  std::printf("backend: %s\n", decoder->device().name.c_str());
+  /* A GPU run that fell back to the CPU reference would report exactly the same
+   * pictures, so say which backend actually ran, and refuse to pretend when a
+   * device was asked for by name. */
+  if (kind != BackendKind::Auto && decoder->device().kind != kind) {
+    std::fprintf(stderr, "av1gpu_decode: asked for %s, got %s (%s)\n", to_string(kind),
+                 to_string(decoder->device().kind), decoder->device().name.c_str());
+    return 2;
+  }
+  std::printf("backend: %s (%s)\n", to_string(decoder->device().kind),
+              decoder->device().name.c_str());
 
   std::vector<uint8_t> reference;
   if (!opt.compare.empty() && !read_file(opt.compare, &reference)) {

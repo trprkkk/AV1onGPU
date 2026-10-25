@@ -307,3 +307,19 @@ then this. None of it touches the kernels.
 10/12 bit already flows through the kernels (samples are 16 bit, `maxv` is
 derived from the bit depth) but is untested; 4:4:4 is supported by the layout
 code and untested. Both need tests and a real stream to verify against.
+
+## 8. Verification on a real GPU
+
+Everything in this repository is checkable without a device except the driver
+interface itself, and that is where a port to another machine usually breaks:
+device queries, buffer sizes, the layouts the kernels declare, launch shapes, and
+how much CPU time is left over while the card works. `tests/gpu_verify.py` (and
+`docs/GPU.md`) is that check: synthetic parity against the CPU reference, then the
+fixture streams decoded through the GPU backend with the fallback disabled.
+
+As of this writing it has run on OpenCL — on PoCL, a CPU device, which is enough
+to prove the plumbing and the arithmetic but says nothing about speed — and not at
+all on CUDA, which has had no NVIDIA device here. The first run of that shape is
+what the numbers in this file are waiting for: which frame sizes play in real
+time, what the CPU share looks like next to it, and whether the wave scheduling in
+section 5 is the right thing to attack first.

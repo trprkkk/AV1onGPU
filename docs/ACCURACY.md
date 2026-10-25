@@ -133,7 +133,10 @@ av1gpu_decode --backend opencl --frames 30 tests/data/lw_t2.ivf \
 ```
 
 then checks the whole backend — context, buffers, job upload, launch order,
-reference copies — against a reference decoder's pictures. Every stream in the
+reference copies — against a reference decoder's pictures. `tests/gpu_verify.py`
+does that for every backend and every fixture in one command, with the CPU
+fallback disabled so a run that quietly used the CPU cannot pass; `docs/GPU.md`
+is the page to hand to whoever has the GPU. Every stream in the
 fixture set decodes bit exactly that way on a two-core PoCL device (14 streams),
 and `av1gpu_bench` reports the same PSNR for `--backend cpu` and `--backend
 opencl`. This is an arithmetic and plumbing check, not a performance one: a CPU

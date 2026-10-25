@@ -230,10 +230,17 @@ cd build && ctest --output-on-failure
   launch counts, reference slots and loop filter scheduling together — the
   things the per-kernel check cannot see. Also needs `pyopencl`.
 
+* `gpu_verify.py` — the same question asked of a machine that really has a GPU:
+  `av1gpu_bench` has to report a GPU result bit identical to the CPU reference,
+  and the fixture streams have to decode bit exactly through the GPU backend with
+  `--require-device`, so a backend that fell back to the CPU cannot pass. Run it
+  on the machine with the card, see `docs/GPU.md`.
+
 ```sh
 pip install pyopencl          # or pyopencl + pocl-binary-distribution
 python3 tests/opencl_selftest.py
 python3 tests/opencl_pipeline.py --frames 4 --qstep 6
+python3 tests/gpu_verify.py   # on the machine with the GPU
 ```
 
 `tests/` and this section assume Linux or macOS. On a machine without an ICD
