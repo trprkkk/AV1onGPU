@@ -163,6 +163,16 @@ AV1G_TBL int av1g_tbl_ii_weights[128] = {
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 };
 
+/* Sgr_Params (7.17.3): the radius and eps of the self guided filter's two box
+ * filters, per coded set. A radius of 0 means the pass is skipped - the input
+ * is used instead - which is why the last sets code { 2, 30, 0, 0 }. */
+AV1G_TBL int av1g_tbl_sgr_params[16][4] = {
+    {2, 12, 1, 4}, {2, 15, 1, 6}, {2, 18, 1, 8}, {2, 21, 1, 9},
+    {2, 24, 1, 10}, {2, 29, 1, 11}, {2, 36, 1, 12}, {2, 45, 1, 13},
+    {2, 56, 1, 14}, {2, 68, 1, 15}, {0, 0, 1, 5}, {0, 0, 1, 8},
+    {0, 0, 1, 11}, {0, 0, 1, 14}, {2, 30, 0, 0}, {2, 75, 0, 0},
+};
+
 /* Gaussian_Sequence (10.5): the white noise list the film grain generator
  * draws from, zero mean with a standard deviation of about 512, clipped to
  * [-2048, 2047] and rounded to a multiple of four. */

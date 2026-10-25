@@ -310,6 +310,11 @@ struct TileDecodeResult {
   int cdef_rows = 0;
   std::vector<int8_t> cdef_idx;
 
+  /* Loop restoration units, one entry per unit of each plane, row major with
+   * the frame's unit column count. Filled by read_lr() as the superblocks code
+   * them; a unit that codes no filter keeps type 0. */
+  std::vector<RestorationUnit> restoration[3];
+
   /* The frame's motion vector grid, saved for the frames that refer back to
    * this one: their temporal candidate scan projects it onto itself. Null for
    * an intra frame, which has no motion vectors to store. */

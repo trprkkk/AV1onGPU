@@ -124,7 +124,10 @@ void read_global_param(const FrameHeader& h, BitReader* r, GlobalMotion* gm, int
   const int sub = (idx % 3) == 2 ? (1 << prec_bits) : 0;
   const int mx = 1 << abs_bits;
   const int ref = (prev.params[idx] >> prec_diff) - sub;
-  gm->params[idx] = (decode_signed_subexp_with_ref(-mx, mx + 1, ref, r) << prec_diff) + round;
+  /* the parameter is signed, so the scaling to the model precision is a
+   * multiply rather than a left shift */
+  const int decoded = decode_signed_subexp_with_ref(-mx, mx + 1, ref, r);
+  gm->params[idx] = decoded * (1 << prec_diff) + round;
 }
 
 /* global_motion_params(): one model per reference type, coded as a difference
@@ -1333,19 +1336,24 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
       h.restoration_type[2] = static_cast<int>(r.read(2));
     }
     if (h.restoration_type[0] || h.restoration_type[1] || h.restoration_type[2]) {
-      h.restoration_unit_size[0] = 6 + sb128;
+      /* LoopRestorationSize[0] = RESTORATION_TILESIZE_MAX >> (2 - lr_unit_shift),
+       * i.e. 64, 128 or 256 samples across, and the chroma size is the same or
+       * half of it. Everything downstream only needs the base two logarithm. */
+      int log2_size = 6 + sb128;
       if (r.read_bit()) {
-        ++h.restoration_unit_size[0];
-        if (!sb128) h.restoration_unit_size[0] += static_cast<int>(r.read_bit());
+        ++log2_size;
+        if (!sb128) log2_size += static_cast<int>(r.read_bit());
       }
-      h.restoration_unit_size[1] = h.restoration_unit_size[0];
+      h.restoration_unit_log2[0] = log2_size;
+      h.restoration_unit_log2[1] = log2_size;
+      h.restoration_unit_log2[2] = log2_size;
       if ((h.restoration_type[1] || h.restoration_type[2]) && seq.ss_x == 1 &&
           seq.ss_y == 1) {
-        h.restoration_unit_size[1] -= static_cast<int>(r.read_bit());
+        /* lr_uv_shift: the chroma units are the same size as the luma ones or
+         * half of them, and the bit says which */
+        if (r.read_bit()) --h.restoration_unit_log2[1];
+        h.restoration_unit_log2[2] = h.restoration_unit_log2[1];
       }
-      *out = h;
-      return unsupported("restoration filters (Wiener / self guided) are not implemented",
-                         error);
     }
   }
 

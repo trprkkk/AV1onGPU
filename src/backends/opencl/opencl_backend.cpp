@@ -145,6 +145,12 @@ class OpenCLBackend final : public Backend {
     layout_ = g;
     ensure(&frame_, &frame_cap_, size * sizeof(uint16_t));
     ensure(&scratch_, &scratch_cap_, size * sizeof(uint16_t));
+    /* Loop restoration reads two pictures the frame no longer holds by then -
+     * the deblocked one and a snapshot of the CDEF output - and, for a superres
+     * frame, the upscaled deblocked one. */
+    ensure(&lr_curr_, &lr_curr_cap_, size * sizeof(uint16_t));
+    ensure(&lr_cdef_, &lr_cdef_cap_, size * sizeof(uint16_t));
+    ensure(&lr_prev_up_, &lr_prev_up_cap_, size * sizeof(uint16_t));
     ensure_ref_pool(size);
     ensure(&filters_, &filters_cap_, tables::filters().size() * sizeof(int), true);
     return g;
@@ -361,6 +367,15 @@ class OpenCLBackend final : public Backend {
     }
 
     /* ---- CDEF (needs a snapshot of the frame) ------------------------------ */
+    const bool uses_lr = !plan.restoration.empty();
+    if (uses_lr) {
+      /* the two lines either side of a stripe come from the picture as it is
+       * *before* CDEF, so it has to be kept */
+      if (api_.EnqueueCopyBuffer(queue_, frame_, lr_curr_, 0, 0,
+                                 g.buffer_size * sizeof(uint16_t), 0, nullptr,
+                                 nullptr) != opencl::CL_SUCCESS)
+        return fail(error, "restoration snapshot copy failed");
+    }
     if (!plan.cdef.empty()) {
       if (!ensure(&scratch_, &scratch_cap_, g.buffer_size * sizeof(uint16_t)))
         return fail(error, "out of device memory for the CDEF snapshot");
@@ -409,6 +424,50 @@ class OpenCLBackend final : public Backend {
       set_mem(k, 6, filters_);
       set_int(k, 7, maxv);
       if (!enqueue(k, total, 64)) return fail(error, "av1g_k_upscale failed");
+      ++launches;
+      /* Restoration works on the upscaled picture, so the pre-CDEF snapshot is
+       * resampled by the same jobs into a buffer of its own; the CDEF output
+       * frame_ holds is copied afterwards, as its snapshot. */
+      if (uses_lr) {
+        cl_kernel kb = kernel("av1g_k_upscale");
+        set_mem(kb, 0, job_mem);
+        set_mem(kb, 1, pref_mem);
+        set_int(kb, 2, static_cast<int>(plan.upscale.size()));
+        set_int(kb, 3, total);
+        set_mem(kb, 4, lr_curr_);
+        set_mem(kb, 5, lr_prev_up_);
+        set_mem(kb, 6, filters_);
+        set_int(kb, 7, maxv);
+        if (!enqueue(kb, total, 64)) return fail(error, "av1g_k_upscale failed");
+        ++launches;
+      }
+    }
+
+    /* ---- loop restoration (7.17) ------------------------------------------- */
+    /* Every job computes its samples from the two snapshots, never from samples
+     * another unit has written, so the whole stage is one launch. */
+    if (uses_lr) {
+      /* frame_ holds the CDEF output - upscaled, if this frame is superres -
+       * and restoration reads it, not the picture it is about to write */
+      if (api_.EnqueueCopyBuffer(queue_, frame_, lr_cdef_, 0, 0,
+                                 g.buffer_size * sizeof(uint16_t), 0, nullptr,
+                                 nullptr) != opencl::CL_SUCCESS)
+        return fail(error, "restoration snapshot copy failed");
+      int total = 0;
+      cl_mem job_mem = 0, pref_mem = 0;
+      if (!upload_jobs(plan.restoration, &job_mem, &pref_mem, &total,
+                       [](const Av1gLrJob& j) { return j.w * j.h; }))
+        return fail(error, "restoration job upload failed");
+      cl_kernel k = kernel("av1g_k_lr");
+      set_mem(k, 0, job_mem);
+      set_mem(k, 1, pref_mem);
+      set_int(k, 2, static_cast<int>(plan.restoration.size()));
+      set_int(k, 3, total);
+      set_mem(k, 4, lr_cdef_);
+      set_mem(k, 5, plan.upscale.empty() ? lr_curr_ : lr_prev_up_);
+      set_mem(k, 6, frame_);
+      set_int(k, 7, maxv);
+      if (!enqueue(k, total, 64)) return fail(error, "av1g_k_lr failed");
       ++launches;
     }
 
@@ -607,12 +666,14 @@ class OpenCLBackend final : public Backend {
       if (entry.second && api_.ReleaseKernel) api_.ReleaseKernel(entry.second);
     }
     kernels_.clear();
-    cl_mem buffers[] = {frame_, scratch_, coef_,    tmp_,     residual_,
-                        filters_, ref_pool_, grain_,   lut_,     rgb_,
-                        job_a_, job_b_,   pref_a_,  pref_b_};
+    cl_mem buffers[] = {frame_,  scratch_,   coef_,   tmp_,     residual_,
+                        filters_, ref_pool_, grain_,  lut_,     rgb_,
+                        job_a_,  job_b_,    pref_a_, pref_b_,  lr_curr_,
+                        lr_cdef_, lr_prev_up_};
     for (cl_mem m : buffers)
       if (m && api_.ReleaseMemObject) api_.ReleaseMemObject(m);
     frame_ = scratch_ = coef_ = tmp_ = residual_ = filters_ = nullptr;
+    lr_curr_ = lr_cdef_ = lr_prev_up_ = nullptr;
     ref_pool_ = grain_ = lut_ = rgb_ = job_a_ = job_b_ = nullptr;
     pref_a_ = pref_b_ = nullptr;
     if (program_ && api_.ReleaseProgram) api_.ReleaseProgram(program_);
@@ -806,11 +867,13 @@ class OpenCLBackend final : public Backend {
   bool tables_uploaded_ = false;
 
   cl_mem frame_ = nullptr, scratch_ = nullptr, coef_ = nullptr, tmp_ = nullptr;
+  cl_mem lr_curr_ = nullptr, lr_cdef_ = nullptr, lr_prev_up_ = nullptr;
   cl_mem residual_ = nullptr, filters_ = nullptr;
   cl_mem ref_pool_ = nullptr, grain_ = nullptr, lut_ = nullptr, palette_ = nullptr;
   cl_mem rgb_ = nullptr, job_a_ = nullptr, job_b_ = nullptr;
   cl_mem pref_a_ = nullptr, pref_b_ = nullptr;
   size_t frame_cap_ = 0, scratch_cap_ = 0, coef_cap_ = 0, tmp_cap_ = 0;
+  size_t lr_curr_cap_ = 0, lr_cdef_cap_ = 0, lr_prev_up_cap_ = 0;
   size_t residual_cap_ = 0, filters_cap_ = 0, ref_cap_ = 0;
   size_t grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0, palette_cap_ = 0;
   size_t job_a_cap_ = 0, pref_a_cap_ = 0, pref_b_cap_ = 0;

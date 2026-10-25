@@ -4,12 +4,12 @@ The library stops at the entropy decoder boundary on purpose: it consumes
 reconstruction syntax and produces pictures. Everything below is future work in
 the order it unlocks the most.
 
-## 1. A front-end that produces `FrameSyntax`
+## 1. A front-end that produces `FrameSyntax` — done
 
-This is the one thing standing between the library and playing real `.ivf` /
-`.obu` files. The work is an AV1 parser (symbol decoder, partition tree,
-reference frame management) that emits `av1gpu::FrameSyntax`; it does *not*
-touch the GPU.
+This was the one thing standing between the library and playing real `.ivf` /
+`.obu` files: an AV1 parser (symbol decoder, partition tree, reference frame
+management) that emits `av1gpu::FrameSyntax` without touching the GPU. It is
+`src/frontend/`, and every fixture in `tests/data/` goes through it.
 
 **Done: containers and headers.** `src/frontend/` reads IVF files and raw OBU
 streams and parses the complete sequence header and every frame header type -
@@ -21,8 +21,8 @@ through `found_ref` (`frame_size_with_refs`) and skip mode are derived, not
 guessed. That pool carries each slot's order hint and
 frame id, which is what `frame_refs_short_signaling` (7.8) and the frame id
 checks of 5.9.2 - including `mark_ref_frames` and the order hints an error
-resilient frame re-states - work on. Features that are not implemented (loop restoration) are reported
-with a message instead of being misparsed.
+resilient frame re-states - work on. Loop restoration used to be reported with
+a message instead of being misparsed; it is implemented now (see item 3 below).
 `av1gpu_probe` shows what it found in a real file, and
 `tests/data/svt_av1_320x240.ivf` keeps the parser honest against bytes from a
 real encoder.
@@ -95,8 +95,8 @@ the first symbol of the fixture's key frame.
    With those in, the first inter frame of the fixture parses to its last byte
    with the same block tree, references, motion vectors, motion modes and
    coefficients as dav1d - 249 blocks, all of the tile's 2004 bytes used - and
-   the inter frames of every other fixture do the same. What is left, in the
-   order the gateways appear when decoding the rest of the file:
+   the inter frames of every other fixture do the same. The gateways after that,
+   in the order they appeared:
 
    * *Projected motion vectors.* Done: `RefPool` slots carry a frame's 8x8
      motion vector grid (`RefMvs`) and the order hints of the frames it referred
@@ -120,14 +120,38 @@ the first symbol of the fixture's key frame.
      fixtures code it 1033 (`inter_intra`), 2220 (`lw_t2`), 2042 (`lw_t3`) and
      43 (`svt_av1_320x240`) times - bit exact, which is what pins the pair, the
      vector and the blend.
-   * *Compound prediction.* The syntax (reference pair, `comp_group_idx`,
-     `compound_idx`, wedge index and sign) plus the engine's masked blend; the
-     kernels already implement the average and distance blends.
-   * *OBMC and local warped motion*, both of which need neighbour motion
-     vectors from the map that `mark_inter` already fills.
-   * *Reference sample buffers and inter reconstruction*: the reference
-     refresh in the decoder loop, the engine's inter jobs for these blocks, and
-     `show_existing_frame` output. The syntax is there; nothing draws it yet.
+   * *Compound prediction*, done: the reference pair, `comp_group_idx`,
+     `compound_idx`, the wedge index and sign, and the masked blend in the
+     engine - the average, distance, wedge and difference weighted masks (the
+     last of which is the *luma* prediction difference even on a chroma plane,
+     which a 4:4:4 stream is what showed). The fixtures code compound
+     thousands of times and are bit exact.
+   * *OBMC and local warped motion*, done: both read the neighbour motion
+     vectors from the map `mark_inter` fills, and the kernels run the window
+     blend and the affine warp (`tests/data/lw_t2.ivf`, `lw_t3.ivf`).
+   * *Reference sample buffers and inter reconstruction*, done: the decoder
+     loop refreshes the slots the frame header names, the engine builds the
+     inter jobs, and `show_existing_frame` outputs a picture that is already
+     there (`av1gpu_decode --inherit-slot` covers the slot a stream names).
+   * *A lossless frame*, done: `all_lossless` (7.4.4 - `base_q_idx` 0 for every
+     segment, no superres) makes the frame header skip `loop_filter_params`,
+     `cdef_params` and the restoration units altogether, so a decoder must not
+     filter such a picture at all. `tests/data/lossless.ivf` codes four of them
+     and is bit exact against dav1d and ffmpeg; `make_lossless_clip.py` rebuilds
+     it and refuses to finish unless the header it produced really is the
+     lossless one.
+   * *Frames whose size is not a multiple of eight*, done: the 4x4 grid the
+     tiles code on is the frame size rounded up to *eight* (`MiCols = 2 *
+     ((FrameWidth + 7) >> 3)`, 7.4.4), and the loop filters and the intra
+     prediction read samples outside the picture but inside that grid - so the
+     wave scheduler's dependency tracking and the CDEF job's bound use the coded
+     extent as well. Rounding to four, as this tree did, decoded every such
+     frame as garbage; two of the three fixes only show up as a handful of
+     samples. `tests/data/odd_size.ivf` (130x100, six frames) is bit exact
+     against dav1d and through the OpenCL replay, and the sweep behind it is
+     listed in `docs/ACCURACY.md`, together with the one place that is still not
+     exact - the loop filter reading the border of such a frame, off by one on a
+     single sample in the cases measured.
 
    Two bugs the block level trace found on the way, worth recording because
    both are the kind that decodes plausibly and then desynchronises: the single
@@ -164,8 +188,77 @@ the first symbol of the fixture's key frame.
    but it cannot cover filter intra, every transform shape or a 128x128
    superblock; a stream per feature class is cheap insurance and needs an
    encoder (or a hand-patched fixture) to produce.
-3. *Restoration.* `loop_restoration` is currently rejected at the frame header;
-   the fixture signals it off, so nothing below it has been exercised.
+3. *Restoration - done.* Loop restoration (7.17) is implemented end to end: the
+   frame header's `restoration_params` (5.9.20) and each unit's filter (5.11.46)
+   are read, and both filters - the seven tap Wiener filter and the self guided
+   filter with its two box filters - run in the CPU backend and in the shared
+   device kernels (`av1g_k_lr`, OpenCL and CUDA). `tests/data/lr.ivf` codes every
+   combination the syntax has (three switchable frames, and across the eight
+   frames Wiener and SGR on luma and on both chroma planes) and is bit exact
+   against dav1d, as is every frame of it, through the CPU backend
+   (`stream_lr`) and through the kernels (`opencl_lr`, which replays the plan's
+   restoration jobs; the plan format carries them from version 7). The same clip
+   is coded at 10 and 12 bit as well (`lr_10bit`, `lr_12bit`), because the self
+   guided filter's bit depth scaling is a no-op at 8 bit: a stream that forgets it
+   is bit exact on `lr.ivf` and wrong everywhere above 8 bit. The same clip is
+   coded at 4:4:4 and 4:2:2 as well (`lr_444`, `lr_422`), where the chroma unit
+   grid and the chroma planes themselves are not the 4:2:0 ones; the 4:4:4 one
+   found a difference weighted mask that was rebuilt from the chroma prediction
+   instead of the luma one (see `docs/ACCURACY.md`).
+
+   Two details cost the most and are worth writing down, because both show up as
+   a handful of samples that are off by one and nothing else:
+
+   * `FILTER_BITS` is **7** in the Wiener filter, not the 3 of the interpolation
+     filters, and the intermediate's clip range (`1 << (BitDepth + FILTER_BITS -
+     InterRound0)`) is derived from it. With 3 the intermediate is clipped to a
+     sixteenth of its range and the picture turns into a flat grey.
+   * The unit that filters a row is not `row / unitSize`: 7.17.1 adds eight luma
+     samples before the division (`Min(unitRows - 1, ((row * MI_SIZE + 8) >>
+     subY) / unitSize)`), the same eight samples the stripes are shifted up by.
+     A row in the last eight lines of a unit therefore belongs to the *next*
+     unit. The offset is a multiple of the stripe grid, which is what makes one
+     stripe piece one unit's work and keeps the jobs independent.
+
+   The one combination no stream here can code - restoration on a superres
+   picture - is built as syntax instead: `tests/test_pipeline.cpp` adds
+   restoration units to a clip and compares every restored sample against its own
+   implementation of the specification. Two pictures are carried, not one, so
+   7.17.6 is checkable at all: the test decodes the clip a second time with the
+   CDEF parameters removed - that decode *is* the deblocked picture - and takes
+   a row inside the stripe from the CDEF output, a row outside it from the other
+   picture, clamped to the two lines the stripe may borrow. On top of that the
+   reference picks each sample's coefficients with 7.17.1's unit rule, and every
+   unit carries *different* ones, so a grid that is off by a row or a column
+   produces wrong samples instead of the same picture; eight geometries are
+   swept (128x96 over superres 112, 128x100, 128x68, 120x68, one 128-sample unit
+   at 160x96, a 64-wide unit with a 32-wide last one at 96x72, and 32x24 and
+   16x16, both smaller than a unit). The same clip with identity filters also
+   has to come back bit identical to the same clip with restoration switched off.
+   Of the eight mutations tried, seven are caught - the stripe starting at the
+   frame edge (54 samples), `unitRow` without the `+ 8` (572), the last unit not
+   stretched to the plane edge (315), always taking the CDEF picture (11), never
+   borrowing below a stripe (26), no clamp at the borrowed row (6) and the two
+   pictures swapped (1575) - and the eighth, removing the intermediate clip, is
+   not observable through any output (the final `Clip1` hides it); the table is
+   in `docs/ACCURACY.md`.
+
+   The whole fixture set, `lr` and its two higher depths included, also decodes
+   through an ASan/UBSan build (`-DAV1GPU_SANITIZE=ON`): 46/46 tests pass and no
+   `runtime error` reaches stderr. That sweep found one defect, wherever the
+   specification scales a signed value: a left shift of a negative number, which
+   is undefined in C++. They are multiplications now; `docs/ACCURACY.md` lists
+   them and the recipe. Restoration itself produced none: the two snapshots are
+   sized from the coded geometry, so no stripe can read past a plane.
+
+   The filters also have unit tests of their own now, because a fixture can only
+   pin what a stream happens to code: `test_kernels` checks unity DC gain on a
+   flat plane at all three depths, the two snapshots across a stripe border
+   (`get_source_sample`), the "radius 0 uses the input" rule, and the 8 vs 10 bit
+   `A`/`B` relation the historical bug broke - and `tests/opencl_selftest.py`
+   runs a Wiener job, a self guided job at 8 and 10 bit and one upscale job on the
+   device against the host build of the same kernel, so `av1g_k_lr` and
+   `av1g_k_upscale` are no longer only exercised through a whole-frame replay.
 
 ## 2. Subpel filters from the specification — done
 
@@ -362,6 +455,14 @@ and through the OpenCL kernels. They found three things the 8 bit streams could
 not: the loop filter ran on frames that code no level at all, `frame_to_yuv8`
 sized its output as 4:2:0 and wrote past its buffer on a 4:4:4 frame, and the
 `1 << (BitDepth - 8)` threshold scaling had never been exercised.
+
+**Done: 4:4:4 and 4:2:2 restoration.** `tests/data/lr_444.ivf` and
+`lr_422.ivf` are the restoration clip at those subsamplings, so the chroma
+planes are the luma size (4:4:4, six restoration units each) or half as wide
+(4:2:2, two units each) instead of half in both directions. They are bit exact
+against dav1d and ffmpeg, and the 4:4:4 one found a difference weighted mask
+that was rebuilt from the chroma prediction rather than the luma one - right for
+4:2:0, wrong at 4:4:4 - which is plan format 8.
 
 ## 8. Verification on a real GPU
 

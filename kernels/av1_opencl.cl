@@ -137,6 +137,20 @@ __kernel void av1g_k_upscale(__global const Av1gUpscaleJob *jobs,
                   elem / job.upscaled_w, maxv);
 }
 
+/* Loop restoration: one work item per sample. Two source pictures - the CDEF
+ * output and the deblocked picture before it - because the two lines either
+ * side of a stripe come from the latter, and a separate destination because a
+ * unit's filter reads samples its neighbours write. */
+__kernel void av1g_k_lr(__global const Av1gLrJob *jobs,
+                        __global const int *joff, int njobs, int total,
+                        __global const av1g_px *cdef,
+                        __global const av1g_px *curr,
+                        __global av1g_px *dst, int maxv) {
+  AV1G_JOB_LOOKUP(job_idx, elem);
+  Av1gLrJob job = jobs[job_idx];
+  av1g_lr_px(&job, cdef, curr, dst, elem % job.w, elem / job.w, maxv);
+}
+
 /* ------------------------------------------------------------------- output */
 __kernel void av1g_k_color(__global const Av1gColorJob *jobs,
                            __global const int *joff, int njobs, int total,

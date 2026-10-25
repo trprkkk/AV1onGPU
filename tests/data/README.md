@@ -289,6 +289,150 @@ frame's LAST reference) instead of assuming one; `--inherit-slot` overrides it.
 `stream_grain_inherit` checks the hashes. Every sample of every frame is equal to
 dav1d's.
 
+`lr.ivf` is the loop restoration fixture: 8 frames of 320x240, 82 KB, the only
+stream in this directory whose frame headers and units code 7.17. It is an
+ordinary libaom encode of a generated clip, so nothing had to be patched:
+
+```
+python3 clip.py > lr_clip.yuv          # the snippet below
+ffmpeg -f rawvideo -pix_fmt yuv420p -s 320x240 -r 30 -i lr_clip.yuv \
+    -c:v libaom-av1 -cpu-used 4 -crf 36 -lag-in-frames 0 -g 8 -tiles 1x1 \
+    -enable-restoration 1 -f ivf lr.ivf
+```
+
+The clip alternates two kinds of luma content every four frames - a smooth ramp
+with fine noise, which the encoder restores with the self guided filter, and a
+fine texture with hard edged panels, which it restores with Wiener - and pans
+both three pixels a frame, so the inter frames code residual and restoration.
+The result is one stream that covers the whole syntax: three frames code the
+type per unit (`SWITCHABLE` on luma, frames 4, 5 and 7), the other five code one
+filter for the plane, and over the eight frames the units are 7x Wiener / 1x SGR
+on luma and 12x Wiener / 4x SGR on the two chroma planes, with ten units that are
+coded `RESTORE_NONE` inside a frame that restores. `lr.hash` holds the per frame
+hashes and `stream_lr` checks them, while `opencl_lr` replays the same frames
+through the device kernels - both are bit exact, and dav1d and libaom agree with
+each other on the file.
+
+`lr_12bit.ivf` is the same again at 12 bit (79 KB, `-pix_fmt yuv420p12le`), the
+one depth where the Wiener filter's rounding constants change
+(`InterRound0 = 5`, `InterRound1 = 9` instead of 3 and 11) and where the box
+filter's bit depth shifts are at their widest. `lr_12bit.hash` +
+`stream_lr_12bit` and `opencl_lr_12bit` are the 16 bit checks, both bit exact.
+
+`lr_10bit.ivf` is the same clip coded at 10 bit (78 KB), with the same
+`-enable-restoration 1` and `-pix_fmt yuv420p10le`. It exists because the self
+guided filter scales its local sums by the bit depth
+(`a = Round2(a, 2 * (BitDepth - 8))`, `d = Round2(b, BitDepth - 8)`) and at 8 bit
+both shifts are zero - so an implementation that forgets them, or that builds the
+offset `B` from the rounded `d` instead of the raw `b`, is bit exact on the 8 bit
+fixture and wrong on this one. `lr_10bit.hash` holds the per frame hashes of the
+16 bit samples (`--yuv16` on both sides, see above) and `stream_lr_10bit` checks
+them; `opencl_lr_10bit` replays the frames through the device kernels. Both are
+bit exact, against dav1d and through the kernels.
+
+`tests/data/make_lr_clip.py` is that generator with the encoder wrapped around
+it: run as `python3 tests/data/make_lr_clip.py tests/data/lr.ivf` it writes this
+stream back byte for byte, and `--pix-fmt 444` / `--pix-fmt 422` build the two
+fixtures below from the same content.
+
+`lr_444.ivf` and `lr_422.ivf` are that clip coded at 4:4:4 (196 KB, `-pix_fmt
+yuv444p`, profile 1) and 4:2:2 (105 KB, `-pix_fmt yuv422p`, profile 2), with the
+same encoder settings. They exist because restoration on a chroma plane that is
+*not* subsampled the 4:2:0 way is a different path: the chroma unit grid only
+halves for 4:2:0 (`lr_uv_shift` in the plan), so at 4:4:4 the chroma units are as
+large as the luma ones - six per plane at 320x240 - and at 4:2:2 only their
+horizontal step halves (two per plane) - and a 4:4:4 frame's chroma samples still
+take their difference weighted mask from the *luma* prediction even though one
+chroma sample covers exactly one luma sample. Both streams code both filters on
+chroma: across the eight frames the 4:4:4 chroma planes hold 78 Wiener and 6 SGR
+units, the 4:2:2 ones 22 Wiener and 1 SGR, and three of the 4:4:4 frames code the
+chroma type per unit (`switchable`) instead of one filter for the plane. `av1gpu_probe`
+prints that breakdown as a `restoration units:` line.
+
+The 4:4:4 one caught exactly that mask bug: the decoder decided "rebuild the mask
+from the luma predictions" from the subsampling flags, which is right for 4:2:0
+and wrong at 4:4:4, where it built the mask from the chroma prediction under it.
+`Av1gInterJob` carries the plane now (plan format 8) and the decision follows it.
+`lr_444.hash` / `lr_422.hash` hold the per frame hashes, `stream_lr_444` /
+`stream_lr_422` check them and `opencl_lr_444` / `opencl_lr_422` replay the same
+frames through the device kernels; dav1d and ffmpeg agree with each other and
+with us on both files, sample for sample.
+
+```python
+import sys
+import numpy as np
+
+rng = np.random.default_rng(5)
+W, H, N = 320, 240, 8
+yy, xx = np.mgrid[0:H, 0:W + 4 * N].astype(np.float64)
+smooth = 110 + 35 * np.sin(xx / 47.0) * np.cos(yy / 31.0)
+tex = rng.integers(0, 256, (H, W + 4 * N)).astype(np.float64)
+tex = (tex * 3 + np.roll(tex, 1, 1) * 2 + np.roll(tex, -1, 1)) / 7 - 128
+noise = rng.normal(0, 7, (H, W + 4 * N))
+yyc, xxc = np.mgrid[0:H // 2, 0:W // 2 + 2 * N].astype(np.float64)
+u = 128 + 50 * np.sin(xxc / 9.0) * np.cos(yyc / 13.0) + rng.normal(0, 4, (H // 2, W // 2 + 2 * N))
+v = 128 + 40 * np.cos(xxc / 11.0) + rng.normal(0, 4, (H // 2, W // 2 + 2 * N))
+out = bytearray()
+for f in range(N):
+    smooth_frame = f < N // 2
+    lum = smooth + noise if smooth_frame else 130 + tex
+    img = np.clip(lum[:, 3 * f:3 * f + W] + 2 * f, 0, 255).astype(np.uint8)
+    if not smooth_frame:
+        for k in range(6):
+            x0, y0 = 10 + (k % 3) * 100 + 3 * f, 15 + (k // 3) * 115 + 2 * f
+            img[y0:y0 + 55, x0:x0 + 70] = (40 + 35 * k) % 256
+    sys.stdout.buffer.write(img.tobytes())
+    sys.stdout.buffer.write(np.clip(u[:, f:f + W // 2], 0, 255).astype(np.uint8).tobytes())
+    sys.stdout.buffer.write(np.clip(v[:, f:f + W // 2], 0, 255).astype(np.uint8).tobytes())
+```
+
+`lossless.ivf` is the lossless fixture: four frames of 160x120, 58 KB, coded at
+`-lossless 1 -crf 0 -cpu-used 6 -lag-in-frames 0 -g 4 -tiles 1x1` with
+`-enable-intrabc 0`. It exists because a frame that codes no quantiser at all
+(`CodedLossless`, and `AllLossless` follows from it - the picture is not
+superres'ed) has a *different frame header*: 5.9.2 skips `loop_filter_params`,
+`cdef_params` and the restoration units entirely, so a parser that reads them
+anyway desynchronises immediately and a decoder that then runs deblock, CDEF or
+restoration on the picture changes samples a lossless stream promises are exact.
+`-enable-intrabc 0` is deliberate: `allow_intrabc` skips the same three parameter
+sets by the other route, and this fixture is meant to pin down the lossless one -
+`intrabc.ivf` covers the block copy path. The content is flat panels on a hard
+diagonal edge, a checkerboard finer than one sample per pixel, noise on every
+frame (so the three inter frames code residual instead of a block copy) and a
+three sample pan per frame.
+
+`lossless.hash` holds the per frame hashes; `stream_lossless` checks them and
+`opencl_lossless` replays the same plans through the device kernels. dav1d and
+ffmpeg agree with us on every sample. `tests/data/make_lossless_clip.py` writes
+this stream back byte for byte (`python3 tests/data/make_lossless_clip.py
+tests/data/lossless.ivf`), and it refuses to finish unless the frame header it
+produced really is the lossless one - no CDEF strengths, deblock levels at zero,
+no restoration.
+
+`odd_size.ivf` is the only fixture whose picture is not a multiple of eight in
+either direction: six frames of 130x100, 16 KB, `-cpu-used 5 -crf 32
+-lag-in-frames 0 -g 6 -tiles 1x1` with CDEF and restoration enabled. Both
+dimensions matter. Rounding the frame up to a *multiple of four* mi columns
+instead of eight (`MiCols = 2 * ((FrameWidth + 7) >> 3)`, 7.4.4) gives one mi
+column too few at 130 wide, and the block loop of the last superblock column then
+reads a different number of blocks than the encoder wrote - the frame decodes as
+garbage, which nothing noticed while every fixture was a multiple of eight. The
+height of 100 is a partial stripe (64 + 36) and leaves every frame predicted from
+row bands whose neighbours are outside the picture but inside the coded grid,
+which is what the wave scheduler's dependency tracking now covers as well; CDEF
+copies whole 8x8 blocks and filters against a halo that reaches into that border.
+`odd_size.hash` holds the per frame hashes, `stream_odd_size` checks them and
+`opencl_odd_size` replays the same plans through the device kernels; dav1d and
+ffmpeg agree with us on every sample.
+
+`tests/data/make_odd_size.py` writes the stream back byte for byte
+(`python3 tests/data/make_odd_size.py tests/data/odd_size.ivf`). Its frames code
+a zero luma level on purpose: the loop filter reading the border of a frame whose
+size is not a multiple of eight is the one place that is still not sample exact
+(one sample off by one on the cases measured), because those samples are only
+defined by the reconstruction - see `docs/ACCURACY.md`, "Frames whose size is not
+a multiple of eight".
+
 The three `aom_*` fixtures are the ones that are not 8 bit 4:2:0: twelve frames
 of a 320x240 ramp each, encoded with libaom through ffmpeg's `libaom-av1` at
 `-crf 40 -cpu-used 8 -lag-in-frames 0`.

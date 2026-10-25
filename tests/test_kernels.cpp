@@ -1102,6 +1102,323 @@ void test_filters() {
   }
 }
 
+/* Loop restoration. The interesting properties are not "matches the decoder"
+ * (the fixtures cover that) but the ones a wrong filter breaks immediately:
+ * both filters have unity DC gain, so a flat plane comes back flat at every bit
+ * depth, and the samples a unit reads come from two different pictures. */
+Av1gLrJob make_lr_job(int x, int y, int w, int h, int stride, int plane_w, int plane_h,
+                      int type, int bitdepth) {
+  Av1gLrJob job;
+  std::memset(&job, 0, sizeof(job));
+  job.plane = 0;
+  /* dst_off points at the job's own first sample, not at the plane origin: the
+   * kernel adds only the position inside the rectangle */
+  job.dst_off = y * stride + x;
+  job.dst_stride = stride;
+  job.cdef_off = 0;
+  job.cdef_stride = stride;
+  job.curr_off = 0;
+  job.curr_stride = stride;
+  job.x = x;
+  job.y = y;
+  job.w = w;
+  job.h = h;
+  job.plane_w = plane_w;
+  job.plane_h = plane_h;
+  job.stripe_start_y = 0;
+  job.stripe_end_y = plane_h - 1;
+  job.type = type;
+  job.bitdepth = bitdepth;
+  return job;
+}
+
+/* reads the restored rectangle back out of the destination plane */
+std::vector<int> lr_result(const std::vector<uint16_t>& dst, const Av1gLrJob& job) {
+  std::vector<int> out;
+  for (int y = 0; y < job.h; ++y)
+    for (int x = 0; x < job.w; ++x)
+      out.push_back(dst[static_cast<size_t>(job.dst_off + y * job.dst_stride + x)]);
+  return out;
+}
+
+void test_loop_restoration() {
+  std::printf("loop restoration\n");
+  const int stride = 32;
+  const int size = 32;
+  const int maxv8 = 255;
+
+  /* The Wiener filter's seven taps are built from three coded coefficients and
+   * always sum to 128, so a flat plane survives it exactly - whatever the
+   * coefficients are. That is the one property that catches a wrong tap
+   * normalisation or a wrong rounding variable. */
+  {
+    for (int bd : {8, 10, 12}) {
+      const int maxv = (1 << bd) - 1;
+      const int flat = bd == 8 ? 100 : (bd == 10 ? 400 : 1600);
+      for (int variant = 0; variant < 2; ++variant) {
+        std::vector<uint16_t> cdef(static_cast<size_t>(stride) * size,
+                                   static_cast<uint16_t>(flat));
+        std::vector<uint16_t> dst(cdef.size(), 0);
+        Av1gLrJob job = make_lr_job(8, 8, 8, 8, stride, size, size, AV1G_LR_WIENER, bd);
+        if (variant == 0) {
+          /* identity: only the centre tap survives */
+          job.vfilter[0] = job.vfilter[1] = job.vfilter[2] = 0;
+          job.hfilter[0] = job.hfilter[1] = job.hfilter[2] = 0;
+        } else {
+          /* a real, asymmetric set: still unity gain */
+          job.vfilter[0] = 3;
+          job.vfilter[1] = -2;
+          job.vfilter[2] = 5;
+          job.hfilter[0] = -4;
+          job.hfilter[1] = 1;
+          job.hfilter[2] = 7;
+        }
+        av1g_lr_block(&job, cdef.data(), cdef.data(), dst.data(), maxv);
+        bool flat_out = true;
+        for (int v : lr_result(dst, job))
+          if (v != flat) flat_out = false;
+        CHECK(flat_out);
+      }
+    }
+  }
+
+  /* A step edge is smoothed but stays between the two levels, and the samples
+   * outside the rectangle are left alone (dst_off is the rectangle's origin, so
+   * a kernel that adds the job origin again writes in the wrong place). */
+  {
+    std::vector<uint16_t> cdef(static_cast<size_t>(stride) * size, 20);
+    for (int y = 0; y < size; ++y)
+      for (int x = 16; x < size; ++x) cdef[static_cast<size_t>(y * stride + x)] = 200;
+    std::vector<uint16_t> dst(cdef.size(), 4000); /* not a valid sample value */
+    Av1gLrJob job = make_lr_job(8, 8, 16, 16, stride, size, size, AV1G_LR_WIENER, 8);
+    job.vfilter[0] = job.vfilter[1] = job.vfilter[2] = 0;
+    job.hfilter[0] = job.hfilter[1] = job.hfilter[2] = 0;
+    /* an asymmetric set: 40 8 -20 72 -20 8 40, so the edge is smoothed over
+     * seven samples and the samples far from it are untouched */
+    job.hfilter[0] = 40;
+    job.hfilter[1] = 8;
+    job.hfilter[2] = -20;
+    av1g_lr_block(&job, cdef.data(), cdef.data(), dst.data(), maxv8);
+    for (int y = 0; y < size; ++y)
+      for (int x = 0; x < size; ++x) {
+        const bool inside = x >= 8 && x < 24 && y >= 8 && y < 24;
+        if (!inside) CHECK_EQ(dst[static_cast<size_t>(y * stride + x)], 4000);
+      }
+    /* the sample just left of the edge is pulled up, the one on the edge down */
+    CHECK(dst[static_cast<size_t>(12 * stride + 15)] > 20);
+    CHECK(dst[static_cast<size_t>(12 * stride + 16)] < 200);
+    /* and the untouched parts of the plane stay as they were */
+    CHECK_EQ(dst[static_cast<size_t>(12 * stride + 20)], 200);
+  }
+
+  /* The self guided filter also has unity gain: with both radii zero it says
+   * "use the input" for both passes, which is an exact copy for any weights. */
+  {
+    std::vector<uint16_t> cdef(static_cast<size_t>(stride) * size, 137);
+    for (int y = 0; y < size; ++y)
+      for (int x = 0; x < size; ++x)
+        cdef[static_cast<size_t>(y * stride + x)] =
+            static_cast<uint16_t>((x * 7 + y * 3) & 255);
+    std::vector<uint16_t> dst(cdef.size(), 0);
+    Av1gLrJob job = make_lr_job(8, 8, 8, 8, stride, size, size, AV1G_LR_SGRPROJ, 8);
+    job.sgr_radius[0] = job.sgr_radius[1] = 0;
+    job.sgr_xqd[0] = -1;
+    job.sgr_xqd[1] = 121;
+    av1g_lr_block(&job, cdef.data(), cdef.data(), dst.data(), maxv8);
+    bool same = true;
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x)
+        if (dst[static_cast<size_t>((8 + y) * stride + 8 + x)] !=
+            cdef[static_cast<size_t>((8 + y) * stride + 8 + x)])
+          same = false;
+    CHECK(same);
+  }
+
+  /* A flat plane through a real strength (Sgr_Params set 0: radius 2 with
+   * eps 12, radius 1 with eps 4) comes back flat at every bit depth. */
+  for (int bd : {8, 10, 12}) {
+    const int maxv = (1 << bd) - 1;
+    const int flat = bd == 8 ? 100 : (bd == 10 ? 400 : 1600);
+    std::vector<uint16_t> cdef(static_cast<size_t>(stride) * size,
+                               static_cast<uint16_t>(flat));
+    std::vector<uint16_t> dst(cdef.size(), 0);
+    Av1gLrJob job = make_lr_job(8, 8, 8, 8, stride, size, size, AV1G_LR_SGRPROJ, bd);
+    job.sgr_radius[0] = 2;
+    job.sgr_radius[1] = 1;
+    job.sgr_eps[0] = 12;
+    job.sgr_eps[1] = 4;
+    job.sgr_xqd[0] = -1;
+    job.sgr_xqd[1] = 121;
+    av1g_lr_block(&job, cdef.data(), cdef.data(), dst.data(), maxv);
+    /* Exactly, not approximately: the variance of a flat block is zero, so the
+     * filter is an identity even through the rounding of A and B - and it only
+     * stays one if the two bit depth scalings are there (see docs/ACCURACY.md:
+     * at 8 bit they are shifts by zero, so this is the assertion that notices
+     * when they are missing). */
+    for (int v : lr_result(dst, job)) CHECK_EQ(v, flat);
+  }
+
+  /* The same picture at 8 and at 10 bit - every sample times four - has to come
+   * back the same way, times four. The box filter scales its sums back to 8 bit
+   * before they become a variance, so both runs see the same A and B; a missing
+   * scaling shows up here as tens of levels, not as rounding. */
+  {
+    const int depth = 10;
+    const int maxv = (1 << depth) - 1;
+    std::vector<uint16_t> p8(static_cast<size_t>(stride) * size, 0);
+    /* a smooth ramp with one bump in the middle of the job: low variance, so
+     * the filter actually smooths (a noisy picture saturates A and the filter
+     * would return its input, which would test nothing) */
+    for (int y = 0; y < size; ++y)
+      for (int x = 0; x < size; ++x) {
+        int v = 40 + x * 3 + y * 2;
+        if (x >= 11 && x <= 13 && y >= 11 && y <= 13) v += 40;
+        p8[static_cast<size_t>(y * stride + x)] = static_cast<uint16_t>(v);
+      }
+    std::vector<uint16_t> p10(p8.size(), 0);
+    for (size_t i = 0; i < p8.size(); ++i) p10[i] = static_cast<uint16_t>(p8[i] * 4);
+    Av1gLrJob job = make_lr_job(8, 8, 8, 8, stride, size, size, AV1G_LR_SGRPROJ, 8);
+    job.sgr_radius[0] = 2;
+    job.sgr_radius[1] = 1;
+    job.sgr_eps[0] = 12;
+    job.sgr_eps[1] = 4;
+    job.sgr_xqd[0] = -1;
+    job.sgr_xqd[1] = 121;
+    std::vector<uint16_t> o8(p8.size(), 0), o10(p10.size(), 0);
+    av1g_lr_block(&job, p8.data(), p8.data(), o8.data(), 255);
+    job.bitdepth = depth;
+    av1g_lr_block(&job, p10.data(), p10.data(), o10.data(), maxv);
+    int maxdev = 0;
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) {
+        const size_t off = static_cast<size_t>((8 + y) * stride + 8 + x);
+        maxdev = std::max(maxdev, std::abs(static_cast<int>(o10[off]) -
+                                           static_cast<int>(o8[off]) * 4));
+      }
+    /* nothing at all: the two runs differ only in where the scaling happens,
+     * and every scaling is exact for a value that is four times another. */
+    CHECK_EQ(maxdev, 0);
+  }
+
+  /* The same box at 8 and at 10 bit must give the same A and a B that is
+   * exactly four times as large: A is built from sums scaled back to 8 bit, B
+   * from the raw sums of the deeper picture. That is the pair of statements the
+   * historical bug in this filter broke (B was built from the scaled sum, which
+   * is invisible at 8 bit), and it is checked here without a 10 bit stream. */
+  {
+    std::vector<uint16_t> p8(static_cast<size_t>(stride) * size, 0);
+    /* a vertical edge of contrast 8 near the middle of the job, so some boxes
+     * straddle it and get a variance in the middle of the table */
+    for (int y = 0; y < size; ++y)
+      for (int x = 0; x < size; ++x)
+        p8[static_cast<size_t>(y * stride + x)] = static_cast<uint16_t>(x < 15 ? 100 : 108);
+    std::vector<uint16_t> p10(p8.size(), 0);
+    for (size_t i = 0; i < p8.size(); ++i) p10[i] = static_cast<uint16_t>(p8[i] * 4);
+    Av1gLrJob job = make_lr_job(8, 8, 8, 8, stride, size, size, AV1G_LR_SGRPROJ, 8);
+    bool straddled = false;
+    for (int y = 9; y < 15; ++y)
+      for (int x = 9; x < 15; ++x) {
+        int a8 = 0, b8 = 0, a10 = 0, b10 = 0;
+        av1g_lr_sgr_ab(&job, p8.data(), p8.data(), x, y, 5, 12, &a8, &b8);
+        job.bitdepth = 10;
+        av1g_lr_sgr_ab(&job, p10.data(), p10.data(), x, y, 5, 12, &a10, &b10);
+        job.bitdepth = 8;
+        CHECK_EQ(a10, a8);
+        CHECK(std::abs(b10 - b8 * 4) <= 4);
+        if (a8 > 1 && a8 < 256) straddled = true;
+      }
+    /* the boxes really did land in the interesting part of the curve */
+    CHECK(straddled);
+
+    /* and the other end of it: a busy box saturates A at 256 (the filter then
+     * passes the picture through) and leaves B at zero */
+    for (int y = 0; y < size; ++y)
+      for (int x = 0; x < size; ++x)
+        p8[static_cast<size_t>(y * stride + x)] =
+            static_cast<uint16_t>(((x + y) & 1) ? 30 : 210);
+    int a = 0, b = 0;
+    av1g_lr_sgr_ab(&job, p8.data(), p8.data(), 12, 12, 5, 12, &a, &b);
+    CHECK_EQ(a, 256);
+    CHECK_EQ(b, 0);
+  }
+
+  /* A gradient is actually filtered: the output differs from the input, stays
+   * inside the sample range, and the projection weights really are used (all
+   * weight on one pass gives a different picture than all weight on the other). */
+  {
+    std::vector<uint16_t> cdef(static_cast<size_t>(stride) * size, 0);
+    for (int y = 0; y < size; ++y)
+      for (int x = 0; x < size; ++x)
+        cdef[static_cast<size_t>(y * stride + x)] =
+            static_cast<uint16_t>(std::min(255, 40 + x * 5 + ((y & 1) ? 30 : 0)));
+    std::vector<uint16_t> a(cdef.size(), 0), b(cdef.size(), 0);
+    Av1gLrJob job = make_lr_job(8, 8, 8, 8, stride, size, size, AV1G_LR_SGRPROJ, 8);
+    job.sgr_radius[0] = 2;
+    job.sgr_radius[1] = 1;
+    job.sgr_eps[0] = 12;
+    job.sgr_eps[1] = 4;
+    job.sgr_xqd[0] = 128;
+    job.sgr_xqd[1] = 0;
+    av1g_lr_block(&job, cdef.data(), cdef.data(), a.data(), maxv8);
+    job.sgr_xqd[0] = 0;
+    job.sgr_xqd[1] = 128;
+    av1g_lr_block(&job, cdef.data(), cdef.data(), b.data(), maxv8);
+    bool filtered = false, differ = false;
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) {
+        const size_t off = static_cast<size_t>((8 + y) * stride + 8 + x);
+        if (a[off] != cdef[off]) filtered = true;
+        if (a[off] != b[off]) differ = true;
+        CHECK(a[off] <= maxv8 && b[off] <= maxv8);
+      }
+    CHECK(filtered);
+    CHECK(differ);
+  }
+
+  /* get_source_sample (7.17.6): a unit only borrows two lines from above its
+   * stripe and two from below, and those lines come from the picture *before*
+   * CDEF. Everything inside the stripe comes from the CDEF output. The vertical
+   * filter here uses only taps -2 and +2, so an output row shows which picture
+   * each of its neighbours came from. */
+  {
+    const int h = 32;
+    std::vector<uint16_t> cdef(static_cast<size_t>(stride) * h, 100);
+    std::vector<uint16_t> curr(static_cast<size_t>(stride) * h, 100);
+    /* rows 6 and 7 are the two lines the stripe may borrow; make them, and the
+     * rows above them, unmistakable */
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < stride; ++x) curr[static_cast<size_t>(y * stride + x)] = 200;
+    std::vector<uint16_t> dst(cdef.size(), 0);
+    Av1gLrJob job = make_lr_job(8, 8, 8, 8, stride, size, h, AV1G_LR_WIENER, 8);
+    job.stripe_start_y = 8;
+    job.stripe_end_y = 23;
+    job.hfilter[0] = job.hfilter[1] = job.hfilter[2] = 0;
+    job.vfilter[0] = 0;
+    job.vfilter[1] = 64; /* the seven taps become 0 64 0 0 0 64 0 */
+    job.vfilter[2] = 0;
+    av1g_lr_block(&job, cdef.data(), curr.data(), dst.data(), maxv8);
+    /* row 8 and 9 read row 6 (clamped twice), which is the pre-CDEF picture,
+     * and row 10 or 12, which is CDEF: both contribute 64/128 each */
+    CHECK_EQ(dst[static_cast<size_t>(8 * stride + 8)], 150);
+    CHECK_EQ(dst[static_cast<size_t>(9 * stride + 8)], 150);
+    /* rows 10 onwards read only CDEF rows, so the flat 100 comes back */
+    CHECK_EQ(dst[static_cast<size_t>(10 * stride + 8)], 100);
+    CHECK_EQ(dst[static_cast<size_t>(15 * stride + 8)], 100);
+  }
+
+  /* Both snapshots the same picture: the filter is just the flat case again,
+   * which is the check that the two pointers are not swapped. */
+  {
+    std::vector<uint16_t> cdef(static_cast<size_t>(stride) * size, 64);
+    std::vector<uint16_t> dst(cdef.size(), 0);
+    Av1gLrJob job = make_lr_job(8, 8, 8, 8, stride, size, size, AV1G_LR_WIENER, 8);
+    job.vfilter[1] = 64;
+    job.hfilter[0] = job.hfilter[1] = job.hfilter[2] = 0;
+    av1g_lr_block(&job, cdef.data(), cdef.data(), dst.data(), maxv8);
+    for (int v : lr_result(dst, job)) CHECK_EQ(v, 64);
+  }
+}
+
 void test_color() {
   std::printf("colour conversion\n");
   Frame frame;
@@ -1146,6 +1463,7 @@ int main() {
   test_intrabc();
   test_inter_intra();
   test_filters();
+  test_loop_restoration();
   test_color();
   return testing::finish("test_kernels");
 }

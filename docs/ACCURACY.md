@@ -155,17 +155,24 @@ three layers, all of them runnable on a machine with no GPU driver:
 1. `test_kernels` / `test_pipeline` — the shared scalar code on the host, and a
    closed loop decode through the CPU backend.
 2. `tests/opencl_selftest.py` — compiles `kernels/av1_opencl.cl` with a real
-   OpenCL compiler (pocl) and checks one job of every kernel.
+   OpenCL compiler (pocl) and checks one job of every kernel. That now includes
+   the two filters that had only ever been checked through a whole-frame replay:
+   a Wiener job, a self guided job at 8 bit and the same job at 10 bit (where
+   the box filter's sums are scaled back to 8 bit instead of being used as they
+   are), and one superres upscale job - each compared with the host build of the
+   same kernel, sample for sample.
 3. `tests/opencl_pipeline.py` — `av1gpu_dump` writes the real decode plans of a
    clip, the test replays *every* job of *every* wave through the real kernels in
    backend order (waves, deblock vertical, deblock horizontal, CDEF, upscale,
-   grain) and compares whole frames against the CPU reference decode. Four frames, intra
+   loop restoration, grain) and compares whole frames against the CPU reference
+   decode. Four frames, intra
    and inter, all filters on: **bit identical**. With `--input` the plans come
    from `av1gpu_decode --dump-plans` for a real stream instead, so the reference
    pool slots are the decoder's own: `lw_t2` and `lw_t3` (local warped motion and
    OBMC, 30 frames each), `palette_sc` (102 palette blocks, 10 frames),
    `inter_intra` (23 inter/intra compound blocks, 110 frames), `seg_altq`
-   (two quantiser classes), `superres` (320 columns coded, 480 displayed) and
+   (two quantiser classes), `superres` (320 columns coded, 480 displayed), `lr`
+   (Wiener and SGR on both luma and chroma, three of its frames switchable) and
    `svt_av1_320x240` (a different encoder, 6 frames) are all **bit identical**
    too. `superres` is the one where the replay needs the plan to carry the
    display geometry as well as the coded one: the upscale job reads the coded
@@ -343,6 +350,14 @@ was built for.)
 | `lw_t2`, `lw_t3` | 30 each | local warped motion **and** OBMC (in `tests/data/`) |
 | `palette_sc` | 10 | palette coded blocks (screen content, in `tests/data/`) |
 | `inter_intra` | 110 | inter/intra compound: the taper and wedge masks (in `tests/data/`) |
+| `intrabc` | 16 | intra block copy, as all-key-frame screen content (in `tests/data/`) |
+| `seg_altq` | 30 | segmentation, a different quantiser per segment |
+| `superres` | 30 | a picture coded narrower than it displays (upscaling, scaled prediction) |
+| `grain`, `grain_inherit` | 30, 10 | film grain, coded per frame and inherited from a reference |
+| `lr`, `lr_10bit`, `lr_12bit` | 8 each | loop restoration at 8, 10 and 12 bit |
+| `lr_444`, `lr_422` | 8 each | loop restoration on chroma planes that are not 4:2:0 |
+| `lossless` | 4 | `all_lossless`: no filter parameters in the header, no filtering |
+| `odd_size` | 6 | a picture that is not a multiple of eight in either direction |
 
 The four local-warp streams are the ROTZOOM clip re-encoded with libaom at
 `--cpu-used=2` and `--cpu-used=3`, `--crf=30`, `--lag-in-frames=25`,
@@ -764,6 +779,215 @@ added `out_width`/`out_height` and the per plane display sizes next to the coded
 ones, plus the upscale jobs), which is what lets the replay check the displayed
 picture rather than the coded one.
 
+## Loop restoration
+
+Loop restoration (7.17) is the last reconstruction filter, and the only one that
+reads a picture the frame no longer holds: a restoration unit is filtered from
+the CDEF output *and* from the deblocked picture before CDEF, because the two
+lines either side of a stripe's border are taken from the latter (`get_source_sample`,
+7.17.6). The backend therefore keeps two snapshots - the frame as it leaves the
+deblocker and the frame as it leaves CDEF - and every unit reads them, never the
+picture being written, so units cannot observe each other's output.
+
+Three things about the geometry decide the result:
+
+* Stripes are 64 luma rows, but the first stripe of a frame starts at
+  `-8 >> subY` so that it begins two luma rows above the tile (7.17.1). Every
+  later stripe is `stripe_start += 64 >> subY`.
+* `StripesPerTile` is `ceil((MiRows * MI_SIZE + 8) >> 3) / 8`, and a unit whose
+  top left corner is outside the visible plane is skipped only when it also has
+  no stripe start in this tile - the last unit of a row therefore covers the
+  short remainder rather than being dropped.
+* The unit a row belongs to is not `row / unitSize`: 7.17.1 offsets by the same
+  eight luma samples the stripes are shifted by, so the last eight rows of a unit
+  belong to the next one.
+
+Two filters, both pointwise once their taps are known. The Wiener filter
+(7.17.4) is separable with `FILTER_BITS = 7` - not the 3 of the interpolation
+filters - and its intermediate is the *horizontal* pass, rounded by
+`InterRound0` and clipped to
+`[-(1 << (BitDepth + FILTER_BITS - InterRound0 - 1)),
+(1 << (BitDepth + 1 + FILTER_BITS - InterRound0)) - 1]`, which is what the
+specification's `Min(15, BitDepth + 5)` bit note works out to at 8 bit. Feeding
+3 there instead flattens the picture to a sixteenth of its range. The self guided
+filter (7.17.3) is the unit's two box filters, radii 1 and 2, with `Sgr_Params`
+giving each a radius and an `eps`: each 4x4 cell becomes a local variance `p`, a
+weight `A = SgrMathematicalFormula(p * s)` and an offset
+`B = Round2(((1 << SGRPROJ_SGR_BITS) - A) * sum * oneOverN, SGRPROJ_RECIP_BITS)`,
+and the unit's two `SgrXqd` weights project the results back together with
+`Round2(..., SGRPROJ_PRJ_BITS)`. A radius of 0 means "use the input", i.e. the
+filter is skipped for that pass rather than run with a one sample radius.
+
+**What is verified.** `tests/data/lr.ivf` is the fixture: three of its frames code
+the type per unit (`SWITCHABLE`) and the other five one filter per plane, and
+across it every combination runs - Wiener and SGR on luma and on both chroma
+planes, units coded `RESTORE_NONE` inside a frame that restores, and units whose
+stripe is split by the stripe grid. Every frame is bit exact against dav1d (and
+libaom) through the CPU backend (`stream_lr`) and through the OpenCL kernels
+(`opencl_lr`), and the CPU backend's `AV1GPU_NO_LR` - the same debug bitmask as
+its `AV1GPU_NO_DEBLOCK` - switches restoration off per plane so the pre-LR
+picture can be compared with dav1d's, which is how the two snapshots were checked
+separately from the filters. The plan format carries the restoration jobs
+(`v7`; `v8` added the plane they belong to), because a replay needs both
+snapshots; the replay keeps them exactly where
+the backend does, including the second upscale pass a superres frame needs to
+bring the pre-CDEF picture into the displayed geometry.
+
+**Chroma that is not 4:2:0.** `tests/data/lr_444.ivf` and `lr_422.ivf` are the
+same clip at 4:4:4 and 4:2:2, because restoration on a chroma plane that is not
+subsampled the 4:2:0 way is not the same path: the chroma unit grid only halves
+for 4:2:0 (`lr_uv_shift` in the plan), at 4:2:2 only its horizontal step does,
+and at 4:4:4 the chroma planes are the size of the luma one. The 4:4:4 stream
+reproduces `switchable` chroma units - the type coded per unit on a plane that is
+not subsampled - and both streams code Wiener and SGR on chroma. Every frame of
+both is bit exact against dav1d and ffmpeg, through the CPU backend
+(`stream_lr_444`, `stream_lr_422`) and through the kernels (`opencl_lr_444`,
+`opencl_lr_422`).
+
+The 4:4:4 one found a bug that had nothing to do with restoration itself, and
+every 4:2:0 fixture was blind to it: the compound difference weighted mask is the
+*luma* prediction difference (7.11.3.12 is plane 0 only), and the decoder decided
+"rebuild it from the luma predictions" from the subsampling flags. That is right
+for 4:2:0 - a subsampled plane has no luma predictions of its own - and wrong at
+4:4:4, where one chroma sample covers exactly one luma sample but the mask still
+has to come from the luma picture. `Av1gInterJob` carries the plane now (plan
+format 8) and the kernel branches on it instead of on `ss_x`/`ss_y`.
+
+**The unit tests.** `test_kernels` covers the two filters as properties rather
+than as fixtures, because a wrong filter breaks them immediately: the Wiener
+taps always sum to 128 and a self guided unit is an identity on a flat block, so
+a flat plane has to come back flat at 8, 10 and 12 bit, exactly, for any
+coefficients, any strength and any pair of projection weights. Next to that sit
+the two things only restoration does: a unit reads samples from two different
+pictures (`get_source_sample`, checked with a vertical filter whose only taps are
+-2 and +2, so an output row shows which picture each neighbour came from) and a
+pass with radius zero uses the sample itself instead of filtering. The last check
+is the one the 8 bit fixtures cannot make: the same box at 8 and at 10 bit has to
+give the same `A` and a `B` exactly four times as large, which is exactly what the
+historical bug in this filter broke. All of them were confirmed by mutation -
+dropping either bit depth scaling, building `B` from the scaled sum, or swapping
+the two snapshots each fail a named check.
+
+**Bit depth.** The box filter's local sums are scaled back to 8 bit before they
+become a variance (`a = Round2(a, 2 * (BitDepth - 8))`, `d = Round2(b,
+BitDepth - 8)`), and at 8 bit those two shifts are zero - which is exactly why a
+stream that forgets them looks right at 8 bit. The offset is the other way round:
+`B` is built from the *raw* sum `b`, not from the rounded `d` that went into the
+variance, and again the two are the same number at 8 bit. `tests/data/lr_10bit.ivf`
+is the same clip at 10 bit for both, and with the raw `b` missing the chroma
+planes of every frame differed by up to 88 and the luma drifted from the sixth
+frame on (the reference frames had already inherited the chroma error), while
+every 8 bit fixture stayed bit exact. `stream_lr_10bit` and `stream_lr_12bit`
+pin both depths, and 12 bit is also the one depth where the Wiener filter's
+rounding constants move (`InterRound0` 5, `InterRound1` 9) - which is why the
+fixtures are coded at all three depths rather than at 8 bit alone.
+
+The one combination no fixture here codes is superres *and* restoration at once:
+making an LR stream superres means changing the *unit grid* (7.17.1 sizes the
+units on the upscaled picture), so unlike `superres.ivf` the header of an LR
+stream cannot simply be patched, and libaom's superres mode is not reachable
+through the ffmpeg wrapper in this sandbox. It is covered by construction
+instead: `tests/test_pipeline.cpp` builds the syntax of a clip coded narrower
+than it displays - `make_clip` writes the blocks, the test adds the restoration
+units - and compares every restored sample against its own implementation of the
+specification. Three things are pinned that no single-picture reference can
+express:
+
+* **7.17.6 chooses between two pictures.** A row inside the stripe comes from
+  the CDEF output, a row outside it from the picture *before* CDEF, and the third
+  row outside is a copy of the second. The two references the test carries
+  (`wiener_sample_striped`, one picture per source) make that checkable: it
+  decodes the same clip twice, once with CDEF and once with the CDEF parameters
+  removed - the second decode *is* the deblocked picture - and builds the
+  expected sample from the right one, with the clamp at the border. CDEF on and
+  off also pins the second upscale (the pre-CDEF snapshot has to be brought into
+  the displayed geometry as well); with CDEF off the two pictures are equal and
+  only the clamp is exercised.
+* **The unit grid, not just the filter.** Every unit carries *different*
+  coefficients (`wiener[0][0] = 2 + 2*row`, `wiener[1][0] = 1 + 2*col`, so the
+  vertical and horizontal sets differ too), and the reference picks them per
+  sample with 7.17.1's rule. A grid that is one row or one column off, or a unit
+  count that does not stretch the last unit to the plane edge, then produces
+  wrong samples instead of the same picture. Eight geometries are swept -
+  128x96 over superres 112, 128x100, 128x68, 120x68, 160x96 with one 128-sample
+  unit, 96x72 with a 64-wide unit and a 32-wide last one, 32x24 and 16x16, i.e.
+  smaller than one unit - and every case also asserts that the filter actually
+  changed samples (129 to 770 of them), because a case where nothing moves could
+  not tell a wrong grid from a right one.
+* **A no-op has to be a no-op.** With an identity filter in every luma unit (taps
+  `{0,0,0,128,0,0,0}`) and a self guided one on both chroma planes, which on this
+  ramp is an identity as well, the picture has to come back bit identical to the
+  same clip with restoration switched off - the whole frame, chroma included.
+
+Mutations of the engine and of the kernel were then run against the test, each
+one restoring the old numbers when reverted:
+
+| mutation | samples wrong |
+| --- | --- |
+| the stripe starts at the frame edge instead of eight rows above | 54 (section 6) |
+| `unitRow` drops the `+ 8` of 7.17.1 | 572 / 561, and 558 across a border |
+| the last unit is not stretched to the plane edge | 315 (160x96) |
+| every row is taken from the CDEF picture | 11 + 5 |
+| rows below a stripe are never borrowed from the earlier picture | 26 + 26 |
+| the borrowed row is not clamped to `StripeStartY - 2` | 6 + 5 |
+| the two pictures are swapped | 1575 (section 6) |
+| the identity filter's intermediate clip is removed | 0 - not observable |
+
+The last row is worth writing down: `InterRound0` clips the horizontal pass to
+`[-(1 << (BitDepth + 7 - InterRound0)), (1 << (BitDepth + 8 + 7 - InterRound0)) -
+1]`, and with real coefficients the final `Clip1` hides the difference, so no
+sample of any fixture or of the superres clip can tell the two apart. The clip is
+still implemented (the specification bounds the intermediate so it fits a
+`Min(15, BitDepth + 5)` bit accumulator), but it is not what a test can pin.
+
+## Frames whose size is not a multiple of eight
+
+Every fixture used to be a multiple of eight in both directions, and that is the
+size where three roundings agree - so nothing noticed that the decoder had two
+of them wrong.
+
+**The 4x4 grid a tile codes on** is the frame size rounded up to eight:
+`MiCols = 2 * ((FrameWidth + 7) >> 3)` (7.4.4). Rounding to four, i.e.
+`(FrameWidth + 3) >> 2`, gives the same number for every multiple of eight and
+one mi column too few for a width 1 to 4 samples past a multiple of eight - and
+the block loop of the last superblock column then reads a different number of
+blocks than the encoder wrote. It is not a sample or two: a two frame 130x96
+clip decoded to 23,796 wrong bytes out of 37,440, i.e. the frame was garbage.
+The tile decoder, the deblocking grid, the CDEF grid and the reconstruction grid
+all derive the size from one place now (`mi_dim()` in
+`src/frontend/headers.hpp`).
+
+**The samples the filters and the prediction read outside the picture** are
+inside that grid, and they belong to blocks as well: a block on the last row band
+is predicted from the left column *below* it, CDEF copies and writes whole 8x8
+blocks, and the deblocker reads `q3` three samples past the edge. Two things
+followed. The engine's wave scheduler tracked sample ownership over the visible
+plane only, so those reads were not ordered after the block that writes them -
+the result was a handful of samples that depended on scheduling (91 wrong samples
+on a 128x99 frame, deterministic in practice, wrong nevertheless). And the CDEF
+job was given the visible size as its bound, so the last partial block filtered
+against a halo that stopped at the picture edge. Both now use the coded extent
+(`((FrameWidth + 7) & ~7) >> subX`), which is also what the prediction jobs
+already clamped to.
+
+`tests/data/odd_size.ivf` is 130x100 - two samples past 128 in every row, a
+partial stripe at the bottom (100 = 64 + 36), and six frames so the error would
+drift - and it is bit exact against dav1d and ffmpeg, through the CPU backend and
+through the OpenCL replay. `tests/data/make_odd_size.py` rebuilds it byte for
+byte. With the two fixes the sweep that found this is clean: widths 124 to 139 at
+height 64, and 128x97, 128x98, 128x100, 128x101, 128x102, 128x104, 130x64,
+130x68, 130x70, 130x72, 129x99, 132x102, 134x102, 160x116, 126x98, 120x66,
+96x60, 64x52 and 48x36 (decoded against dav1d, two frames each, CDEF and
+restoration on) are sample for sample equal.
+
+What is left is smaller and narrower: when the loop filter runs *on the last row
+or column band* of such a frame, it reads samples just outside the picture, and
+those are defined only by the reconstruction. Practical example: a 130x66 clip at
+`-crf 45` differs in exactly one sample (row 65, column 65) and it is off by one.
+This is why `odd_size.ivf`'s frames code a zero luma level - the fixture pins the
+grid, the CDEF halo and the clamps, which are fully defined, and not the samples
+the specification leaves to the implementation's border handling.
+
 ## Film grain
 
 Film grain is the one filter that runs after the picture is finished: it is part
@@ -840,6 +1064,64 @@ PSNR of the decoded picture against the *clean source*, frames 1–11:
   rate/distortion decisions.
 * At qstep 4 the deblock-only result is 45.6 dB with a **1.9 dB** gap between
   the worst and best frame, i.e. no visible drift over the clip.
+
+## Undefined behaviour and the sanitizer build
+
+`AV1GPU_SANITIZE=ON` builds every target with AddressSanitizer and UBSan, and the
+whole fixture set is decoded through it:
+
+```sh
+cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug -DAV1GPU_SANITIZE=ON
+cmake --build build-san -j
+export ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1
+ctest --test-dir build-san -j
+```
+
+The normal and the sanitizer build are both expected to stay at 46/46, and
+neither is allowed to print a `runtime error` line.
+The option compiles with `-fno-sanitize-recover=all` for exactly that reason:
+UBSan recovers by default, so without it a finding is a line on stderr and a
+green test, and `ctest` never sees it. With halting, a finding aborts the
+process and the test that ran it fails. `av1gpu_decode` is still worth wiring into
+a sweep of its own, since it is the only thing that decodes every fixture -
+`ctest` splits them across the CTest tests and a decode that is not one of them
+would not run at all:
+
+```sh
+for f in tests/data/*.ivf; do
+  build-san/bin/av1gpu_decode "$f" -o /dev/null 2>&1 | grep -E 'runtime error|AddressSanitizer'
+done
+```
+
+That pipeline has to print nothing for the whole fixture set.
+
+The first sweep over the fixtures found nothing but one defect, wherever
+a signed value is scaled by a power of two: a **left shift of a negative value**,
+which is undefined in C++ but is what the specification's arithmetic says
+(`x * 2^s` for a signed `x`). Every one is a multiplication now, and the decoded
+pictures are unchanged - the point of the change is that a compiler is no longer
+allowed to assume the value was positive:
+
+* `kernels/av1gpu_kernels.h`, the directional intra predictor: `idx` is a signed
+  tap index that goes negative for the acute angles, so
+  `(idx << upsample_above) >> 1` became `(idx * (1 << upsample_above)) >> 1`
+  (two call sites, one per half of the angle range).
+* `src/core/tables.cpp`, `gm_setup_shear`: the four shear parameters it derives
+  are signed, and so is `params[4]` before the 16 bit scaling.
+* `src/frontend/tile_decoder.cpp` (a negative `delta_q` is scaled by
+  `delta_q_res`) and `src/frontend/headers.cpp` (a global motion parameter
+  scaled by `prec_diff`).
+* `src/frontend/deblock.hpp`, the loop filter's reference and mode deltas at
+  `level >> 5` (this one shows up on `lr.ivf`: a reference delta of -1).
+* `src/core/synthetic.cpp`, the synthetic encoder's analysis transform (a pixel
+  scaled into 64 bit before the separable pass) and the motion vectors it writes
+  into a block.
+
+The sanitizer build also removed a compiler warning that had been noise for a
+while: `read_palette_plane` sorts its eight byte colour cache up to `size`, and
+gcc's inliner could not see the bound and warned about an out of bounds read in
+`std::sort`. It is an insertion sort now - linear on two ascending runs anyway,
+which is what the comment above it already claimed.
 
 ## Precision and portability notes
 

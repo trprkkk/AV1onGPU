@@ -490,6 +490,24 @@ inline const uint16_t tx_type_inter3[4][2] = {
     { 32020, 0 },
 };
 
+/* Default_Use_Wiener_Cdf: 1 symbols, one context.
+   * loop restoration: this unit uses the Wiener filter */
+inline const uint16_t use_wiener[2] = {
+  21198, 0,
+};
+
+/* Default_Use_Sgrproj_Cdf: 1 symbols, one context.
+   * loop restoration: this unit uses the self guided filter */
+inline const uint16_t use_sgrproj[2] = {
+  15913, 0,
+};
+
+/* Default_Restoration_Type_Cdf: 2 symbols, one context.
+   * loop restoration: none, Wiener or self guided */
+inline const uint16_t restoration_type[3] = {
+  23355, 10187, 0,
+};
+
 /* palette colour index, [plane][palette size - 2][colour context].
    * The palette size - 1 symbol index is coded as a symbol with
    * palette size values, so the row for a palette of N colours codes

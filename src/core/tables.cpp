@@ -449,7 +449,9 @@ bool gm_setup_shear(const int32_t* params, int* alpha, int* beta, int* gamma, in
   const int beta0 = std::min(kClip, std::max(-kClip - 1, params[3]));
   int div_shift = 0, div_factor = 0;
   resolve_divisor(params[2], &div_shift, &div_factor);
-  const int64_t v = static_cast<int64_t>(params[4]) << kPrecBits;
+  /* a multiply rather than a shift: params[4] is signed and a left shift of a
+   * negative value is undefined in C++17 */
+  const int64_t v = static_cast<int64_t>(params[4]) * (int64_t{1} << kPrecBits);
   /* Round2Signed(v * divFactor, divShift) in 64 bit: v is already shifted up by
    * 16 and the divisor factor is Q14, so the product does not fit 32 */
   const int64_t vd = v * div_factor;
@@ -461,10 +463,12 @@ bool gm_setup_shear(const int32_t* params, int* alpha, int* beta, int* gamma, in
                               std::max(-kClip - 1, static_cast<int>(params[5] -
                                                                     round2s64(wd, div_shift) -
                                                                     (1 << kPrecBits))));
-  *alpha = round2_signed(alpha0, kReduceBits) << kReduceBits;
-  *beta = round2_signed(beta0, kReduceBits) << kReduceBits;
-  *gamma = round2_signed(gamma0, kReduceBits) << kReduceBits;
-  *delta = round2_signed(delta0, kReduceBits) << kReduceBits;
+  /* the four are signed, so scaling them back up is a multiply (see above) */
+  const int step = 1 << kReduceBits;
+  *alpha = round2_signed(alpha0, kReduceBits) * step;
+  *beta = round2_signed(beta0, kReduceBits) * step;
+  *gamma = round2_signed(gamma0, kReduceBits) * step;
+  *delta = round2_signed(delta0, kReduceBits) * step;
   if (4 * std::abs(*alpha) + 7 * std::abs(*beta) >= (1 << kPrecBits)) return false;
   if (4 * std::abs(*gamma) + 4 * std::abs(*delta) >= (1 << kPrecBits)) return false;
   return true;

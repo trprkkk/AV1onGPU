@@ -76,6 +76,9 @@ TABLES = [
     ("tx_type_inter1", "Default_Inter_Tx_Type_Set1_Cdf"),
     ("tx_type_inter2", "Default_Inter_Tx_Type_Set2_Cdf"),
     ("tx_type_inter3", "Default_Inter_Tx_Type_Set3_Cdf"),
+    ("use_wiener", "Default_Use_Wiener_Cdf"),
+    ("use_sgrproj", "Default_Use_Sgrproj_Cdf"),
+    ("restoration_type", "Default_Restoration_Type_Cdf"),
 ]
 
 # The context shape each table is indexed by, for the comment in front of it.
@@ -116,6 +119,9 @@ NOTES = {
     "tx_type_inter1": "transform type, inter, set 1",
     "tx_type_inter2": "transform type, inter, set 2",
     "tx_type_inter3": "transform type, inter, set 3",
+    "use_wiener": "loop restoration: this unit uses the Wiener filter",
+    "use_sgrproj": "loop restoration: this unit uses the self guided filter",
+    "restoration_type": "loop restoration: none, Wiener or self guided",
 }
 
 

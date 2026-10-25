@@ -78,6 +78,11 @@ class CpuBackend final : public Backend {
     const size_t size = g.buffer_size;
     if (frame_.size() < size) frame_.resize(size, 0);
     if (scratch_.size() < size) scratch_.resize(size, 0);
+    /* Loop restoration reads two pictures the frame no longer holds by then:
+     * the deblocked one and a snapshot of the CDEF output. They are separate
+     * buffers because the restored samples are written back into the frame. */
+    if (lr_curr_.size() < size) lr_curr_.resize(size, 0);
+    if (lr_cdef_.size() < size) lr_cdef_.resize(size, 0);
     if (ref_pool_.size() < size * kReferenceSlots)
       ref_pool_.assign(size * kReferenceSlots, 0);
     layout_ = g;
@@ -317,6 +322,12 @@ class CpuBackend final : public Backend {
       }
     }
 
+    /* Loop restoration needs the picture as it is *before* CDEF as well: the
+     * two lines above and below the stripe it is restoring come from there, so
+     * the snapshot is taken here, before CDEF touches the frame. */
+    const bool uses_lr = !plan.restoration.empty();
+    if (uses_lr) std::memcpy(lr_curr_.data(), frame, g.buffer_size * sizeof(uint16_t));
+
     /* AV1GPU_NO_CDEF is a debug bitmask of planes to leave unfiltered. */
     const char* no_cdef_env = std::getenv("AV1GPU_NO_CDEF");
     const int no_cdef = no_cdef_env ? std::atoi(no_cdef_env) : 0;
@@ -350,6 +361,42 @@ class CpuBackend final : public Backend {
         for (int y = 0; y < rows; ++y)
           for (int x = 0; x < job.upscaled_w; ++x)
             av1g_upscale_px(&job, scratch_.data(), frame, filters, x, y, maxv);
+      }
+      /* Restoration works on the upscaled picture, so the pre-CDEF snapshot
+       * has to be upscaled too - the same jobs, into the second buffer. */
+      if (uses_lr) {
+        if (lr_prev_up_.size() < g.buffer_size) lr_prev_up_.resize(g.buffer_size, 0);
+        for (const Av1gUpscaleJob& job : plan.upscale) {
+          const int rows = job.rows;
+#if defined(AV1GPU_HAVE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+          for (int y = 0; y < rows; ++y)
+            for (int x = 0; x < job.upscaled_w; ++x)
+              av1g_upscale_px(&job, lr_curr_.data(), lr_prev_up_.data(), filters, x, y, maxv);
+        }
+      }
+    }
+
+    /* ---- loop restoration (7.17) ------------------------------------------- */
+    /* Restored samples are computed from the two snapshots, never from samples
+     * another unit has just written, so the stage is a plain map over the
+     * units and needs no ordering. */
+    /* AV1GPU_NO_LR is a debug bitmask of planes to leave unrestored, the same
+     * convention AV1GPU_NO_DEBLOCK and AV1GPU_NO_CDEF use. */
+    const char* no_lr_env = std::getenv("AV1GPU_NO_LR");
+    const int no_lr = no_lr_env ? std::atoi(no_lr_env) : 0;
+    if (uses_lr && no_lr != 7) {
+      std::memcpy(lr_cdef_.data(), frame, g.buffer_size * sizeof(uint16_t));
+      const uint16_t* lr_curr = plan.upscale.empty() ? lr_curr_.data() : lr_prev_up_.data();
+      const int n = static_cast<int>(plan.restoration.size());
+#if defined(AV1GPU_HAVE_OPENMP)
+#pragma omp parallel for schedule(dynamic, 4)
+#endif
+      for (int i = 0; i < n; ++i) {
+        const Av1gLrJob& job = plan.restoration[static_cast<size_t>(i)];
+        if (no_lr & (job.plane ? 2 : 1)) continue;
+        av1g_lr_block(&job, lr_cdef_.data(), lr_curr, frame, maxv);
       }
     }
 
@@ -513,6 +560,9 @@ class CpuBackend final : public Backend {
   PlanLayout layout_;
   std::vector<uint16_t> frame_;
   std::vector<uint16_t> scratch_;
+  std::vector<uint16_t> lr_curr_;   /* the deblocked picture, before CDEF  */
+  std::vector<uint16_t> lr_cdef_;   /* a snapshot of the CDEF output       */
+  std::vector<uint16_t> lr_prev_up_;/* the upscaled deblocked picture      */
   /* kReferenceSlots pictures of buffer_size samples, one after another */
   std::vector<uint16_t> ref_pool_;
   RefFrame refs_[kReferenceSlots];

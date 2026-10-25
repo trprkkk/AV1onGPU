@@ -154,7 +154,14 @@ class CudaBackend final : public Backend {
      * later as an unexplained device error. */
     alloc_failed_ = !ensure(&frame_, &frame_cap_, size * sizeof(uint16_t)) ||
                     !ensure(&scratch_, &scratch_cap_, size * sizeof(uint16_t)) ||
-                    !ensure(&ref_pool_, &ref_cap_, size * kReferenceSlots * sizeof(uint16_t));
+                    !ensure(&ref_pool_, &ref_cap_, size * kReferenceSlots * sizeof(uint16_t)) ||
+                    /* Loop restoration reads two pictures the frame no longer
+                     * holds by then - the deblocked one and a snapshot of the
+                     * CDEF output - and, for a superres frame, the upscaled
+                     * deblocked one. */
+                    !ensure(&lr_curr_, &lr_curr_cap_, size * sizeof(uint16_t)) ||
+                    !ensure(&lr_cdef_, &lr_cdef_cap_, size * sizeof(uint16_t)) ||
+                    !ensure(&lr_prev_up_, &lr_prev_up_cap_, size * sizeof(uint16_t));
     if (!tables_uploaded_ && !alloc_failed_) {
       upload_tables();
       tables_uploaded_ = true;
@@ -368,6 +375,13 @@ class CudaBackend final : public Backend {
       ++launches;
     }
 
+    /* The two lines either side of a stripe that restoration reads come from
+     * the picture as it is *before* CDEF, so it has to be kept. */
+    const bool uses_lr = !plan.restoration.empty();
+    if (uses_lr &&
+        driver_.MemcpyDtoD(lr_curr_, frame_, g.buffer_size * sizeof(uint16_t)) !=
+            cuda::CUDA_SUCCESS)
+      return fail(error, "restoration snapshot copy failed");
     if (!plan.cdef.empty()) {
       if (!ensure(&scratch_, &scratch_cap_, g.buffer_size * sizeof(uint16_t)))
         return fail(error, "out of device memory for the CDEF snapshot");
@@ -415,6 +429,48 @@ class CudaBackend final : public Backend {
       add_mem(a, filters_);
       add_int(a, maxv);
       if (!launch("av1g_k_upscale", total, a)) return fail(error, "av1g_k_upscale failed");
+      ++launches;
+      /* Restoration works on the upscaled picture, so the pre-CDEF snapshot is
+       * resampled by the same jobs into a buffer of its own. */
+      if (uses_lr) {
+        Launcher a;
+        add_mem(a, job_mem);
+        add_mem(a, pref_mem);
+        add_int(a, static_cast<int>(plan.upscale.size()));
+        add_int(a, total);
+        add_mem(a, lr_curr_);
+        add_mem(a, lr_prev_up_);
+        add_mem(a, filters_);
+        add_int(a, maxv);
+        if (!launch("av1g_k_upscale", total, a)) return fail(error, "av1g_k_upscale failed");
+        ++launches;
+      }
+    }
+
+    /* ---- loop restoration (7.17) ------------------------------------------- */
+    /* Every job computes its samples from the two snapshots, never from samples
+     * another unit has written, so the whole stage is one launch. */
+    if (uses_lr) {
+      /* the CDEF output frame_ holds is snapshot last: the upscaler above has
+       * already replaced the coded picture with the display one */
+      if (driver_.MemcpyDtoD(lr_cdef_, frame_, g.buffer_size * sizeof(uint16_t)) !=
+          cuda::CUDA_SUCCESS)
+        return fail(error, "restoration snapshot copy failed");
+      int total = 0;
+      CUdeviceptr job_mem = 0, pref_mem = 0;
+      if (!upload_jobs(plan.restoration, &job_mem, &pref_mem, &total,
+                       [](const Av1gLrJob& j) { return j.w * j.h; }))
+        return fail(error, "restoration job upload failed");
+      Launcher a;
+      add_mem(a, job_mem);
+      add_mem(a, pref_mem);
+      add_int(a, static_cast<int>(plan.restoration.size()));
+      add_int(a, total);
+      add_mem(a, lr_cdef_);
+      add_mem(a, plan.upscale.empty() ? lr_curr_ : lr_prev_up_);
+      add_mem(a, frame_);
+      add_int(a, maxv);
+      if (!launch("av1g_k_lr", total, a)) return fail(error, "av1g_k_lr failed");
       ++launches;
     }
 
@@ -619,14 +675,16 @@ class CudaBackend final : public Backend {
     /* every allocation: the palette map and the second prefix table were
      * missing from this list, so a backend that decoded a palette stream leaked
      * them when it was destroyed */
-    CUdeviceptr buffers[] = {frame_,    scratch_, coef_,   tmp_,     residual_,
-                             filters_,  ref_pool_, grain_, lut_,     rgb_,
-                             job_,      pref_,    pref_b_, palette_};
+    CUdeviceptr buffers[] = {frame_,   scratch_,   coef_,   tmp_,    residual_,
+                             filters_, ref_pool_,  grain_,  lut_,    rgb_,
+                             job_,     pref_,      pref_b_, palette_,
+                             lr_curr_, lr_cdef_,   lr_prev_up_};
     for (CUdeviceptr b : buffers)
       if (b && driver_.MemFree) driver_.MemFree(b);
     frame_ = scratch_ = coef_ = tmp_ = residual_ = 0;
     filters_ = ref_pool_ = grain_ = 0;
     lut_ = rgb_ = job_ = pref_ = pref_b_ = palette_ = 0;
+    lr_curr_ = lr_cdef_ = lr_prev_up_ = 0;
     palette_cap_ = 0;
     if (context_ && driver_.CtxDestroy) driver_.CtxDestroy(context_);
     context_ = nullptr;
@@ -820,10 +878,12 @@ class CudaBackend final : public Backend {
   CUdeviceptr frame_ = 0, scratch_ = 0, coef_ = 0, tmp_ = 0, residual_ = 0;
   CUdeviceptr filters_ = 0, ref_pool_ = 0, grain_ = 0, palette_ = 0;
   CUdeviceptr lut_ = 0, rgb_ = 0, job_ = 0, pref_ = 0, pref_b_ = 0;
+  CUdeviceptr lr_curr_ = 0, lr_cdef_ = 0, lr_prev_up_ = 0;
   size_t frame_cap_ = 0, scratch_cap_ = 0, coef_cap_ = 0, tmp_cap_ = 0;
   size_t residual_cap_ = 0, filters_cap_ = 0, ref_cap_ = 0;
   size_t grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0, palette_cap_ = 0;
   size_t job_cap_ = 0, pref_cap_ = 0, pref_b_cap_ = 0;
+  size_t lr_curr_cap_ = 0, lr_cdef_cap_ = 0, lr_prev_up_cap_ = 0;
   bool alloc_failed_ = false;
   std::vector<uint16_t> staging_;
   bool slots_[kReferenceSlots] = {};

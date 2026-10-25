@@ -159,6 +159,12 @@ struct ModeCdf {
   /* transform size, transform partition */
   uint16_t txsz[4][3][4];
   uint16_t txpart[7][3][2];
+  /* loop restoration: the switchable frame's filter symbol and the two
+   * single-filter frames' on/off symbols (5.11.46). They are read once per
+   * restoration unit and adapt like any other table. */
+  uint16_t restore_switchable[3];
+  uint16_t restore_wiener[2];
+  uint16_t restore_sgrproj[2];
 };
 
 /* The tables only an inter frame reads: reference selection (single, compound,

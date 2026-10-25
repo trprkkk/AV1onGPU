@@ -197,6 +197,99 @@ int main() {
     emit_plane("cdef", dst.data(), stride, 8, 8, 8, 8);
   }
 
+  /* --------------------------------------------------- loop restoration */
+  /* Two snapshots: the CDEF output and the deblocked picture before it. The top
+   * rows of the second are the two lines a stripe may borrow, so a device that
+   * reads the wrong pointer disagrees on the rows at the top of the stripe. */
+  {
+    const int stride = 32, size = 32;
+    std::vector<uint16_t> cdef((size_t)stride * size, 0), curr;
+    for (int y = 0; y < size; ++y)
+      for (int x = 0; x < stride; ++x)
+        cdef[(size_t)y * stride + x] = (uint16_t)(90 + ((x * 5 + y * 3) % 23));
+    curr = cdef;
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < stride; ++x) curr[(size_t)y * stride + x] = 200;
+    Av1gLrJob job;
+    std::memset(&job, 0, sizeof(job));
+    job.dst_off = 8 * stride + 8;
+    job.dst_stride = stride;
+    job.cdef_stride = stride;
+    job.curr_stride = stride;
+    job.x = 8;
+    job.y = 8;
+    job.w = 8;
+    job.h = 8;
+    job.plane_w = stride;
+    job.plane_h = size;
+    job.stripe_start_y = 8;
+    job.stripe_end_y = 23;
+    job.bitdepth = 8;
+    /* Wiener: the vertical taps reach two rows above, so the first output rows
+     * mix the two pictures */
+    job.type = AV1G_LR_WIENER;
+    job.vfilter[0] = 3;
+    job.vfilter[1] = -2;
+    job.vfilter[2] = 5;
+    job.hfilter[0] = 1;
+    job.hfilter[1] = 6;
+    job.hfilter[2] = -3;
+    {
+      std::vector<uint16_t> plane = cdef;
+      av1g_lr_block(&job, cdef.data(), curr.data(), plane.data(), 255);
+      emit_plane("lr_wiener", plane.data(), stride, 8, 8, 8, 8);
+    }
+    /* self guided: one pass with a radius, one without (which then uses the
+     * sample itself), and the two projection weights */
+    job.type = AV1G_LR_SGRPROJ;
+    job.sgr_radius[0] = 2;
+    job.sgr_eps[0] = 12;
+    job.sgr_radius[1] = 0;
+    job.sgr_eps[1] = 0;
+    job.sgr_xqd[0] = 95;
+    job.sgr_xqd[1] = 33;
+    {
+      std::vector<uint16_t> plane = cdef;
+      av1g_lr_block(&job, cdef.data(), curr.data(), plane.data(), 255);
+      emit_plane("lr_sgr", plane.data(), stride, 8, 8, 8, 8);
+    }
+    /* the same job at 10 bit, where the box filter's sums are scaled back to
+     * 8 bit instead of being used as they are */
+    {
+      std::vector<uint16_t> cdef10(cdef.size(), 0), curr10(curr.size(), 0);
+      for (size_t i = 0; i < cdef.size(); ++i) {
+        cdef10[i] = (uint16_t)(cdef[i] * 4);
+        curr10[i] = (uint16_t)(curr[i] * 4);
+      }
+      job.bitdepth = 10;
+      std::vector<uint16_t> plane = cdef10;
+      av1g_lr_block(&job, cdef10.data(), curr10.data(), plane.data(), 1023);
+      emit_plane("lr_sgr10", plane.data(), stride, 8, 8, 8, 8);
+    }
+  }
+
+  /* ------------------------------------------------------------ upscale */
+  {
+    const int src_stride = 24, dst_stride = 32, rows = 8;
+    std::vector<uint16_t> src((size_t)src_stride * rows, 0);
+    for (int y = 0; y < rows; ++y)
+      for (int x = 0; x < src_stride; ++x)
+        src[(size_t)y * src_stride + x] = (uint16_t)(40 + ((x * 7 + y * 11) % 61));
+    std::vector<uint16_t> dst((size_t)dst_stride * rows, 0);
+    Av1gUpscaleJob job;
+    std::memset(&job, 0, sizeof(job));
+    job.src_stride = src_stride;
+    job.dst_stride = dst_stride;
+    job.rows = rows;
+    job.upscaled_w = dst_stride;
+    job.max_x = src_stride - 1;
+    job.bitdepth = 8;
+    av1g_superres_params(src_stride, dst_stride, &job.step_x, &job.initial_subpel_x);
+    av1g_upscale_plane(&job, src.data(), dst.data(), tables::filters().data(), 255);
+    emit_plane("upscale", dst.data(), dst_stride, 0, 0, 8, 8);
+    emit({job.step_x, job.initial_subpel_x, rows, dst_stride}, "upscale_params");
+  }
+
   /* ------------------------------------------------------------- layouts */
   S(Av1gItxJob);
   F(Av1gItxJob, coef_off); F(Av1gItxJob, tmp_off); F(Av1gItxJob, dst_off);
@@ -218,7 +311,8 @@ int main() {
   FA(Av1gIntraJob, palette_color, 8);
   F(Av1gIntraJob, palette_off); F(Av1gIntraJob, palette_stride);
   S(Av1gInterJob);
-  F(Av1gInterJob, dst_off); F(Av1gInterJob, dst_stride); F(Av1gInterJob, w);
+  F(Av1gInterJob, dst_off); F(Av1gInterJob, dst_stride); F(Av1gInterJob, plane);
+  F(Av1gInterJob, w);
   F(Av1gInterJob, h); F(Av1gInterJob, ref0_off); F(Av1gInterJob, ref0_stride);
   F(Av1gInterJob, ref1_off); F(Av1gInterJob, ref1_stride); F(Av1gInterJob, ref0_slot);
   F(Av1gInterJob, ref1_slot); F(Av1gInterJob, ref_x); F(Av1gInterJob, ref_y);
@@ -263,6 +357,18 @@ int main() {
   F(Av1gUpscaleJob, upscaled_w); F(Av1gUpscaleJob, max_x);
   F(Av1gUpscaleJob, step_x); F(Av1gUpscaleJob, initial_subpel_x);
   F(Av1gUpscaleJob, bitdepth);
+  S(Av1gLrJob);
+  F(Av1gLrJob, plane); F(Av1gLrJob, dst_off); F(Av1gLrJob, dst_stride);
+  F(Av1gLrJob, cdef_off); F(Av1gLrJob, cdef_stride);
+  F(Av1gLrJob, curr_off); F(Av1gLrJob, curr_stride);
+  F(Av1gLrJob, x); F(Av1gLrJob, y); F(Av1gLrJob, w); F(Av1gLrJob, h);
+  F(Av1gLrJob, plane_w); F(Av1gLrJob, plane_h);
+  F(Av1gLrJob, stripe_start_y); F(Av1gLrJob, stripe_end_y);
+  F(Av1gLrJob, type);
+  FA(Av1gLrJob, vfilter, 3); FA(Av1gLrJob, hfilter, 3);
+  FA(Av1gLrJob, sgr_radius, 2); FA(Av1gLrJob, sgr_eps, 2);
+  FA(Av1gLrJob, sgr_xqd, 2);
+  F(Av1gLrJob, bitdepth);
   S(Av1gGrainJob);
   F(Av1gGrainJob, dst_off); F(Av1gGrainJob, dst_stride);
   F(Av1gGrainJob, noise_off); F(Av1gGrainJob, noise_stride);
@@ -400,6 +506,8 @@ def main():
     InterJob = layouts["Av1gInterJob"]
     DeblockJob = layouts["Av1gDeblockJob"]
     CdefJob = layouts["Av1gCdefJob"]
+    UpscaleJob = layouts["Av1gUpscaleJob"]
+    LrJob = layouts["Av1gLrJob"]
     GrainJob = layouts["Av1gGrainJob"]
     ColorJob = layouts["Av1gColorJob"]
 
@@ -727,6 +835,132 @@ def main():
     # and the block really was filtered, so the check above is not vacuous
     check("cdef moved samples next to the edge",
           int(np.abs(cdef_block - edge.reshape(size, stride)[8:16, 8:16]).max()) > 0,
+          True)
+
+    # ------------------------------------------------------ loop restoration
+    # Two snapshots and one output picture: inside the stripe the kernel reads
+    # the CDEF output, in the two lines above it the deblocked picture. The
+    # reference is the host build of the same kernel, so any disagreement -
+    # swapped snapshots included - shows up sample for sample.
+    print("loop restoration")
+    cdef_plane = np.zeros(stride * size, dtype=np.uint16)
+    for y in range(size):
+        for x in range(stride):
+            cdef_plane[y * stride + x] = 90 + ((x * 5 + y * 3) % 23)
+    curr_plane = cdef_plane.copy()
+    curr_plane[:8 * stride] = 200
+
+    def lr_job(bitdepth):
+        job = LrJob()
+        job.dst_off = 8 * stride + 8
+        job.dst_stride = stride
+        job.cdef_stride = stride
+        job.curr_stride = stride
+        job.x = 8
+        job.y = 8
+        job.w = 8
+        job.h = 8
+        job.plane_w = stride
+        job.plane_h = size
+        job.stripe_start_y = 8
+        job.stripe_end_y = 23
+        job.bitdepth = bitdepth
+        return job
+
+    def run_lr(job, cdef_src, curr_src, maxv):
+        dst = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=cdef_src)
+        jb = upload(np.frombuffer(job, dtype=np.uint8).copy())
+        launch(None, program.av1g_k_lr, lr_total, jb, lr_pref_buf, np.int32(1),
+               np.int32(lr_total), upload(cdef_src), upload(curr_src), dst,
+               np.int32(maxv))
+        queue.finish()
+        return download(dst, cdef_src.shape)
+
+    lr_pref, lr_total = prefix([64])
+    lr_pref_buf = upload(lr_pref)
+
+    wiener = lr_job(8)
+    wiener.type = 1          # AV1G_LR_WIENER
+    wiener.vfilter0, wiener.vfilter1, wiener.vfilter2 = 3, -2, 5
+    wiener.hfilter0, wiener.hfilter1, wiener.hfilter2 = 1, 6, -3
+    out = run_lr(wiener, cdef_plane, curr_plane, 255)
+    region = out.reshape(size, stride)[8:16, 8:16].astype(int)
+    want = np.array(tables["host.lr_wiener"], dtype=int).reshape(8, 8)
+    check("wiener matches the host kernel", bool((region == want).all()), True)
+    check("wiener changes the picture",
+          int(np.abs(region - cdef_plane.reshape(size, stride)[8:16, 8:16]).max()) > 0,
+          True)
+    # The three rows at the top of the job are the only ones whose vertical taps
+    # reach above the stripe, and those taps read the pre-CDEF picture: with the
+    # snapshots made equal those rows are the only ones that change, which fails
+    # if the two pointers are swapped or if one of them is ignored.
+    flat_run = run_lr(wiener, cdef_plane, cdef_plane, 255)
+    flat_region = flat_run.reshape(size, stride)[8:16, 8:16].astype(int)
+    check("wiener reads the pre-CDEF picture above the stripe",
+          bool((flat_region[:3] != region[:3]).any() and
+               (flat_region[3:] == region[3:]).all()), True)
+
+    sgr = lr_job(8)
+    sgr.type = 2             # AV1G_LR_SGRPROJ
+    sgr.sgr_radius0, sgr.sgr_eps0 = 2, 12
+    sgr.sgr_radius1, sgr.sgr_eps1 = 0, 0   # the second pass then uses the input
+    sgr.sgr_xqd0, sgr.sgr_xqd1 = 95, 33
+    out = run_lr(sgr, cdef_plane, curr_plane, 255)
+    region = out.reshape(size, stride)[8:16, 8:16].astype(int)
+    want = np.array(tables["host.lr_sgr"], dtype=int).reshape(8, 8)
+    check("self guided matches the host kernel", bool((region == want).all()), True)
+    check("self guided changes the picture",
+          int(np.abs(region - cdef_plane.reshape(size, stride)[8:16, 8:16]).max()) > 0,
+          True)
+
+    # 10 bit, where the box filter scales its sums back to 8 bit before they
+    # become a variance: at 8 bit those shifts are zero and this check would
+    # pass even if the device dropped them
+    deep = lr_job(10)
+    deep.type = 2
+    deep.sgr_radius0, deep.sgr_eps0 = 2, 12
+    deep.sgr_radius1, deep.sgr_eps1 = 0, 0
+    deep.sgr_xqd0, deep.sgr_xqd1 = 95, 33
+    out = run_lr(deep, (cdef_plane * 4).astype(np.uint16),
+                 (curr_plane * 4).astype(np.uint16), 1023)
+    region = out.reshape(size, stride)[8:16, 8:16].astype(int)
+    want = np.array(tables["host.lr_sgr10"], dtype=int).reshape(8, 8)
+    check("10 bit self guided matches the host kernel",
+          bool((region == want).all()), True)
+
+    # ------------------------------------------------------ superres upscale
+    # The source and the target are different geometries, so every output
+    # sample resamples its own eight taps: the reference is the host kernel.
+    print("superres upscale")
+    step_x, initial_subpel_x, up_rows, up_w = tables["upscale_params"]
+    src_stride = 24
+    src = np.zeros(src_stride * up_rows, dtype=np.uint16)
+    for y in range(up_rows):
+        for x in range(src_stride):
+            src[y * src_stride + x] = 40 + ((x * 7 + y * 11) % 61)
+    up = UpscaleJob()
+    up.src_stride = src_stride
+    up.dst_stride = up_w
+    up.rows = up_rows
+    up.upscaled_w = up_w
+    up.max_x = src_stride - 1
+    up.bitdepth = 8
+    up.step_x = step_x
+    up.initial_subpel_x = initial_subpel_x
+    ubuf = upload(np.frombuffer(up, dtype=np.uint8).copy())
+    upref, utotal = prefix([up_w * up_rows])
+    upref_buf = upload(upref)
+    src_buf = upload(src)
+    dst_buf = cl.Buffer(context, mf.READ_WRITE, up_w * up_rows * 2)
+    launch(None, program.av1g_k_upscale, utotal, ubuf, upref_buf, np.int32(1),
+           np.int32(utotal), src_buf, dst_buf, filter_buf, np.int32(255))
+    queue.finish()
+    out = download(dst_buf, (up_w * up_rows,)).reshape(up_rows, up_w)
+    region = out[:8, :8].astype(int)
+    want = np.array(tables["host.upscale"], dtype=int).reshape(8, 8)
+    check("upscale matches the host kernel", bool((region == want).all()), True)
+    check("upscale moved samples",
+          int(np.abs(region - src.reshape(up_rows, src_stride)[:8, :8]).max()) > 0,
           True)
 
     # ------------------------------------------------------------ film grain

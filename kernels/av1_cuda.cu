@@ -118,6 +118,17 @@ extern "C" __global__ void av1g_k_upscale(const Av1gUpscaleJob *jobs,
                   elem / job.upscaled_w, maxv);
 }
 
+/* Loop restoration: one thread per sample, from the two source pictures (the
+ * CDEF output and the deblocked picture before it) into the restored one. */
+extern "C" __global__ void av1g_k_lr(const Av1gLrJob *jobs,
+                                     const int *joff, int njobs, int total,
+                                     const av1g_px *cdef, const av1g_px *curr,
+                                     av1g_px *dst, int maxv) {
+  AV1G_JOB_LOOKUP(job_idx, elem);
+  Av1gLrJob job = jobs[job_idx];
+  av1g_lr_px(&job, cdef, curr, dst, elem % job.w, elem / job.w, maxv);
+}
+
 /* Film grain: one thread per sample. `luma` is the same picture (the chroma
  * blend reads the luma samples before any grain was added, which is why the
  * chroma jobs are launched first). */

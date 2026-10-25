@@ -201,21 +201,37 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
      * add afterwards, so a same-wave neighbour would be read before its
      * residual exists. The schedule below therefore requires a *strictly*
      * earlier wave for every sample a block reads. */
+    /* The grid this covers is the *coded* one, MiCols * MI_SIZE - the frame
+     * size rounded up to a multiple of eight - and not the visible size. A
+     * frame 99 samples tall has blocks down to row 103, and the last visible
+     * row band is predicted from the left column below it: those samples are
+     * outside the picture but inside the grid, so a dependency tracker that
+     * stopped at the visible height would let a block read a neighbour that has
+     * not been reconstructed yet. Every multiple of eight size makes the two
+     * grids the same, which is why this only shows up as a handful of samples
+     * on the last rows of an odd sized frame. */
+    std::vector<int> grid_w(3), grid_h(3);
+    for (int p = 0; p < 3; ++p) {
+      const int sub_x = p > 0 && geom.ss_x ? 1 : 0;
+      const int sub_y = p > 0 && geom.ss_y ? 1 : 0;
+      grid_w[p] = ((frame_w + 7) & ~7) >> sub_x;
+      grid_h[p] = ((frame_h + 7) & ~7) >> sub_y;
+    }
     std::vector<std::vector<int>> owner(3);
     for (int p = 0; p < 3; ++p)
-      owner[p].assign(static_cast<size_t>(g.plane_w[p]) * g.plane_h[p], -1);
+      owner[p].assign(static_cast<size_t>(grid_w[p]) * grid_h[p], -1);
     for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
       const BlockSyntax& b = syntax.blocks[bi];
       const int p = b.plane;
-      const int x1 = std::min(b.x + b.w, g.plane_w[p]);
-      const int y1 = std::min(b.y + b.h, g.plane_h[p]);
-      for (int y = b.y; y < y1; ++y)
-        for (int x = b.x; x < x1; ++x)
-          owner[p][static_cast<size_t>(y) * g.plane_w[p] + x] = static_cast<int>(bi);
+      const int x1 = std::min(b.x + b.w, grid_w[p]);
+      const int y1 = std::min(b.y + b.h, grid_h[p]);
+      for (int y = std::max(b.y, 0); y < y1; ++y)
+        for (int x = std::max(b.x, 0); x < x1; ++x)
+          owner[p][static_cast<size_t>(y) * grid_w[p] + x] = static_cast<int>(bi);
     }
     auto sample_owner = [&](int p, int x, int y) {
-      if (x < 0 || y < 0 || x >= g.plane_w[p] || y >= g.plane_h[p]) return -1;
-      return owner[p][static_cast<size_t>(y) * g.plane_w[p] + x];
+      if (x < 0 || y < 0 || x >= grid_w[p] || y >= grid_h[p]) return -1;
+      return owner[p][static_cast<size_t>(y) * grid_w[p] + x];
     };
     /* True when every in-frame sample of the rectangle already belongs to a
      * block earlier in coding order - the question BlockDecoded answers for
@@ -292,8 +308,8 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
           const int mv_shift_y = 3 + (p > 0 && geom.ss_y ? 1 : 0);
           const int sx = b.x + (b.mv[0][0] >> mv_shift_x);
           const int sy = b.y + (b.mv[0][1] >> mv_shift_y);
-          const int x1 = std::min(sx + b.w, g.plane_w[p]);
-          const int y1 = std::min(sy + b.h, g.plane_h[p]);
+          const int x1 = std::min(sx + b.w, grid_w[p]);
+          const int y1 = std::min(sy + b.h, grid_h[p]);
           for (int y = std::max(sy, 0); y < y1; ++y) {
             for (int x = std::max(sx, 0); x < x1; ++x) {
               const int o = sample_owner(p, x, y);
@@ -404,6 +420,7 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         std::memset(&job, 0, sizeof(job));
         job.dst_off = dst_off;
         job.dst_stride = stride;
+        job.plane = plane;
         job.w = b.w;
         job.h = b.h;
         job.ref_x = b.x; /* patch origin, in plane samples */
@@ -463,7 +480,11 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
             job.wedge_yoff = yoff;
             job.wedge_flip = flip;
           }
-          if (job.mask_kind == AV1G_MASK_DIFFWTD && (job.sub_x || job.sub_y)) {
+          /* A difference weighted mask is a function of the two luma
+           * predictions on every chroma plane, subsampled or not: at 4:4:4 a
+           * chroma sample covers exactly one luma sample, but the two are still
+           * different pictures, so the chroma job carries the luma plane. */
+          if (job.mask_kind == AV1G_MASK_DIFFWTD && plane > 0) {
             job.luma_ref0_off = g.plane_off[0];
             job.luma_ref1_off = g.plane_off[0];
             job.luma_stride = g.stride[0];
@@ -627,8 +648,13 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
       job.ss_x = geom.ss_x;
       job.ss_y = geom.ss_y;
       job.bitdepth = geom.bit_depth;
-      job.plane_w = g.plane_w[plane];
-      job.plane_h = g.plane_h[plane];
+      /* The block grid and the halo are the *coded* extent (MiCols * MI_SIZE,
+       * rounded to eight), not the visible one: 7.15 copies and writes the
+       * whole 8x8 block and decides availability in mi units, so the last
+       * partial block of a frame whose size is not a multiple of eight filters
+       * against samples that exist in the border but not in the picture. */
+      job.plane_w = grid_w[plane];
+      job.plane_h = grid_h[plane];
       plan->cdef.push_back(job);
     }
 
@@ -663,6 +689,88 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         job.bitdepth = geom.bit_depth;
         plan->upscale.push_back(job);
       }
+    }
+
+    /* ---- loop restoration (7.17) ------------------------------------------- */
+    /* The picture is restored in stripes, and one job is one stripe's part of
+     * one restoration unit: inside the stripe the samples come from the CDEF
+     * output, the two lines either side of it from the deblocked picture, so a
+     * job may only see one of the two.
+     *
+     * Which unit filters a row is not simply its position divided by the unit
+     * size: 7.17.1 offsets the row by eight luma samples before the division
+     * (the same eight samples the stripes are shifted by), so a unit owns the
+     * samples up to eight rows past its nominal end. The offset is a multiple
+     * of the stripe grid, so one stripe piece always belongs to one unit, and
+     * the pieces are the right granularity. Nothing here depends on the order
+     * the jobs run in, which is what lets the GPU backends run them together. */
+    for (int plane = 0; plane < 3; ++plane) {
+      if (syntax.restoration_type[plane] == kRestoreNone) continue;
+      const int sub_x = plane > 0 ? geom.ss_x : 0;
+      const int sub_y = plane > 0 ? geom.ss_y : 0;
+      const int unit_size = 1 << syntax.restoration_unit_log2[plane];
+      const int unit_cols = std::max(syntax.restoration_unit_cols[plane], 1);
+      const int plane_w = g.out_w[plane];
+      const int plane_h = g.out_h[plane];
+      /* count_units_in_frame( unitSize, Round2( frameSize, subY ) ) */
+      const int frame_h = (geom.height + (sub_y ? 1 << (sub_y - 1) : 0)) >> sub_y;
+      const int unit_rows = std::max((frame_h + (unit_size >> 1)) / unit_size, 1);
+      for (int y = 0; y < plane_h;) {
+        const int stripe = ((y << sub_y) + 8) / 64;
+        const int stripe_start = (-8 + stripe * 64) >> sub_y;
+        const int stripe_end = stripe_start + (64 >> sub_y) - 1;
+        const int y1 = std::min(plane_h, stripe_end + 1);
+        const int unit_row =
+            std::min(unit_rows - 1, (((y << sub_y) + 8) >> sub_y) / unit_size);
+        for (int unit_col = 0; unit_col < unit_cols; ++unit_col) {
+          const size_t index = static_cast<size_t>(unit_row) * unit_cols + unit_col;
+          if (index >= syntax.restoration[plane].size()) continue;
+          const RestorationUnit& unit = syntax.restoration[plane][index];
+          if (unit.type == kRestoreNone) continue;
+          const int ux0 = unit_col * unit_size;
+          /* 7.17.1 clamps the unit index, so the last unit of a row or of the
+           * frame extends over the samples past its nominal end. */
+          const int ux1 = unit_col + 1 == unit_cols ? plane_w
+                                                    : std::min(ux0 + unit_size, plane_w);
+          if (ux1 <= ux0) continue;
+          Av1gLrJob job;
+          std::memset(&job, 0, sizeof(job));
+          job.plane = plane;
+          job.dst_off = at(plane, ux0, y);
+          job.dst_stride = g.stride[plane];
+          job.cdef_off = at(plane, 0, 0);
+          job.cdef_stride = g.stride[plane];
+          job.curr_off = at(plane, 0, 0);
+          job.curr_stride = g.stride[plane];
+          job.x = ux0;
+          job.y = y;
+          job.w = ux1 - ux0;
+          job.h = y1 - y;
+          job.plane_w = plane_w;
+          job.plane_h = plane_h;
+          job.stripe_start_y = stripe_start;
+          job.stripe_end_y = stripe_end;
+          job.type = unit.type == kRestoreWiener ? AV1G_LR_WIENER : AV1G_LR_SGRPROJ;
+          if (unit.type == kRestoreWiener) {
+            for (int i = 0; i < 3; ++i) {
+              /* pass 0 is the vertical filter, which the bitstream codes
+               * first */
+              job.vfilter[i] = unit.wiener[0][i];
+              job.hfilter[i] = unit.wiener[1][i];
+            }
+          } else {
+            for (int i = 0; i < 2; ++i) {
+              job.sgr_radius[i] = kSgrParams[unit.sgr_set & 15][i * 2];
+              job.sgr_eps[i] = kSgrParams[unit.sgr_set & 15][i * 2 + 1];
+              job.sgr_xqd[i] = unit.sgr_xqd[i];
+            }
+          }
+          job.bitdepth = geom.bit_depth;
+          plan->restoration.push_back(job);
+        }
+        y = y1;
+      }
+      (void)sub_x;
     }
 
     /* ---- film grain -------------------------------------------------------- */

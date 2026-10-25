@@ -2262,8 +2262,8 @@ void test_intrabc_frame() {
     /* inside the tile ... */
     CHECK(src_col >= 0);
     CHECK(src_row >= 0);
-    CHECK(src_col + bw4 <= (header.width + 3) >> 2);
-    CHECK(src_row + bh4 <= (header.height + 3) >> 2);
+    CHECK(src_col + bw4 <= mi_dim(header.width));
+    CHECK(src_row + bh4 <= mi_dim(header.height));
     /* ... and clear of the superblock the block is in, one way or the other */
     const int sb4 = seq.use_128x128_superblock ? 32 : 16;
     const int sb_col = (block.mi_col / sb4) * sb4;

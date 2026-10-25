@@ -43,10 +43,12 @@ sys.path.insert(0, HERE)
 import opencl_selftest as selftest  # noqa: E402  (probe, kernel source, helpers)
 
 MAGIC = b"AV1GPLAN"
-FORMAT_VERSION = 6       # 2 the palette map, 3 the itx scratch size,
+FORMAT_VERSION = 8       # 2 the palette map, 3 the itx scratch size,
                          # 4 the display geometry and the upscale jobs,
                          # 5 the film grain noise image and its two passes,
-                         # 6 that noise image as 16 bit samples
+                         # 6 that noise image as 16 bit samples,
+                         # 7 the loop restoration jobs,
+                         # 8 the inter job's plane
 REFERENCE_SLOTS = 9      # kReferenceSlots in the backends
 CDEF_DIM = 8             # AV1G_CDEF_DIM
 MASK_DIFFWTD = 2         # AV1G_MASK_DIFFWTD
@@ -143,6 +145,7 @@ def read_plan(path, layouts):
         plan["waves"].append(wave)
     for key, name in (("deblock_v", "DeblockJob"), ("deblock_h", "DeblockJob"),
                       ("cdef", "CdefJob"), ("upscale", "UpscaleJob"),
+                      ("restoration", "LrJob"),
                       ("grain_chroma", "GrainJob"), ("grain_luma", "GrainJob")):
         plan[key] = r.jobs(layouts["Av1g" + name], r.i32())
 
@@ -369,6 +372,16 @@ class Replay:
                         (job_buf, pref, np.int32(len(jobs)), np.int32(total), frame,
                          np.int32(maxv)))
 
+        # ---- loop restoration's two sources --------------------------------
+        # Restoration borrows the two lines either side of a stripe from the
+        # picture as it is *before* CDEF, so the deblocked frame is kept here,
+        # where the backends take the snapshot.
+        uses_lr = bool(plan["restoration"])
+        lr_curr = None
+        if uses_lr:
+            lr_curr = self.buffer(np.zeros(size, dtype=np.uint16), readonly=False)
+            cl.enqueue_copy(self.queue, lr_curr, frame)
+
         # ---- CDEF works from a snapshot and writes the frame ---------------
         if plan["cdef"]:
             jobs = plan["cdef"]
@@ -394,6 +407,27 @@ class Replay:
             self.launch("av1g_k_upscale", total,
                         (job_buf, pref, np.int32(len(jobs)), np.int32(total), snapshot,
                          frame, filter_buf, np.int32(maxv)))
+            # restoration works on the upscaled picture, so the pre-CDEF snapshot
+            # has to be resampled with the same jobs into a buffer of its own
+            if uses_lr:
+                lr_prev_up = self.buffer(np.zeros(size, dtype=np.uint16),
+                                         readonly=False)
+                self.launch("av1g_k_upscale", total,
+                            (job_buf, pref, np.int32(len(jobs)), np.int32(total),
+                             lr_curr, lr_prev_up, filter_buf, np.int32(maxv)))
+                lr_curr = lr_prev_up
+
+        # ---- loop restoration (7.17) ---------------------------------------
+        # Both sources are snapshots, so no unit can observe another's output
+        # and the stage is one launch, in any order.
+        if uses_lr:
+            jobs = plan["restoration"]
+            lr_cdef = self.buffer(np.zeros(size, dtype=np.uint16), readonly=False)
+            cl.enqueue_copy(self.queue, lr_cdef, frame)
+            job_buf, pref, total = self.jobs(jobs, [j.w * j.h for j in jobs])
+            self.launch("av1g_k_lr", total,
+                        (job_buf, pref, np.int32(len(jobs)), np.int32(total), lr_cdef,
+                         lr_curr, frame, np.int32(maxv)))
 
         if before_grain is not None:
             before_grain(frame)

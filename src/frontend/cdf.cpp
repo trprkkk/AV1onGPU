@@ -78,6 +78,9 @@ void init_default_cdf(CdfContext* cdf, int base_q_idx) {
    * by a frame that allows screen content tools, but its tables belong to the
    * mode context */
   copy_table(cdf->mode.pal_color, it::pal_color);
+  copy_table(cdf->mode.restore_wiener, it::use_wiener);
+  copy_table(cdf->mode.restore_sgrproj, it::use_sgrproj);
+  copy_table(cdf->mode.restore_switchable, it::restoration_type);
   copy_table(cdf->inter.y_mode, it::y_mode);
   copy_table(cdf->inter.is_inter, it::is_inter);
   copy_table(cdf->inter.skip_mode, it::skip_mode);
@@ -221,6 +224,9 @@ void reset_cdf_counts(CdfContext* cdf) {
   reset_3d(m.pal_sz, 6);
   reset_3d(m.pal_y, 1);
   reset_2d(m.pal_uv, 1);
+  reset_row(m.restore_switchable, 2);
+  reset_row(m.restore_wiener, 1);
+  reset_row(m.restore_sgrproj, 1);
   reset_2d(cdf->skip.table, 1);
   reset_row(m.delta_q, 3);
   reset_2d(m.delta_lf, 3);

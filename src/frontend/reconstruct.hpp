@@ -56,6 +56,7 @@
 #include "av1gpu/av1gpu.hpp"
 #include "frontend/block_size.hpp"
 #include "frontend/cdef.hpp"
+#include "frontend/restoration.hpp"
 #include "frontend/coef_model.hpp"
 #include "frontend/deblock.hpp"
 #include "frontend/dequant.hpp"
@@ -350,8 +351,8 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
   /* MiCols / MiRows are the frame size rounded up to a whole 4x4 sample, and
    * then to a whole superblock: BlockDecoded is addressed relative to
    * superblocks, so the map has to cover the padding of the last one. */
-  const int mi_cols = (width + 3) >> 2;
-  const int mi_rows = (height + 3) >> 2;
+  const int mi_cols = mi_dim(width);
+  const int mi_rows = mi_dim(height);
   st.mi_cols = ((mi_cols + st.sb4 - 1) / st.sb4) * st.sb4;
   st.mi_rows = ((mi_rows + st.sb4 - 1) / st.sb4) * st.sb4;
 
@@ -877,6 +878,11 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
    * the direction, so all this stage decides is which blocks filter and with
    * which of the header's parameter sets. */
   if (!plan_cdef(seq, frame, tile, out, error)) return false;
+
+  /* Loop restoration runs last, on the CDEF output and (outside the stripe it
+   * is filtering) on the deblocked picture, so it only needs the frame level
+   * parameters and the unit table the tile decoder read. */
+  if (!plan_restoration(seq, frame, tile, out, error)) return false;
 
   return true;
 }

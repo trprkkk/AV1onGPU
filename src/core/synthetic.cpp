@@ -123,7 +123,8 @@ void forward_transform(const int* src, int stride, int w, int h, int* out) {
     for (int k = 0; k < h; ++k) {
       long long acc = 0;
       for (int i = 0; i < h; ++i) {
-        const long long s = static_cast<long long>(src[static_cast<size_t>(i) * stride + x]) << up;
+        const long long s =
+            static_cast<long long>(src[static_cast<size_t>(i) * stride + x]) * (1LL << up);
         acc += s * bh[static_cast<size_t>(i) * h + k];
       }
       tmp[static_cast<size_t>(k) * w + x] = round_shift(acc * sa, 24);
@@ -278,8 +279,8 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
            * axis to mean the same thing. Integer vectors only, so the phase
            * stays zero. */
           const int mv_shift = 3 + (plane ? ss : 0);
-          block.mv[0][0] = best_mv_x << mv_shift;
-          block.mv[0][1] = best_mv_y << mv_shift;
+          block.mv[0][0] = best_mv_x * (1 << mv_shift);
+          block.mv[0][1] = best_mv_y * (1 << mv_shift);
           block.filter = FilterType::Regular;
           block.compound = CompoundType::None;
 
@@ -316,6 +317,19 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
                       pred.data() + static_cast<size_t>(yy) * w,
                       static_cast<size_t>(w) * sizeof(uint16_t));
 
+        /* A transform block is a power of two, at least 4x4, and it has to
+         * tile the block: a plane whose size is not a multiple of the block size
+         * (a chroma plane 34 rows tall, say) keeps its last samples at the
+         * prediction. That is what a decoder does with a block that codes no
+         * residual, so the two reconstructions still agree. */
+        const int tw = std::min(ts, w);
+        const int th = std::min(ts, h);
+        if (tw < 4 || th < 4 || (tw & (tw - 1)) != 0 || (th & (th - 1)) != 0 || w % tw != 0 ||
+            h % th != 0) {
+          syntax.blocks.push_back(block);
+          continue;
+        }
+
         /* ---- residual, transform, quantisation -------------------------- */
         std::vector<int> residual(static_cast<size_t>(w) * h, 0);
         for (int yy = 0; yy < h; ++yy) {
@@ -326,8 +340,6 @@ FrameSyntax synthetic_encode(const SyntheticConfig& cfg, int frame_index,
           }
         }
 
-        const int tw = std::min(ts, w);
-        const int th = std::min(ts, h);
         const int tiles_x = w / tw;
         const int tiles_y = h / th;
         for (int ty = 0; ty < tiles_y; ++ty) {

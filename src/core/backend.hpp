@@ -166,9 +166,14 @@ struct FramePlan {
   std::vector<Av1gDeblockJob> deblock_h;
   std::vector<Av1gCdefJob> cdef;
   /* Superres: the rows of each plane resampled from the coded width to the
-   * display width. Runs on the CDEF output and before the film grain, which is
-   * why the grain jobs below are built on the display geometry. */
+   * display width. Runs on the CDEF output and before loop restoration and the
+   * film grain, which is why the jobs below are built on the display
+   * geometry. */
   std::vector<Av1gUpscaleJob> upscale;
+  /* Loop restoration: one job per restoration unit per stripe it touches, so
+   * every job's samples come from a single stripe. It restores the *upscaled*
+   * CDEF output (7.17), so it runs after the upscaling and before the grain. */
+  std::vector<Av1gLrJob> restoration;
   /* Film grain, in two passes: the chroma planes read the luma the picture had
    * before any grain was added, so they run first, and the luma samples they
    * blend against are the ones a later pass is about to change. */

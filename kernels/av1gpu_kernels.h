@@ -176,6 +176,9 @@ typedef struct {
 typedef struct {
   int dst_off;
   int dst_stride;
+  int plane;          /* 0 luma, 1 U, 2 V: a chroma job's difference weighted
+                         mask comes from the luma samples even when the plane
+                         is not subsampled */
   int w, h;
   int ref0_off, ref0_stride; /* plane offset inside the reference pool   */
   int ref1_off, ref1_stride;
@@ -1074,13 +1077,16 @@ AV1G_FN void av1g_intra_directional(const Av1gIntraJob *job, int *above, int *le
         int base = idx >> (6 - upsample_above);
         int v;
         if (base >= -(1 << upsample_above)) {
-          const int shift = ((idx << upsample_above) >> 1) & 0x1F;
+          /* idx is signed and negative here, so the upsampling is a multiply:
+           * shifting a negative value left is undefined in C++17 (and would
+           * only ever be "multiply by 2^n" by accident) */
+          const int shift = ((idx * (1 << upsample_above)) >> 1) & 0x1F;
           v = av1g_round2(above[base] * (32 - shift) + above[base + 1] * shift, 5);
         } else {
           idx = (i << 6) - (j + 1) * dy;
           base = idx >> (6 - upsample_left);
           {
-            const int shift = ((idx << upsample_left) >> 1) & 0x1F;
+            const int shift = ((idx * (1 << upsample_left)) >> 1) & 0x1F;
             v = av1g_round2(left[base] * (32 - shift) + left[base + 1] * shift, 5);
           }
         }
@@ -1936,9 +1942,13 @@ AV1G_FN void av1g_inter_px(const Av1gInterJob *job, AV1G_GLOBAL av1g_px *dst,
             if (job->mask_kind == AV1G_MASK_WEDGE) {
               m = av1g_wedge_px(job, ly, lx);
               if (job->mask_sign) m = 64 - m;
-            } else if (ctx.sub_x == 0 && ctx.sub_y == 0) {
+            } else if (job->plane == 0) {
               /* the luma plane already has both predictions, so its mask needs
-               * no second pass over the references */
+               * no second pass over the references. Note that this is about the
+               * plane, not about subsampling: at 4:4:4 a chroma sample covers
+               * exactly one luma sample, but the mask is still the *luma*
+               * prediction difference (7.11.3.12 is plane 0 only), and the
+               * chroma samples around it are a different picture. */
               m = av1g_diffwtd_m(av1g_abs(v0 - v1), sh, job->mask_sign);
             } else {
               /* the mask lives on the luma grid and this plane has no luma
@@ -2445,6 +2455,222 @@ AV1G_FN void av1g_cdef_block(const Av1gCdefJob *job, AV1G_GLOBAL const av1g_px *
     }
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* loop restoration (7.17)                                            */
+/* ------------------------------------------------------------------ */
+/* The filters read the picture twice: samples inside the stripe being restored
+ * come from the CDEF output, samples outside it from the deblocked picture
+ * before CDEF. Both are snapshots the backend keeps, so every work item reads
+ * the same two arrays and the stage is fully parallel. The two arrays are
+ * always separate from the destination: a unit's filter reads samples its
+ * neighbours are writing. */
+#define AV1G_LR_NONE 0
+#define AV1G_LR_WIENER 1
+#define AV1G_LR_SGRPROJ 2
+
+/* FILTER_BITS: the precision of the Wiener coefficients, seven bits - the value
+ * the specification's symbol table gives it, and the one that makes the
+ * intermediate's clip range the Min(15, BitDepth + 5) bits its note promises
+ * (3 would clip every intermediate to a sixteenth of what it holds). */
+#define AV1G_LR_FILTER_BITS 7
+#define AV1G_LR_WIENER_TAPS 7
+#define AV1G_LR_SGR_PRJ_BITS 7        /* SGRPROJ_PRJ_BITS                     */
+#define AV1G_LR_SGR_RST_BITS 4        /* SGRPROJ_RST_BITS                     */
+#define AV1G_LR_SGR_MTABLE_BITS 20    /* SGRPROJ_MTABLE_BITS                  */
+#define AV1G_LR_SGR_RECIP_BITS 12     /* SGRPROJ_RECIP_BITS                   */
+#define AV1G_LR_SGR_SGR_BITS 8        /* SGRPROJ_SGR_BITS                     */
+
+/* The specification's Round2() for the two places the shift can be zero (the
+ * bit depth scaling of the A and B sums, which is a no-op at 8 bit): the
+ * general helper shifts by n - 1, so it cannot take n == 0. */
+AV1G_FN int av1g_lr_round2(long long v, int n) {
+  return n ? av1g_rshift_rnd(v, n) : (int)v;
+}
+
+/* One rectangle of one plane, filtered with one restoration unit's filter. The
+ * rectangle lies inside a single stripe (a unit can span two stripes, and the
+ * two take their samples from different pictures). */
+typedef struct {
+  int plane;
+  int dst_off, dst_stride;    /* the picture being restored, the CDEF output */
+  int cdef_off, cdef_stride;  /* a snapshot of that same CDEF picture        */
+  int curr_off, curr_stride;  /* the deblocked picture, before CDEF          */
+  int x, y, w, h;             /* plane samples, inside one stripe            */
+  int plane_w, plane_h;       /* visible size of the plane, for the clamps   */
+  int stripe_start_y, stripe_end_y; /* the stripe, in plane samples, inclusive */
+  int type;                   /* AV1G_LR_WIENER or AV1G_LR_SGRPROJ           */
+  int vfilter[3];             /* the coded Wiener coefficients, vertical     */
+  int hfilter[3];             /* and horizontal                              */
+  int sgr_radius[2];          /* Sgr_Params[set][0] and [set][2]             */
+  int sgr_eps[2];             /* Sgr_Params[set][1] and [set][3]             */
+  int sgr_xqd[2];             /* the unit's two projection weights           */
+  int bitdepth;
+} Av1gLrJob;
+
+/* get_source_sample (7.17.6): the sample at plane position (x, y), clamped to
+ * the plane and, across the stripe border, clamped to the two lines the stripe
+ * may borrow and taken from the picture the right stage produced. */
+AV1G_FN int av1g_lr_src(const Av1gLrJob *job, AV1G_GLOBAL const av1g_px *cdef,
+                        AV1G_GLOBAL const av1g_px *curr, int x, int y) {
+  x = av1g_clip(x, 0, job->plane_w - 1);
+  y = av1g_clip(y, 0, job->plane_h - 1);
+  if (y < job->stripe_start_y) {
+    if (y < job->stripe_start_y - 2) y = job->stripe_start_y - 2;
+    return (int)curr[job->curr_off + y * job->curr_stride + x];
+  }
+  if (y > job->stripe_end_y) {
+    if (y > job->stripe_end_y + 2) y = job->stripe_end_y + 2;
+    return (int)curr[job->curr_off + y * job->curr_stride + x];
+  }
+  return (int)cdef[job->cdef_off + y * job->cdef_stride + x];
+}
+
+/* One output sample of the Wiener filter (7.17.4). The three coded
+ * coefficients give the seven symmetric taps, `V` is the vertical pass and `H`
+ * the horizontal one; the horizontal pass runs first and its result is clipped
+ * to the width the specification reserves for it before the second pass. */
+AV1G_FN int av1g_lr_wiener_px(const Av1gLrJob *job, AV1G_GLOBAL const av1g_px *cdef,
+                              AV1G_GLOBAL const av1g_px *curr, int x, int y) {
+  const int bd = job->bitdepth;
+  const int iround0 = bd == 12 ? 5 : 3;  /* InterRound0, isCompound = 0 */
+  const int iround1 = bd == 12 ? 9 : 11;
+  const int offset = 1 << (bd + AV1G_LR_FILTER_BITS - iround0 - 1);
+  const int limit = (1 << (bd + 1 + AV1G_LR_FILTER_BITS - iround0)) - 1;
+  int vtap[AV1G_LR_WIENER_TAPS], htap[AV1G_LR_WIENER_TAPS];
+  int t, s, sum = 0;
+  for (t = 0; t < 3; ++t) {
+    vtap[t] = job->vfilter[t];
+    vtap[6 - t] = job->vfilter[t];
+    htap[t] = job->hfilter[t];
+    htap[6 - t] = job->hfilter[t];
+  }
+  vtap[3] = 128 - 2 * (job->vfilter[0] + job->vfilter[1] + job->vfilter[2]);
+  htap[3] = 128 - 2 * (job->hfilter[0] + job->hfilter[1] + job->hfilter[2]);
+  for (t = 0; t < AV1G_LR_WIENER_TAPS; ++t) {
+    int k;
+    s = 0;
+    for (k = 0; k < AV1G_LR_WIENER_TAPS; ++k)
+      s += htap[k] * av1g_lr_src(job, cdef, curr, x + k - 3, y + t - 3);
+    /* the intermediate row is the horizontal pass, rounded and clipped */
+    sum += vtap[t] * av1g_clip(av1g_rshift_rnd(s, iround0), -offset, limit - offset);
+  }
+  return av1g_rshift_rnd(sum, iround1);
+}
+
+/* A and B of the box filter process (7.17.3) for the cell centred on plane
+ * position (x, y): the local variance turns into the weight A and the local
+ * mean into the offset B. `two_r_plus_one` and `eps` come from Sgr_Params. */
+AV1G_FN void av1g_lr_sgr_ab(const Av1gLrJob *job, AV1G_GLOBAL const av1g_px *cdef,
+                            AV1G_GLOBAL const av1g_px *curr, int x, int y, int two_r_plus_one,
+                            int eps, int *a_out, int *b_out) {
+  const int bd = job->bitdepth;
+  const int r = two_r_plus_one >> 1;
+  const int n = two_r_plus_one * two_r_plus_one;
+  const long long n2e = (long long)n * n * eps;
+  const long long mtable = ((1LL << AV1G_LR_SGR_MTABLE_BITS) + n2e / 2) / n2e;
+  long long sa = 0, sb = 0;
+  int dx, dy, z, a2, one_over_n;
+  long long b2;
+  for (dy = -r; dy <= r; ++dy)
+    for (dx = -r; dx <= r; ++dx) {
+      const int c = av1g_lr_src(job, cdef, curr, x + dx, y + dy);
+      sa += (long long)c * c;
+      sb += c;
+    }
+  /* `a` and `d` are the sums scaled back to 8 bit, which is what makes the
+   * variance comparable across bit depths; the offset B, however, is built from
+   * the *unscaled* sum `b` (7.17.3), which is invisible at 8 bit because the two
+   * are then the same number. */
+  const long long b_sum = sb;
+  sa = av1g_lr_round2(sa, 2 * (bd - 8));
+  sb = av1g_lr_round2(sb, bd - 8);
+  /* the variance, floored at zero so a flat area gets the smallest weight */
+  {
+    long long p = sa * n - sb * sb;
+    if (p < 0) p = 0;
+    z = av1g_rshift_rnd(p * mtable, AV1G_LR_SGR_MTABLE_BITS);
+  }
+  if (z >= 255)
+    a2 = 256;
+  else if (z == 0)
+    a2 = 1;
+  else
+    a2 = ((z << AV1G_LR_SGR_SGR_BITS) + (z / 2)) / (z + 1);
+  one_over_n = ((1 << AV1G_LR_SGR_RECIP_BITS) + (n / 2)) / n;
+  b2 = (long long)((1 << AV1G_LR_SGR_SGR_BITS) - a2) * b_sum * one_over_n;
+  *a_out = a2;
+  *b_out = av1g_rshift_rnd(b2, AV1G_LR_SGR_RECIP_BITS);
+}
+
+/* One output sample of the self guided filter (7.17.2): both box filters of
+ * the set are evaluated around the sample, then the two are projected onto it
+ * with the unit's weights. A pass whose radius is zero does not filter, and
+ * the specification then uses the sample itself in its place. */
+AV1G_FN int av1g_lr_sgr_px(const Av1gLrJob *job, AV1G_GLOBAL const av1g_px *cdef,
+                           AV1G_GLOBAL const av1g_px *curr, int x, int y) {
+  const int u = av1g_lr_src(job, cdef, curr, x, y);
+  const int w0 = job->sgr_xqd[0];
+  const int w1 = job->sgr_xqd[1];
+  const int w2 = (1 << AV1G_LR_SGR_PRJ_BITS) - w0 - w1;
+  int flt[2];
+  int pass;
+  for (pass = 0; pass < 2; ++pass) {
+    const int r = job->sgr_radius[pass];
+    int dy, dx, a = 0, b = 0;
+    if (r == 0) {
+      flt[pass] = 0;
+      continue;
+    }
+    for (dy = -1; dy <= 1; ++dy)
+      for (dx = -1; dx <= 1; ++dx) {
+        int weight, a2, b2;
+        if (pass == 0)
+          weight = ((y + dy) & 1) ? (dx == 0 ? 6 : 5) : 0;
+        else
+          weight = (dx == 0 || dy == 0) ? 4 : 3;
+        if (!weight) continue;
+        av1g_lr_sgr_ab(job, cdef, curr, x + dx, y + dy, 2 * r + 1, job->sgr_eps[pass], &a2,
+                       &b2);
+        a += weight * a2;
+        b += weight * b2;
+      }
+    /* the first pass reads the odd rows only, and shifts by one bit less */
+    {
+      const int shift = (pass == 0 && (y & 1)) ? 4 : 5;
+      flt[pass] = av1g_rshift_rnd((long long)a * u + b,
+                                  AV1G_LR_SGR_SGR_BITS + shift - AV1G_LR_SGR_RST_BITS);
+    }
+  }
+  {
+    const int us = u << AV1G_LR_SGR_RST_BITS;
+    long long v = (long long)w1 * us;
+    v += (long long)w0 * (job->sgr_radius[0] ? flt[0] : us);
+    v += (long long)w2 * (job->sgr_radius[1] ? flt[1] : us);
+    return av1g_rshift_rnd(v, AV1G_LR_SGR_RST_BITS + AV1G_LR_SGR_PRJ_BITS);
+  }
+}
+
+/* One restored sample of one plane. */
+AV1G_FN void av1g_lr_px(const Av1gLrJob *job, AV1G_GLOBAL const av1g_px *cdef,
+                        AV1G_GLOBAL const av1g_px *curr, AV1G_GLOBAL av1g_px *dst, int x,
+                        int y, int maxv) {
+  const int out = job->type == AV1G_LR_WIENER
+                      ? av1g_lr_wiener_px(job, cdef, curr, job->x + x, job->y + y)
+                      : av1g_lr_sgr_px(job, cdef, curr, job->x + x, job->y + y);
+  /* dst_off already points at sample (job->x, job->y) of the plane, so only
+   * the position inside the job is added */
+  dst[job->dst_off + y * job->dst_stride + x] = (av1g_px)av1g_clip_px(out, maxv);
+}
+
+#if !defined(AV1G_DEVICE)
+AV1G_HOST_FN void av1g_lr_block(const Av1gLrJob *job, const av1g_px *cdef,
+                                const av1g_px *curr, av1g_px *dst, int maxv) {
+  int x, y;
+  for (y = 0; y < job->h; ++y)
+    for (x = 0; x < job->w; ++x) av1g_lr_px(job, cdef, curr, dst, x, y, maxv);
+}
+#endif /* !AV1G_DEVICE */
 
 /* ------------------------------------------------------------------ */
 /* film grain                                                         */

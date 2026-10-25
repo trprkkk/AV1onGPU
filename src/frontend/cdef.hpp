@@ -60,8 +60,8 @@ inline bool plan_cdef(const SequenceHeader& seq, const FrameHeader& frame,
   }
   if (!any) return true;
 
-  const int mi_cols = (frame.width + 3) >> 2;
-  const int mi_rows = (frame.height + 3) >> 2;
+  const int mi_cols = mi_dim(frame.width);
+  const int mi_rows = mi_dim(frame.height);
   const int ss_x = seq.ss_x, ss_y = seq.ss_y;
   const int planes = seq.monochrome ? 1 : 3;
   const int width = frame.width, height = frame.height;

@@ -289,12 +289,20 @@ class TileParser {
     }
     const int sb4 = seq_.use_128x128_superblock ? 32 : 16;
     const BlockSize sb_size = seq_.use_128x128_superblock ? kBlock128x128 : kBlock64x64;
+    if (frame_.restoration_type[0] || frame_.restoration_type[1] ||
+        frame_.restoration_type[2])
+      init_restoration();
     for (int r = tile_row_start_; r < tile_row_end_; r += sb4) {
       /* clear_left_context: the segment prediction contexts live per 4x4 row,
        * so they start over at every superblock row, like the coefficient ones. */
       std::fill(left_seg_pred_.begin(), left_seg_pred_.end(), 0);
       for (int c = tile_col_start_; c < tile_col_end_; c += sb4) {
         read_deltas_ = frame_.delta_q_present;
+        /* read_lr runs once per superblock, before its partition tree: the
+         * units whose top left corner lies inside this superblock code their
+         * filter here (5.11.46). */
+        const ParseStatus lr_status = read_lr(r, c, sb_size);
+        if (lr_status != ParseStatus::Ok) return lr_status;
         const ParseStatus status = decode_partition(r, c, sb_size);
         if (status != ParseStatus::Ok) return status;
       }
@@ -340,8 +348,8 @@ class TileParser {
   const std::vector<int8_t>& cdef_index() const { return cdef_idx_; }
 
  private:
-  int mi_cols() const { return (frame_.width + 3) >> 2; }
-  int mi_rows() const { return (frame_.height + 3) >> 2; }
+  int mi_cols() const { return mi_dim(frame_.width); }
+  int mi_rows() const { return mi_dim(frame_.height); }
   int index(int row, int col) const { return row * mi_cols() + col; }
 
   /* Records that the tile reached syntax this layer does not read, and why. The
@@ -476,6 +484,174 @@ class TileParser {
   /* the most 4x4 units a block's coded span exceeds the frame by on either
    * axis, i.e. the largest block side */
   static constexpr int kMiPad = 16;
+
+  /* --- loop restoration (5.11.46) ---------------------------------------- */
+
+  /* The per plane state the unit syntax predicts from: the last unit's Wiener
+   * coefficients and self guided weights, which start at the specification's
+   * mid points at the top of every tile. */
+  int lr_wiener_[3][2][3] = {{{3, -7, 15}, {3, -7, 15}},
+                             {{3, -7, 15}, {3, -7, 15}},
+                             {{3, -7, 15}, {3, -7, 15}}};
+  int lr_sgr_xqd_[3][2] = {{-32, 31}, {-32, 31}, {-32, 31}};
+
+  void init_restoration() {
+    for (int plane = 0; plane < 3; ++plane) {
+      for (int pass = 0; pass < 2; ++pass) {
+        for (int i = 0; i < 3; ++i) lr_wiener_[plane][pass][i] = kWienerTapsMid[i];
+        lr_sgr_xqd_[plane][pass] = kSgrXqdMid[pass];
+      }
+      const int unit_size = 1 << frame_.restoration_unit_log2[plane];
+      const int sub_x = plane > 0 && seq_.ss_x ? 1 : 0;
+      const int sub_y = plane > 0 && seq_.ss_y ? 1 : 0;
+      const int cols = count_units_in_frame(unit_size, round_up_even(frame_.upscaled_width, sub_x));
+      const int rows = count_units_in_frame(unit_size, round_up_even(frame_.height, sub_y));
+      out_->restoration[plane].assign(static_cast<size_t>(cols) * rows, RestorationUnit());
+    }
+  }
+
+  /* count_units_in_frame(): the number of units a frame of `size` samples
+   * holds, rounding to the nearest unit so that a sliver of less than half a
+   * unit at the far edge is not coded (5.11.46). */
+  static int count_units_in_frame(int unit_size, int size) {
+    return std::max((size + (unit_size >> 1)) / unit_size, 1);
+  }
+  /* Round2( size, sub ): the plane's size in samples, rounded up when the
+   * plane is subsampled. */
+  static int round_up_even(int size, int sub) { return sub ? (size + 1) >> 1 : size; }
+
+  /* decode_subexp() in its arithmetic coded form: the same subexponential code
+   * the global motion parameters use, with the uniform and literal bits read
+   * from the range decoder instead of the bit reader. `k` is 1, 2 or 3. */
+  int read_subexp_bool(int num_symbols, int k) {
+    int i = 0, mk = 0;
+    for (;;) {
+      const int b2 = i ? k + i - 1 : k;
+      const int a = 1 << b2;
+      if (num_symbols <= mk + 3 * a)
+        return static_cast<int>(decoder_.read_uniform(static_cast<uint32_t>(num_symbols - mk))) + mk;
+      if (decoder_.read_bit()) {
+        ++i;
+        mk += a;
+      } else {
+        return static_cast<int>(decoder_.read_literal(b2)) + mk;
+      }
+    }
+  }
+
+  int inverse_recenter(int r, int v) {
+    if (v > 2 * r) return v;
+    if (v & 1) return r - ((v + 1) >> 1);
+    return r + (v >> 1);
+  }
+
+  int decode_unsigned_subexp_with_ref(int mx, int r, int k) {
+    const int v = read_subexp_bool(mx, k);
+    if ((r << 1) <= mx) return inverse_recenter(r, v);
+    return mx - 1 - inverse_recenter(mx - 1 - r, v);
+  }
+
+  int decode_signed_subexp_with_ref(int low, int high, int r, int k) {
+    return decode_unsigned_subexp_with_ref(high - low, r - low, k) + low;
+  }
+
+  /* read_lr_unit(): one restoration unit's filter and its parameters. */
+  void read_lr_unit(int plane, int unit_row, int unit_col) {
+    const int cols = out_restoration_cols(plane);
+    RestorationUnit& unit =
+        out_->restoration[plane][static_cast<size_t>(unit_row) * cols + unit_col];
+    const int frame_type = frame_.restoration_type[plane];
+    if (frame_type == kRestoreSwitchable) {
+      /* The switchable table codes RESTORE_NONE / RESTORE_WIENER /
+       * RESTORE_SGRPROJ as 0, 1, 2, while the frame level types skip
+       * RESTORE_NONE's neighbour: add one to everything but the first. */
+      const int symbol = static_cast<int>(decoder_.read_symbol(cdf_.mode.restore_switchable, 2));
+      unit.type = symbol + (symbol ? 1 : 0);
+    } else {
+      const bool on =
+          decoder_.read_symbol(frame_type == kRestoreWiener ? cdf_.mode.restore_wiener
+                                                            : cdf_.mode.restore_sgrproj,
+                               1) != 0;
+      unit.type = on ? frame_type : kRestoreNone;
+    }
+    if (unit.type == kRestoreWiener) {
+      for (int pass = 0; pass < 2; ++pass) {
+        const int first = plane ? 1 : 0;
+        if (plane) unit.wiener[pass][0] = 0;
+        for (int j = first; j < 3; ++j) {
+          const int v = decode_signed_subexp_with_ref(kWienerTapsMin[j], kWienerTapsMax[j] + 1,
+                                                      lr_wiener_[plane][pass][j], kWienerTapsK[j]);
+          unit.wiener[pass][j] = v;
+          lr_wiener_[plane][pass][j] = v;
+        }
+      }
+    } else if (unit.type == kRestoreSgrproj) {
+      const int set = static_cast<int>(decoder_.read_literal(kSgrParamsBits));
+      unit.sgr_set = set;
+      for (int i = 0; i < 2; ++i) {
+        const int radius = kSgrParams[set][i * 2];
+        int v;
+        if (radius) {
+          v = decode_signed_subexp_with_ref(kSgrXqdMin[i], kSgrXqdMax[i] + 1,
+                                            lr_sgr_xqd_[plane][i], kSgrProjSubexpK);
+        } else {
+          /* a pass with radius zero is not filtered at all, so the weight is
+           * either zero or whatever is left of the unit DC gain */
+          v = 0;
+          if (i == 1) v = std::min(std::max((1 << kSgrProjPrjBits) - lr_sgr_xqd_[plane][0],
+                                            kSgrXqdMin[i]), kSgrXqdMax[i]);
+        }
+        unit.sgr_xqd[i] = v;
+        lr_sgr_xqd_[plane][i] = v;
+      }
+    }
+  }
+
+  int out_restoration_cols(int plane) const {
+    const int unit_size = 1 << frame_.restoration_unit_log2[plane];
+    const int sub_x = plane > 0 && seq_.ss_x ? 1 : 0;
+    return count_units_in_frame(unit_size, round_up_even(frame_.upscaled_width, sub_x));
+  }
+
+  /* read_lr(): the restoration units whose top left corner is inside this
+   * superblock. The spans are the specification's ceils, so a unit that starts
+   * inside the superblock is read exactly once - by the superblock that holds
+   * its start - and the last unit of a frame narrower than a whole unit is
+   * clamped away by the unit counts. */
+  ParseStatus read_lr(int row, int col, BlockSize size) {
+    if (frame_.allow_intrabc) return ParseStatus::Ok;
+    const int w4 = block_width4(size), h4 = block_height4(size);
+    for (int plane = 0; plane < 3; ++plane) {
+      if (frame_.restoration_type[plane] == kRestoreNone) continue;
+      const int sub_x = plane > 0 && seq_.ss_x ? 1 : 0;
+      const int sub_y = plane > 0 && seq_.ss_y ? 1 : 0;
+      const int unit_size = 1 << frame_.restoration_unit_log2[plane];
+      const int unit_rows = count_units_in_frame(
+          unit_size, round_up_even(frame_.height, sub_y));
+      const int unit_cols = out_restoration_cols(plane);
+      const int mi = 4; /* MI_SIZE */
+      const int row_start = (row * (mi >> sub_y) + unit_size - 1) / unit_size;
+      const int row_end = std::min(unit_rows, ((row + h4) * (mi >> sub_y) + unit_size - 1) /
+                                                   unit_size);
+      int numerator, denominator;
+      if (frame_.superres) {
+        /* the frame is coded narrower than it is displayed, so a superblock's
+         * columns map to units through the superres ratio */
+        numerator = (mi >> sub_x) * frame_.superres_denominator;
+        denominator = unit_size * 8; /* SUPERRES_NUM */
+      } else {
+        numerator = mi >> sub_x;
+        denominator = unit_size;
+      }
+      const int col_start = (col * numerator + denominator - 1) / denominator;
+      const int col_end =
+          std::min(unit_cols, ((col + w4) * numerator + denominator - 1) / denominator);
+      for (int unit_row = row_start; unit_row < row_end; ++unit_row)
+        for (int unit_col = col_start; unit_col < col_end; ++unit_col)
+          read_lr_unit(plane, unit_row, unit_col);
+    }
+    return ParseStatus::Ok;
+  }
 
   /* read_segment_id(): `skip` is the block's skip flag, which decides that the
    * block keeps its neighbours' prediction rather than coding a distance. */
@@ -3102,7 +3278,9 @@ class TileParser {
         }
         if (delta != 0) {
           if (decoder_.read_bit()) delta = -delta;
-          delta <<= frame_.delta_q_res;
+          /* delta is signed; a left shift of a negative value is undefined,
+           * so scale it with a multiply */
+          delta *= 1 << frame_.delta_q_res;
           current_q_ = std::min(255, std::max(1, current_q_ + delta));
         }
         if (frame_.delta_lf_present) {
@@ -3410,9 +3588,22 @@ class TileParser {
           bits = std::min(bits, palette_bits(std::max(remaining, 0)));
         }
       }
-      /* the cache and the new colours are both ascending, so this is the
-       * merge the specification's sort() is allowed to be */
-      std::sort(colors, colors + size);
+      /* The cache and the new colours are both ascending, so a stable insertion
+       * sort is linear here and exact. It is spelled out rather than handed to
+       * std::sort because the array is only filled up to `size`: gcc's inliner
+       * then believes the sort can walk past the end of the eight byte array and
+       * warns about a buffer overflow that cannot happen (the warning is a false
+       * positive, but an obvious loop is cheaper than teaching every build to
+       * ignore it). */
+      for (int i = 1; i < size; ++i) {
+        const uint8_t key = colors[i];
+        int j = i - 1;
+        while (j >= 0 && colors[j] > key) {
+          colors[j + 1] = colors[j];
+          --j;
+        }
+        colors[j + 1] = key;
+      }
     }
     if (trace_enabled()) {
       std::fprintf(stderr, "PALC %d %d pl=%d n=%d rng=%u [", col * 4, row * 4, plane, size,

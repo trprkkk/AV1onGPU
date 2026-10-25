@@ -6,6 +6,9 @@ option(AV1GPU_BUILD_TOOLS "Build av1gpu_info / av1gpu_bench / av1gpu_play" ON)
 option(AV1GPU_ENABLE_OPENCL "Build the OpenCL backend" ON)
 option(AV1GPU_ENABLE_CUDA "Build the CUDA backend" ON)
 option(AV1GPU_ENABLE_OPENMP "Use OpenMP in the CPU reference backend" ON)
+# ASan + UBSan, with UBSan configured to halt (see the block below). The
+# sweep it is meant for - every fixture decoded, 38/38 tests, no findings -
+# is written down in docs/ACCURACY.md.
 option(AV1GPU_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -22,7 +25,11 @@ if(NOT MSVC)
 endif()
 
 if(AV1GPU_SANITIZE)
-  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+  # UBSan recovers by default: it prints a diagnostic and carries on, so a ctest
+  # run stays green while stderr fills with undefined behaviour. Halting turns
+  # every finding into a failed test, which is the only useful setting for CI.
+  add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all
+                      -fno-omit-frame-pointer -g)
   add_link_options(-fsanitize=address,undefined)
 endif()
 
@@ -152,16 +159,26 @@ if(AV1GPU_BUILD_TESTS)
   # inter/intra compound, with the taper and with wedge masks, seg_altq the only
   # one that codes segmentation (a different quantiser per segment), superres
   # the only one that codes a picture narrower than it displays (so the
-  # upscaling process and reference scaling both run) and grain the only one
+  # upscaling process and reference scaling both run), grain the only one
   # that carries film grain parameters (so the generator, the AR filter and the
-  # stripe blending run) and grain_inherit the only one where the grain
-  # parameters are re-used from a reference (update_grain = 0), and the three
-  # aom_ ones the only ones that are not 8 bit 4:2:0: aom_10bit_320x240 is
-  # 10 bit, aom_444_10bit_320x240 is 4:4:4 and aom_12bit_320x240 is 12 bit.
-  # Every frame of all eleven is bit exact.
+  # stripe blending run), grain_inherit the only one where the grain
+  # parameters are re-used from a reference (update_grain = 0), lr the only one
+  # that codes loop restoration (the Wiener and the self guided filter, on the
+  # luma and on the chroma planes, in frames that code the type per unit and in
+  # frames that code it switchable), lr_10bit the same clip at 10 bit (where the
+  # restoration filters' bit depth scaling is not a no-op), and the three aom_
+  # ones the only ones that are not 8 bit 4:2:0: aom_10bit_320x240 is 10 bit,
+  # aom_444_10bit_320x240 is 4:4:4 and aom_12bit_320x240 is 12 bit, and lossless
+  # the only one whose frames code no quantiser at all (so the frame header
+  # carries no loop filter levels, no CDEF strengths and no restoration unit, and
+  # the decoder must not filter the picture), and odd_size the only one whose
+  # picture is not a multiple of eight in either direction (so the 4x4 grid the
+  # tiles code on is the frame size rounded up to eight, and the filters and the
+  # prediction reach into the border). Every frame of all nineteen is bit exact.
   if(TARGET av1gpu_decode)
     foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra seg_altq superres grain
-                 grain_inherit aom_10bit_320x240 aom_444_10bit_320x240
+                 grain_inherit lr lr_10bit lr_12bit lr_444 lr_422 lossless
+                 odd_size aom_10bit_320x240 aom_444_10bit_320x240
                  aom_12bit_320x240)
       set(frames 30)
       # deeper than 8 bit: the hashes are over the samples themselves, so the
@@ -175,6 +192,32 @@ if(AV1GPU_BUILD_TESTS)
         set(frames 110)
       elseif(stream STREQUAL "grain_inherit")
         set(frames 10)
+      elseif(stream STREQUAL "lr")
+        set(frames 8)
+      elseif(stream STREQUAL "lr_444" OR stream STREQUAL "lr_422")
+        # 4:4:4 and 4:2:2: restoration on a plane whose subsampling is not
+        # 4:2:0, which is what makes the chroma unit grid (lr_uv_shift only
+        # exists for 4:2:0) and the difference weighted mask's luma fallback
+        # observable
+        set(frames 8)
+      elseif(stream STREQUAL "lr_12bit")
+        # 12 bit is the one depth the Wiener filter rounds differently
+        # (InterRound0 = 5, InterRound1 = 9)
+        set(frames 8)
+        set(stream_flags --yuv16)
+      elseif(stream STREQUAL "lossless")
+        # four frames, three of them inter: no quantiser, so the whole in-loop
+        # filter chain is absent from the header
+        set(frames 4)
+      elseif(stream STREQUAL "odd_size")
+        # 130x100: not a multiple of eight either way, so MiCols/MiRows round up
+        set(frames 6)
+      elseif(stream STREQUAL "lr_10bit")
+        # the same clip at 10 bit, where the restoration filters' bit depth
+        # scaling (7.17.3's Round2(a, 2 * (BitDepth - 8))) actually does
+        # something: at 8 bit it is a no-op
+        set(frames 8)
+        set(stream_flags --yuv16)
       elseif(stream MATCHES "^aom_")
         set(frames 12)
         set(stream_flags --yuv16)
@@ -234,6 +277,15 @@ if(AV1GPU_BUILD_TESTS)
     #   superres        the only one that is coded narrower than it displays, so
     #                   the upscaling process and the scaled motion
     #                   compensation reach the device kernels
+    #   lr              the only one that codes loop restoration, so the two
+    #                   source pictures a unit reads - the CDEF output and the
+    #                   deblocked one before it - and the stripes that take
+    #                   samples from both reach the device kernels
+    #   lr_10bit        the same at 10 bit, where the self guided filter's bit
+    #                   depth scaling runs at all (at 8 bit those Round2 calls
+    #                   shift by zero, so a missing scale costs nothing there)
+    #   lr_12bit        and at 12 bit, the depth the Wiener filter rounds
+    #                   differently (InterRound0 5, InterRound1 9)
     #   grain           the only one that carries film grain parameters, so the
     #                   noise image and the per plane curves reach the device
     #                   kernels, and the chroma planes have to be blended before
@@ -247,11 +299,18 @@ if(AV1GPU_BUILD_TESTS)
     #                   a zero luma level with the reference deltas enabled, so
     #                   it is also the one that catches a decoder filtering a
     #                   frame the loop filter never runs on
+    #   lossless        the only one whose frames code no quantiser at all, so the
+    #                   frame header has no filter parameters and every sample a
+    #                   block reconstructs has to reach the kernels untouched
+    #   odd_size        the only one whose picture is not a multiple of eight, so
+    #                   the block grid, the CDEF halo and the prediction clamps
+    #                   reach into the border of the plane
     #   svt_av1_320x240 a different encoder, so a different mix of tools
     # All of it on a machine with no GPU at all.
     if(TARGET av1gpu_decode)
       foreach(stream palette_sc intrabc lw_t2 lw_t3 inter_intra seg_altq
-                     superres grain grain_inherit aom_10bit_320x240
+                     superres lr lr_10bit lr_12bit lr_444 lr_422 lossless
+                     odd_size grain grain_inherit aom_10bit_320x240
                      aom_444_10bit_320x240 aom_12bit_320x240
                      svt_av1_320x240)
         set(frames 30)
@@ -263,8 +322,22 @@ if(AV1GPU_BUILD_TESTS)
           set(frames 110)
         elseif(stream STREQUAL "svt_av1_320x240")
           set(frames 6)
+        elseif(stream STREQUAL "lossless")
+          set(frames 4)
+        elseif(stream STREQUAL "odd_size")
+          set(frames 6)
         elseif(stream STREQUAL "grain_inherit")
           set(frames 10)
+        elseif(stream STREQUAL "lr")
+          set(frames 8)
+        elseif(stream STREQUAL "lr_10bit")
+          set(frames 8)
+        elseif(stream STREQUAL "lr_12bit")
+          set(frames 8)
+        elseif(stream STREQUAL "lr_444")
+          set(frames 8)
+        elseif(stream STREQUAL "lr_422")
+          set(frames 8)
         elseif(stream MATCHES "^aom_")
           set(frames 12)
         endif()

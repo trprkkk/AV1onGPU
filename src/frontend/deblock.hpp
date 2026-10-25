@@ -112,11 +112,14 @@ inline int deblock_level_selection(const FrameHeader& frame, const DeblockGrid& 
     const int mode_type =
         (ref > kRefIntra && mode != kModeGlobalMv && mode != kModeGlobalGlobalMv) ? 1 : 0;
     const int n_shift = level >> 5;
+    /* The deltas are signed, so the specification's shift-by-n_shift is
+     * multiplication: left shifting a negative value is undefined in C++. */
+    const int delta_scale = 1 << n_shift;
     if (ref <= kRefIntra) {
-      level += frame.loop_filter.ref_deltas[0] << n_shift;
+      level += frame.loop_filter.ref_deltas[0] * delta_scale;
     } else {
-      level += (frame.loop_filter.ref_deltas[ref] << n_shift) +
-               (frame.loop_filter.mode_deltas[mode_type] << n_shift);
+      level += frame.loop_filter.ref_deltas[ref] * delta_scale +
+               frame.loop_filter.mode_deltas[mode_type] * delta_scale;
     }
     level = clip3(0, level, kMaxLoopFilter);
   }
@@ -134,8 +137,8 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
   const int ss_x = (!seq.monochrome && seq.ss_x) ? 1 : 0;
   const int ss_y = (!seq.monochrome && seq.ss_y) ? 1 : 0;
   const int planes = seq.monochrome ? 1 : 3;
-  const int mi_cols = (width + 3) >> 2;
-  const int mi_rows = (height + 3) >> 2;
+  const int mi_cols = mi_dim(width);
+  const int mi_rows = mi_dim(height);
 
   /* The loop filter process is only invoked when the frame coded a luma level
    * at all (decode_frame_wrapup step 1): a frame that codes 0 and 0 is left

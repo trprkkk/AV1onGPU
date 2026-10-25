@@ -33,10 +33,16 @@
  *     then the deblock arrays
  *     int32 n_cdef, then the cdef array
  *     int32 n_upscale, then the upscale array
+ *     int32 n_restoration, then that array   (the loop restoration jobs)
  *     int32 n_grain_chroma, then that array   (the chroma planes' jobs)
  *     int32 n_grain_luma, then that array     (the luma plane's jobs)
  *     coefficients[], residual[], noise[], then the palette map
  *     palette_map[]           (palette_count bytes)
+ *
+ * Version 7 added the loop restoration jobs (7.17). Restoration reads two
+ * pictures - the CDEF output and the deblocked one before it - and writes the
+ * restored frame, so a plan carries the job list and the replay keeps both
+ * snapshots; without it a stream that codes restoration cannot be replayed.
  *
  * Version 5 replaced the film grain noise template with the finished noise
  * image (`noise[]`, indexed per plane by noise_off/noise_stride) and the 256

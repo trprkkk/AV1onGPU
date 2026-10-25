@@ -43,7 +43,7 @@ driver at run time.
 | `AV1GPU_ENABLE_OPENMP` | `ON` | thread the CPU reference backend |
 | `AV1GPU_BUILD_TOOLS` | `ON` | the tools below |
 | `AV1GPU_BUILD_TESTS` | `ON` | unit + pipeline tests |
-| `AV1GPU_SANITIZE` | `OFF` | ASan/UBSan build |
+| `AV1GPU_SANITIZE` | `OFF` | ASan/UBSan build — `docs/ACCURACY.md` has the sweep |
 
 ## Tools
 
@@ -124,13 +124,18 @@ tests/                        kernel unit tests, pipeline tests, OpenCL parity
 | `ivf.{hpp,cpp}` | the IVF container used by the AV1 test tools |
 | `headers.{hpp,cpp}` | sequence header and frame header syntax |
 | `range_decoder.{hpp,cpp}` | the boolean range decoder: symbols, `L(n)`, `ns(n)`, overrun handling |
+| `cdf.{hpp,cpp}`, `cdf_tables*.hpp` | the adaptive CDFs and the specification's default tables |
+| `tile_decoder.cpp` | the tile payload: partitions, modes, motion vectors, coefficients, filter and restoration units |
+| `dequant.hpp`, `reconstruct.hpp`, `warp.hpp`, `restoration.hpp` | dequantisation, prediction and the reconstruction helpers the tile decoder calls |
 
-What parses today: the complete sequence header (profiles 0/1/2, 8/10/12 bit,
-4:2:0 / 4:2:2 / 4:4:4, operating points, timing info, all the feature flags) and
-KEY, INTRA_ONLY, INTER and SWITCH frame headers up to the byte where the
-arithmetic coded tile data starts, plus `show_existing_frame`, segmentation,
-delta Q / delta LF, the tile grid, quantiser, deblocking levels, CDEF strengths,
-reference and skip mode decisions and the transform set.
+What parses today is the whole stream: the complete sequence header (profiles
+0/1/2, 8/10/12 bit, 4:2:0 / 4:2:2 / 4:4:4, operating points, timing info, all
+the feature flags), KEY, INTRA_ONLY, INTER and SWITCH frame headers up to the
+byte where the arithmetic coded tile data starts - plus `show_existing_frame`,
+segmentation, delta Q / delta LF, the tile grid, quantiser, deblocking levels,
+CDEF strengths, the loop restoration units, reference and skip mode decisions
+and the transform set - and then the tile payload itself, which comes out as the
+`FrameSyntax` a backend consumes.
 
 Inter frames need to know what came before them - a frame that inherits its size
 from a reference (`found_ref`), that is allowed to use skip mode, or whose
@@ -141,14 +146,19 @@ pool is also what reference frame ids are checked against, and what
 `frame_refs_short_signaling` derives the five uncoded references from
 (`set_frame_refs()`, 7.8): see `docs/ACCURACY.md`.
 
-What is *refused with a message* instead of being misparsed: loop restoration
-filters.
+All of it is parsed: loop restoration (7.17) included, both the frame header's
+`restoration_params` and each unit's filter, though the filter that is *applied*
+lives in the backends rather than the parser (see `docs/ROADMAP.md`).
 
 The tile payload is coded with AV1's boolean range decoder, which
 `src/frontend/range_decoder.hpp` implements: adaptive Q15 symbol CDFs, boolean
 and equiprobable bits, `L(n)` and `ns(n)`, and the padded end-of-tile tail. It is
-bit identical to dav1d's `msac`; the specification's default CDF tables and the
-tile syntax on top of it are the next milestone (`docs/ROADMAP.md`).
+bit identical to dav1d's `msac`, and the default CDF tables on top of it are
+checked against dav1d's own (`tests/data/tile_trace.hpp` replays the first 480
+range coder events dav1d logged while decoding a key frame). `tile_decoder.cpp`
+then walks the partition tree of every superblock, so what comes out is the
+syntax of a whole frame - which is why `av1gpu_decode` decodes the fixtures
+without a second parser.
 
 The parser is checked against a real stream (`tests/data/svt_av1_320x240.ivf`,
 encoded with SVT-AV1) whose fields were cross-checked with FFmpeg's
@@ -170,16 +180,25 @@ sequence header
   key frame, 320x240, base_q_idx 51, 1 tile(s) (1x1)
   deblock 2/2 luma, 1/1 chroma, sharpness 0; cdef damping 3, y strengths 0
   delta Q per superblock (res 0)
-  tile data: 15466 bytes at offset 11; tile syntax not implemented yet
+  tile data: 15466 bytes at offset 11 (320x240 at 0,0)
+  tile decoded: 306 block(s), 1075 transform block(s), 64301 coefficient(s), 15466 of 15466 bytes used
+  first block: 32x32 at mi (0,0), partition 0, skip 0, modes 10/10, transform 32x32, q 53
 temporal unit 1 (491 bytes)
   ...
-  inter frame (not shown), 320x240 from reference, base_q_idx 138, 1 tile(s) (1x1)
+  inter frame (not shown), 320x240, base_q_idx 138, 1 tile(s) (1x1)
   references: last=slot 2 (hint 0) ... intra=slot 2 (hint 0)
   refresh flags 0x01, primary ref 0, order hint 4, not error resilient
-  compound reference select, skip mode off, ref frame mvs
+  compound reference select, skip mode off, ref frame mvs, free integer motion, low precision
+  global motion: none
   deblock 7/7 luma, 3/3 chroma, sharpness 0; cdef damping 5, y strengths 62
-  tile data: 147 bytes at offset 16; tile syntax not implemented yet
+  tile data: 147 bytes at offset 16 (320x240 at 0,0)
+  tile decoded: 87 block(s), 261 transform block(s), 22 coefficient(s), 147 of 147 bytes used
+  first block: 64x64 at mi (0,0), partition 0, skip 1, modes 0/0, transform 64x64, q 138
 ```
+
+The bytes the tile decoder consumed are part of the output because a tile that
+ends before its last byte is a decoder that stopped early: the counts above are
+how `docs/ACCURACY.md` records what a fixture actually codes.
 
 `tests/test_frontend.cpp` writes the same syntax with a small bit writer and
 checks it field by field, including the error paths. The sequence header parser
@@ -230,8 +249,8 @@ cd build && ctest --output-on-failure
   or `av1gpu_decode --dump-plans` (a real stream) writes the real decode plans,
   the test replays every job of every wave through the actual OpenCL kernels in
   the order the backend submits them (waves, then deblocking
-  vertical/horizontal, CDEF, grain), and the whole frame has to match the CPU
-  reference decode bit for bit. It exercises job arrays, prefix tables, launch
+  vertical/horizontal, CDEF, upscale, loop restoration, grain), and the whole
+  frame has to match the CPU reference decode bit for bit. It exercises job arrays, prefix tables, launch
   counts, reference slots, palette maps, OBMC candidates and loop filter
   scheduling together — the things the per-kernel check cannot see. Also needs
   `pyopencl`. Before it runs it checks every job against the pool it indexes, so
@@ -278,9 +297,11 @@ coded blocks (`tests/data/palette_sc.ivf`), inter/intra compound
 skip mode, which the `lw_t2`/`lw_t3`/`inter_intra` fixtures code thousands of
 times, and segmentation (`tests/data/seg_altq.ivf`, a different quantiser per
 segment), superres, where a frame is coded narrower than it is displayed and
-upscaled after CDEF (`tests/data/superres.ivf`), and film grain, whose generator,
-auto-regressive filter and stripe blending follow 7.18.3 sample for sample
-(`tests/data/grain.ivf`).
+upscaled after CDEF (`tests/data/superres.ivf`), loop restoration, both filters
+and the per unit switchable form, which reads the two pictures 7.17 keeps
+(`tests/data/lr.ivf`, and the same clip at 4:4:4 and 4:2:2 as `lr_444` /
+`lr_422`), and film grain, whose generator, auto-regressive filter
+and stripe blending follow 7.18.3 sample for sample (`tests/data/grain.ivf`).
 `av1gpu::synthetic_encode` is a small closed loop test encoder that produces
 valid syntax from a generated clip and does not need any of those.
 

@@ -97,7 +97,14 @@ void Frame::allocate(int w, int h, int bd, int sx, int sy) {
     const int pw = (p == 0) ? w : (sx ? (w + 1) / 2 : w);
     const int ph = (p == 0) ? h : (sy ? (h + 1) / 2 : h);
     stride[p] = (pw + 31) & ~31;
-    storage[p].assign(static_cast<size_t>(stride[p]) * ph, 0);
+    /* A few rows of border: the loop filters read up to three samples past an
+     * edge, and an edge can sit on the last row band of a plane whose size is
+     * not a multiple of four (`av1g_deblock_px` reads q3). A decoded picture
+     * lives in the plan's padded buffer anyway; this is what keeps a frame that
+     * is allocated on its own - the synthetic encoder's, a test's - inside its
+     * storage. */
+    const int rows = (ph + 7) & ~7;
+    storage[p].assign(static_cast<size_t>(stride[p]) * rows, 0);
   }
 }
 

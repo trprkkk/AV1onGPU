@@ -101,6 +101,13 @@ void apply_post_filters_host(Frame* frame, const FrameSyntax& syntax, bool grain
     }
   }
 
+  /* ---- loop restoration ------------------------------------------------ */
+  /* Nothing to do here: this helper reconstructs a frame the way the *synthetic
+   * encoder* codes it, and synthetic_encode never writes restoration_params, so
+   * no stream it produces has a restoration unit. A decoded frame's restoration
+   * runs in the backends (7.17), from the jobs the engine builds - it needs two
+   * pictures this helper does not keep, the pre-CDEF one and the CDEF output. */
+
   if (grain) apply_grain_host(frame, syntax);
 }
 

@@ -354,6 +354,63 @@ struct CdefBlock {
   int dir = 0;
 };
 
+/* FrameRestorationType (5.9.20). */
+enum RestorationType {
+  kRestoreNone = 0,
+  kRestoreSwitchable = 1,
+  kRestoreWiener = 2,
+  kRestoreSgrproj = 3,
+};
+
+/* The constants of the loop restoration process (7.17). They are here rather
+ * than in the kernels because the front end needs the coefficient bounds while
+ * it decodes the unit syntax. */
+constexpr int kWienerTaps = 3;              /* coded coefficients per pass  */
+constexpr int kSgrParamsBits = 4;           /* Sgr_Params index bits        */
+constexpr int kSgrProjPrjBits = 7;          /* SGRPROJ_PRJ_BITS             */
+constexpr int kSgrProjRstBits = 4;          /* SGRPROJ_RST_BITS             */
+constexpr int kSgrProjMtableBits = 20;      /* SGRPROJ_MTABLE_BITS          */
+constexpr int kSgrProjSgrBits = 8;          /* SGRPROJ_SGR_BITS             */
+constexpr int kSgrProjRecipBits = 12;       /* SGRPROJ_RECIP_BITS           */
+constexpr int kSgrProjSubexpK = 4;          /* the subexp k of the weights  */
+/* Wiener_Taps_Min / Max / K: the bounds and the subexponential k of each coded
+ * coefficient. */
+constexpr int kWienerTapsMin[3] = {-5, -23, -17};
+constexpr int kWienerTapsMax[3] = {10, 8, 46};
+constexpr int kWienerTapsK[3] = {1, 2, 3};
+/* Sgrproj_Xqd_Min / Max: the bounds of the two projection weights. */
+constexpr int kSgrXqdMin[2] = {-96, -32};
+constexpr int kSgrXqdMax[2] = {31, 95};
+/* Wiener_Taps_Mid / Sgrproj_Xqd_Mid: what a tile's unit syntax predicts from
+ * before it has read one. */
+constexpr int kWienerTapsMid[3] = {3, -7, 15};
+constexpr int kSgrXqdMid[2] = {-32, 31};
+/* Sgr_Params: (radius, epsilon) per pass, sixteen sets. */
+constexpr int kSgrParams[16][4] = {
+    {2, 12, 1, 4},  {2, 15, 1, 6},   {2, 18, 1, 8},   {2, 21, 1, 9},
+    {2, 24, 1, 10}, {2, 29, 1, 11},  {2, 36, 1, 12},  {2, 45, 1, 13},
+    {2, 56, 1, 14}, {2, 68, 1, 15},  {0, 0, 1, 5},    {0, 0, 1, 8},
+    {0, 0, 1, 11},  {0, 0, 1, 14},   {2, 30, 0, 0},   {2, 75, 0, 0},
+};
+
+/* One loop restoration unit (5.11.46): the filter it selected and the
+ * parameters it coded. The units are stored densely, one entry per unit of the
+ * plane, so the process can index them the way the specification's
+ * LrType[plane][unitRow][unitCol] is indexed.
+ *
+ * `wiener` holds the coefficients as the syntax codes them - three per pass,
+ * the vertical pass first - and `sgr_set`, `sgr_xqd` the self guided table
+ * index and its two projection weights. */
+struct RestorationUnit {
+  /* 0 none, 1 Wiener, 2 self guided. A frame whose FrameRestorationType is
+   * RESTORE_SWITCHABLE stores the unit's own choice here; one that codes a
+   * single filter stores that filter or none. */
+  int type = 0;
+  int wiener[2][3] = {{0, 0, 0}, {0, 0, 0}};
+  int sgr_set = 0;
+  int sgr_xqd[2] = {0, 0};
+};
+
 /* film_grain_params() (5.9.30): the parameters of the film grain synthesis
  * filter (7.18.3). Everything the filter needs is here, so a frame carries its
  * own copy - and a reference slot keeps the one its picture was decoded with,
@@ -442,6 +499,14 @@ struct FrameSyntax {
 
   std::vector<DeblockEdge> deblock;
   std::vector<CdefBlock> cdef;
+
+  /* Loop restoration (7.17). `restoration_type` is the frame's
+   * FrameRestorationType per plane, and the units of each plane are stored row
+   * major with `restoration_unit_cols[plane]` entries per row. */
+  int restoration_type[3] = {0, 0, 0};
+  int restoration_unit_log2[3] = {0, 0, 0};
+  int restoration_unit_cols[3] = {0, 0, 0};
+  std::vector<RestorationUnit> restoration[3];
 
   /* Film grain: `grain.apply` is the syntax's apply_grain. */
   FilmGrainParams grain;

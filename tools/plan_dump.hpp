@@ -53,7 +53,11 @@ inline bool write_plan(const std::string& path, const av1gpu::internal::FramePla
    * 5: the film grain noise image and its two passes replace the noise
    * template, 4 added the display geometry and the upscale jobs, 3 tmp_size, 2
    * the palette colour map */
-  const int32_t version = 6;
+  /* 7: the loop restoration jobs (7.17), so a stream that codes them can be
+   *    replayed through the device kernels at all
+   * 8: an inter job carries its plane, which is what tells a 4:4:4 chroma job
+   *    that its difference weighted mask still comes from the luma samples */
+  const int32_t version = 8;
   const int32_t geom[5] = {g.frame.width, g.frame.height, g.frame.bit_depth,
                            g.frame.ss_x, g.frame.ss_y};
   bool ok = write_all(file, magic, sizeof(magic)) &&
@@ -101,6 +105,7 @@ inline bool write_plan(const std::string& path, const av1gpu::internal::FramePla
   }
   ok = ok && write_vector(file, plan.deblock_v) && write_vector(file, plan.deblock_h) &&
        write_vector(file, plan.cdef) && write_vector(file, plan.upscale) &&
+       write_vector(file, plan.restoration) &&
        write_vector(file, plan.grain_chroma) && write_vector(file, plan.grain_luma);
 
   if (ok && !plan.coefficients.empty())

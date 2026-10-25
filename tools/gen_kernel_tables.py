@@ -133,6 +133,24 @@ for i in range(0, 128, 16):
 w('};')
 w('')
 
+# ---- Sgr_Params -----------------------------------------------------------
+m = re.search(r'Sgr_Params\[ \(1 << SGRPROJ_PARAMS_BITS\) \]\[ 4 \] = \{(.*?)\n~~~~~',
+              text, re.S)
+if not m:
+    raise SystemExit('Sgr_Params not found')
+rows = re.findall(r'\{\s*(-?\d[^{}]*)\}', m.group(1))
+sgr = [[int(v) for v in re.findall(r'-?\d+', row)] for row in rows]
+if len(sgr) != 16 or any(len(row) != 4 for row in sgr):
+    raise SystemExit('Sgr_Params is not 16 sets of 4 values')
+w('/* Sgr_Params (7.17.3): the radius and eps of the self guided filter\'s two box')
+w(' * filters, per coded set. A radius of 0 means the pass is skipped - the input')
+w(' * is used instead - which is why the last sets code { 2, 30, 0, 0 }. */')
+w('AV1G_TBL int av1g_tbl_sgr_params[16][4] = {')
+for start in range(0, 16, 4):
+    w('    ' + ' '.join('{%d, %d, %d, %d},' % tuple(row) for row in sgr[start:start + 4]))
+w('};')
+w('')
+
 # ---- gaussian sequence ----------------------------------------------------
 gauss = numbers_after(r'Gaussian_Sequence\[ 2048 \] = \{(.*?)\n~~~~~', 2048)
 w('/* Gaussian_Sequence (10.5): the white noise list the film grain generator')

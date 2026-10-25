@@ -138,6 +138,18 @@ void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const RefPoo
     for (int i = 0; i < count && i < 8; ++i) std::printf(" %d", hdr.cdef.y_strength[i]);
   }
   std::printf("\n");
+  if (hdr.restoration_type[0] || hdr.restoration_type[1] || hdr.restoration_type[2]) {
+    /* the frame header's restoration_params: the type each plane codes (a frame
+     * that codes it per unit is SWITCHABLE), and the unit size the units are
+     * laid out on. */
+    static const char* const kNames[4] = {"none", "switchable", "wiener", "sgrproj"};
+    std::printf("  restoration %s/%s/%s, unit %d/%d/%d",
+                kNames[hdr.restoration_type[0] & 3], kNames[hdr.restoration_type[1] & 3],
+                kNames[hdr.restoration_type[2] & 3], 1 << hdr.restoration_unit_log2[0],
+                1 << hdr.restoration_unit_log2[1], 1 << hdr.restoration_unit_log2[2]);
+    if (hdr.superres) std::printf(", coded %d wide", hdr.width);
+    std::printf("\n");
+  }
   if (hdr.segmentation_enabled) {
     std::printf("  segmentation on");
     const SegmentationParams& seg = hdr.segmentation;
@@ -187,6 +199,23 @@ void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const RefPoo
                   " %zu of %zu bytes used\n",
                   decoded.blocks.size(), decoded.transform_blocks, decoded.coefficients,
                   decoded.bytes_used, tile.size);
+      /* A frame header only says which type a plane codes - a plane that codes
+       * one filter still writes a flag per unit, and a switchable plane writes
+       * the type of every unit - so count what the units actually say. */
+      if (hdr.restoration_type[0] || hdr.restoration_type[1] || hdr.restoration_type[2]) {
+        std::printf("  restoration units:");
+        for (int plane = 0; plane < 3; ++plane) {
+          int wiener = 0, sgr = 0, none = 0;
+          for (const av1gpu::RestorationUnit& unit : decoded.restoration[plane]) {
+            if (unit.type == av1gpu::kRestoreWiener) ++wiener;
+            else if (unit.type == av1gpu::kRestoreSgrproj) ++sgr;
+            else ++none;
+          }
+          std::printf(" %s %dW/%dS/%d none", plane == 0 ? "Y" : plane == 1 ? "U" : "V", wiener,
+                      sgr, none);
+        }
+        std::printf("\n");
+      }
       /* the tile just produced the frame's motion vector grid, which the frames
        * that refer to it will project from, and the probability tables a later
        * frame may inherit */

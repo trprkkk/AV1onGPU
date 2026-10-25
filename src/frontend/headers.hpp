@@ -20,10 +20,6 @@
  * stream has decoded before, so `parse_frame_header` takes the `RefPool` the
  * caller maintains and `refresh_ref_pool()` applies each frame's refresh flags.
  *
- * Deliberately rejected with a clear message (never silently misparsed)
- *   - the restoration filter parameters (the decoder does not implement the
- *     loop restoration process at all).
- *
  * The field order and the derived values follow the AV1 specification, and a
  * value derived from a reference frame (loop filter deltas, segmentation data,
  * film grain parameters, the frame size) is taken from the slot the header
@@ -453,8 +449,13 @@ struct FrameHeader {
 
   LoopFilter loop_filter;
   CdefParams cdef;
+  /* Loop restoration (5.9.20). `restoration_type` is FrameRestorationType -
+   * 0 none, 1 switchable, 2 Wiener, 3 self guided - and
+   * `restoration_unit_log2[plane]` is the base two logarithm of
+   * LoopRestorationSize[plane], because the process only ever needs it as a
+   * shift. Both are zero when the frame does not use loop restoration. */
   int restoration_type[3] = {0, 0, 0};
-  int restoration_unit_size[2] = {0, 0};
+  int restoration_unit_log2[3] = {0, 0, 0};
 
   bool tx_mode_select = false;
   bool reduced_tx_set = false;
@@ -512,6 +513,14 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
  * Unsupported rather than guessed. */
 ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, size_t size,
                                FrameHeader* out, std::string* error, RefPool* refs = nullptr);
+
+/* 7.4.4: the 4x4 grid a tile codes on is the frame size rounded up to a whole
+ * *eight* samples, not to a whole four: `MiCols = 2 * ((FrameWidth + 7) >> 3)`.
+ * The two differ whenever a dimension is 1 to 4 samples past a multiple of
+ * eight, and a frame 130 samples wide has 34 mi columns (136 samples) - rounding
+ * to four instead desynchronises the block loop of the last superblock column,
+ * which then decodes as garbage while every multiple of eight size stays exact. */
+inline int mi_dim(int size) { return 2 * ((size + 7) >> 3); }
 
 /* set_frame_refs(): fills `h->ref_frame_idx` from just LAST_FRAME and
  * GOLDEN_FRAME, the way frame_refs_short_signaling codes them (7.8). Exposed
