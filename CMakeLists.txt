@@ -155,12 +155,16 @@ if(AV1GPU_BUILD_TESTS)
   # upscaling process and reference scaling both run) and grain the only one
   # that carries film grain parameters (so the generator, the AR filter and the
   # stripe blending run) and grain_inherit the only one where the grain
-  # parameters are re-used from a reference (update_grain = 0); every frame of
-  # all nine is bit exact.
+  # parameters are re-used from a reference (update_grain = 0) and
+  # aom_10bit_320x240 the only one deeper than 8 bit; every frame of all ten is
+  # bit exact.
   if(TARGET av1gpu_decode)
     foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra seg_altq superres grain
-                 grain_inherit)
+                 grain_inherit aom_10bit_320x240)
       set(frames 30)
+      # deeper than 8 bit: the hashes are over the samples themselves, so the
+      # decoder has to write them at full precision
+      set(stream_flags "")
       if(stream STREQUAL "palette_sc")
         set(frames 10)
       elseif(stream STREQUAL "intrabc")
@@ -169,9 +173,12 @@ if(AV1GPU_BUILD_TESTS)
         set(frames 110)
       elseif(stream STREQUAL "grain_inherit")
         set(frames 10)
+      elseif(stream STREQUAL "aom_10bit_320x240")
+        set(frames 12)
+        set(stream_flags --yuv16)
       endif()
       add_test(NAME stream_${stream}
-               COMMAND av1gpu_decode --backend cpu --frames ${frames}
+               COMMAND av1gpu_decode --backend cpu --frames ${frames} ${stream_flags}
                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/${stream}.ivf
                        --hash-check ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/${stream}.hash)
     endforeach()
@@ -231,11 +238,18 @@ if(AV1GPU_BUILD_TESTS)
     #                   the luma ones
     #   grain_inherit   the only one where a frame re-uses a reference's grain
     #                   parameters instead of coding them
+    #   aom_10bit_320x240 the only one deeper than 8 bit, so the only one where
+    #                   the deblocking thresholds' 1 << (BitDepth - 8) scaling
+    #                   and the 10 bit reconstruction run at all - and its first
+    #                   frame codes a zero luma level with the reference deltas
+    #                   enabled, so it is also the only one that catches a
+    #                   decoder filtering a frame the loop filter never runs on
     #   svt_av1_320x240 a different encoder, so a different mix of tools
     # All of it on a machine with no GPU at all.
     if(TARGET av1gpu_decode)
       foreach(stream palette_sc intrabc lw_t2 lw_t3 inter_intra seg_altq
-                     superres grain grain_inherit svt_av1_320x240)
+                     superres grain grain_inherit aom_10bit_320x240
+                     svt_av1_320x240)
         set(frames 30)
         if(stream STREQUAL "palette_sc")
           set(frames 10)
@@ -247,6 +261,8 @@ if(AV1GPU_BUILD_TESTS)
           set(frames 6)
         elseif(stream STREQUAL "grain_inherit")
           set(frames 10)
+        elseif(stream STREQUAL "aom_10bit_320x240")
+          set(frames 12)
         endif()
         add_test(NAME opencl_${stream}
                  COMMAND ${AV1GPU_TEST_PY}

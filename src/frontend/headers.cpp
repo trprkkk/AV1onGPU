@@ -535,10 +535,10 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
   if (hdrpos_enabled()) {
     std::fprintf(stderr,
                  "HDRPOS seq max_frame_width=%zu max_frame_height=%zu enable_superres=%zu "
-                 "width_bits=%d film_grain=%zu mono=%d ss_x=%d ss_y=%d\n",
+                 "width_bits=%d film_grain=%zu mono=%d ss_x=%d ss_y=%d bitdepth=%d\n",
                  pos_max_frame_width, pos_max_frame_width + static_cast<size_t>(seq.width_n_bits),
                  pos_enable_superres, seq.width_n_bits, pos_film_grain_present,
-                 seq.monochrome ? 1 : 0, seq.ss_x, seq.ss_y);
+                 seq.monochrome ? 1 : 0, seq.ss_x, seq.ss_y, seq.bit_depth);
   }
   return ParseStatus::Ok;
 }
@@ -1429,7 +1429,8 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
                  "HDRPOS frame type=%d show=%d override=%d found=%d size_w=%zu "
                  "use_superres=%zu intrabc=%zu header_bits=%zu tile_data_offset=%zu "
                  "upscaled=%d coded=%d superres=%d denom=%d "
-                 "ref0=%d ref1=%d ref2=%d ref3=%d ref4=%d ref5=%d ref6=%d\n",
+                 "ref0=%d ref1=%d ref2=%d ref3=%d ref4=%d ref5=%d ref6=%d "
+                 "lf_y0=%d lf_y1=%d lf_u=%d lf_v=%d sharp=%d deltas=%d\n",
                  static_cast<int>(h.type), h.show_frame ? 1 : 0, h.frame_size_override ? 1 : 0,
                  h.size_from_reference ? 1 : 0, pos_frame_size_width, pos_use_superres,
                  pos_allow_intrabc, header_bits, h.tile_data_offset,
@@ -1440,7 +1441,10 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
                  h.type == FrameType::Inter ? h.ref_frame_idx[3] : -1,
                  h.type == FrameType::Inter ? h.ref_frame_idx[4] : -1,
                  h.type == FrameType::Inter ? h.ref_frame_idx[5] : -1,
-                 h.type == FrameType::Inter ? h.ref_frame_idx[6] : -1);
+                 h.type == FrameType::Inter ? h.ref_frame_idx[6] : -1,
+                 h.loop_filter.level_y[0], h.loop_filter.level_y[1], h.loop_filter.level_u,
+                 h.loop_filter.level_v, h.loop_filter.sharpness,
+                 h.loop_filter.mode_ref_delta_enabled ? 1 : 0);
   }
   return ParseStatus::Ok;
 }

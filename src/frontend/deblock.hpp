@@ -137,6 +137,18 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
   const int mi_cols = (width + 3) >> 2;
   const int mi_rows = (height + 3) >> 2;
 
+  /* The loop filter process is only invoked when the frame coded a luma level
+   * at all (decode_frame_wrapup step 1): a frame that codes 0 and 0 is left
+   * unfiltered even though the per-reference and per-mode deltas would scale a
+   * level of 0 into something the filter would act on. libaom leaves the
+   * level at 0 and dav1d skips the whole pass, so a stream with deltas enabled
+   * and no coded level is exactly where this shows up. */
+  out->sharpness = frame.loop_filter.sharpness;
+  if (frame.loop_filter.level_y[0] == 0 && frame.loop_filter.level_y[1] == 0) {
+    out->deblock.clear();
+    return true;
+  }
+
   DeblockGrid grid;
   grid.mi_cols = mi_cols;
   grid.mi_rows = mi_rows;

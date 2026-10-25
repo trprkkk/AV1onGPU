@@ -289,6 +289,31 @@ frame's LAST reference) instead of assuming one; `--inherit-slot` overrides it.
 `stream_grain_inherit` checks the hashes. Every sample of every frame is equal to
 dav1d's.
 
+`aom_10bit_320x240.ivf` is the only fixture deeper than 8 bit: twelve frames of
+a 320x240 ramp at 10 bit 4:2:0, 681 bytes, encoded with libaom through ffmpeg's
+`libaom-av1` at `-crf 40 -cpu-used 8 -lag-in-frames 0`. It is there because the
+10 bit paths are not the 8 bit ones: the deblocking thresholds scale with
+`1 << (BitDepth - 8)`, the reconstruction has two more bits of headroom and the
+grain range is wider. Its first frame is what makes it worth keeping: libaom
+codes a *zero* loop filter level there while still enabling the per-reference
+deltas, and `decode_frame_wrapup` only runs the loop filter when a level was
+coded, so a decoder that applies the deltas anyway filters an edge the reference
+decoder leaves alone (a few thousand samples, off by one or two). The clip is
+generated, so the stream can be rebuilt from nothing:
+
+```
+python3 tests/data/make_aom10.py tests/data/aom_10bit_320x240.ivf
+```
+
+The script writes the 10 bit clip, encodes it with the ffmpeg that
+`imageio-ffmpeg` installs (`--ffmpeg` selects another), and then refuses to
+finish unless the stream still codes a zero luma level with the deltas on - the
+property the fixture exists for. `aom_10bit_320x240.hash` holds the per frame
+hashes of the *samples*: `stream_aom_10bit_320x240` decodes with `--yuv16` and
+`--hash-check`, and `opencl_aom_10bit_320x240` replays the same plans through the
+device kernels. Every sample of every frame is equal to dav1d's, whose yuv muxer
+writes 16 bit little endian for a stream this deep.
+
 `svt_av1_320x240.ivf` is a real AV1 stream, not a hand written header: six frames
 of a 320x240 gradient at 8 bit 4:2:0, encoded with SVT-AV1 (crf 40, preset 10)
 and muxed into IVF. The front-end tests parse it end to end, so the parser is

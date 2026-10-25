@@ -28,6 +28,19 @@ not disagreements between backends.
   a vertical and a horizontal edge cross: running both at once is a data race,
   and it made `test_pipeline` fail roughly one run in five until the two passes
   were separated.
+* **When the loop filter runs at all.** `decode_frame_wrapup` only invokes it
+  when the frame coded `loop_filter_level[0]` or `[1]` non-zero. A frame that
+  codes 0 and 0 is left unfiltered even though the per-reference and per-mode
+  deltas are enabled and would scale a level of 0 into something a filter would
+  act on, so a decoder that applies the deltas unconditionally filters edges the
+  reference decoders leave alone. It is a small error - a few thousand samples
+  off by one or two - and it only appears on streams where the encoder codes no
+  level at all, which is why it survived until a 10 bit libaom clip was compared:
+  `tests/data/aom_10bit_320x240.ivf`'s first frame is exactly that case and the
+  fixture is checked sample for sample. The thresholds themselves scale with
+  `1 << (BitDepth - 8)` (7.14.6), and this is the only fixture deeper than 8 bit
+  that exercises that scaling, the 10 bit reconstruction and the 16 bit sample
+  path at once.
 * **Film grain synthesis.** The generator, the auto-regressive filter and the
   overlap blending are the specification's, sample for sample, including the
   chroma coupling that reads the luma grain (7.18.3); the blend is one multiply,
