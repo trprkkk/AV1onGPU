@@ -2746,8 +2746,13 @@ class TileParser {
     if (!block.is_inter) {
       if (!frame_.coded_lossless && size > kBlock4x4 && frame_.tx_mode_select) {
         const int cls = tx_square_class(tx);
-        const int depth_ctx =
-            (above_tx_lw_[col] >= tx.lw ? 1 : 0) + (left_tx_lh_[row] >= tx.lh ? 1 : 0);
+        /* An unavailable neighbour contributes zero, and the comparison is in
+         * pixels: a 4 wide transform must still lose against "no neighbour".
+         * The side is kept in 4x4 units, where a 4 pixel side is 0, so absence
+         * has to be -1 rather than 0 to compare the same way. */
+        const int above_lw = row > tile_row_start_ ? above_tx_lw_[col] : -1;
+        const int left_lh = col > tile_col_start_ ? left_tx_lh_[row] : -1;
+        const int depth_ctx = (above_lw >= tx.lw ? 1 : 0) + (left_lh >= tx.lh ? 1 : 0);
         tx_size_row = cls;
         tx_depth_context = depth_ctx;
         const int depth = static_cast<int>(

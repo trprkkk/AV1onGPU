@@ -524,7 +524,7 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
             const int end = std::min(st.mi_cols, block.mi_col + bw4);
             while (count < limit && x4 < end) {
               const TileBlock* cand = mi_block(block.mi_row - 1, x4 | 1);
-              const int step4 = cand ? clip3(2, 16, block_width4(cand->size)) : 1;
+              const int step4 = cand ? clip3(2, block_width4(cand->size), 16) : 1;
               if (cand && cand->is_inter) {
                 ++count;
                 ObmcCandidate c;
@@ -554,7 +554,7 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
             const int end = std::min(st.mi_rows, block.mi_row + bh4);
             while (count < limit && y4 < end) {
               const TileBlock* cand = mi_block(y4 | 1, block.mi_col - 1);
-              const int step4 = cand ? clip3(2, 16, block_height4(cand->size)) : 1;
+              const int step4 = cand ? clip3(2, block_height4(cand->size), 16) : 1;
               if (cand && cand->is_inter) {
                 ++count;
                 ObmcCandidate c;

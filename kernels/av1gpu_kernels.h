@@ -174,11 +174,12 @@ typedef struct {
   int luma_stride;
   int luma_x, luma_y; /* patch origin in the luma plane                   */
   int luma_ref_w, luma_ref_h; /* visible luma reference size              */
-  /* OBMC: at most two strips from above and two from the left (the
-   * specification caps the scan at four each, but a block is at most 16 mi
-   * wide, so a strip is at least 2 mi wide and two of each fit). */
+  /* OBMC: up to four strips from above and four from the left. The scan takes
+   * at most min(4, log2(width)) neighbours on the top edge and the same on the
+   * left, and each strip is at least two 4x4 units wide, so a 32x32 or larger
+   * block can fill all eight slots. */
   int obmc_count;
-  Av1gObmcCandidate obmc[4];
+  Av1gObmcCandidate obmc[8];
   /* Global warped motion (7.11.3.5): a reference predicted through an affine
    * model instead of its motion vector. `warp[refList]` says whether this
    * reference is warped; `warp_params` is the specification's warp matrix at
