@@ -267,8 +267,15 @@ int get_relative_dist(const SequenceHeader& seq, int a, int b);
  * resolve inter frame sizes and skip-mode decisions. */
 struct RefSlot {
   bool valid = false;
+  /* The coded size, i.e. before superres upscales it, which is what
+   * frame_size_with_refs() copies (RefUpscaledWidth). */
+  int upscaled_width = 0;
   int width = 0;
   int height = 0;
+  /* What the frame asks the display to show. A frame that inherits its size
+   * from a reference inherits these too. */
+  int render_width = 0;
+  int render_height = 0;
   int order_hint = 0;
   /* The frame id this slot was stored with, when the sequence carries frame
    * ids (7.4.1's RefFrameId). -1 for a slot stored by a sequence without them,
@@ -333,8 +340,9 @@ struct FrameHeader {
   int frame_presentation_delay = 0;
 
   /* Inter frame syntax. `ref_frame_idx` is resolved through the reference pool;
-   * `size_from_reference` is set when the frame inherits its size from
-   * reference frame 0 instead of coding width/height. */
+   * `size_from_reference` is set when the frame took its size, render size and
+   * superres decision from one of its references through found_ref instead of
+   * coding them (frame_size_with_refs). */
   bool size_from_reference = false;
   /* frame_refs_short_signaling codes only these two slots and lets
    * set_frame_refs() derive the rest; both stay -1 when the frame codes its

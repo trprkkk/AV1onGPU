@@ -271,8 +271,11 @@ void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
     if (frame.refresh_frame_flags & (1 << i)) {
       RefSlot& slot = pool->slots[i];
       slot.valid = true;
+      slot.upscaled_width = frame.frame_width;
       slot.width = frame.width;
       slot.height = frame.height;
+      slot.render_width = frame.render_width;
+      slot.render_height = frame.render_height;
       slot.order_hint = frame.order_hint;
       slot.frame_id = frame.frame_id_present ? frame.frame_id : -1;
       slot.type = frame.type;
@@ -850,32 +853,71 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
         }
       }
     }
+    /* 7.8 requires every reference this frame codes to name a frame the
+     * decoder holds. Saying so here, once, is what keeps a stale slot from
+     * being predicted from - the order hints below and everything the tile
+     * decoder reads depend on it. */
     for (int i = 0; i < 7; ++i) {
-      if (h.ref_frame_idx[i] >= 0) {
-        h.ref_order_hint[i] = refs->slots[h.ref_frame_idx[i]].order_hint;
+      const int slot = h.ref_frame_idx[i];
+      if (slot < 0 || slot > 7) {
+        *out = h;
+        return invalid("a reference frame index is out of range", error);
       }
+      if (!refs->slots[slot].valid) {
+        *out = h;
+        return invalid("an inter frame refers to an empty reference slot", error);
+      }
+    }
+    for (int i = 0; i < 7; ++i) {
+      h.ref_order_hint[i] = refs->slots[h.ref_frame_idx[i]].order_hint;
     }
   }
 
-  /* frame_size(): inter frames with size override off inherit the size of the
-   * reference frame they were predicted from. */
-  if (h.frame_size_override) {
-    h.frame_width = static_cast<int>(r.read(seq.width_n_bits)) + 1;
-    h.height = static_cast<int>(r.read(seq.height_n_bits)) + 1;
-  } else if (!key_or_intra) {
-    const RefSlot& slot = refs->slots[h.ref_frame_idx[0]];
-    if (!slot.valid) {
-      *out = h;
-      return invalid("inter frame refers to an empty reference slot", error);
+  /* frame_size() / frame_size_with_refs() (5.9.4, 5.9.5): an inter frame with
+   * the override on may take its geometry from a reference it names; otherwise
+   * it codes a size or, with the override off, is the sequence's maximum. */
+  bool size_from_ref = false;
+  if (!key_or_intra && h.frame_size_override && !h.error_resilient_mode) {
+    /* frame_size_with_refs(): one found_ref bit per reference, in reference
+     * order, and the first one that is set names the frame this one copies its
+     * whole geometry from - the bits after it are not coded at all. An encoder
+     * that scales a frame relative to its reference says so this way. */
+    int found = -1;
+    for (int i = 0; i < 7; ++i) {
+      if (!r.read_bit()) continue;
+      found = i;
+      break;
     }
-    h.size_from_reference = true;
-    h.frame_width = slot.width;
-    h.height = slot.height;
-  } else {
-    h.frame_width = seq.max_frame_width;
-    h.height = seq.max_frame_height;
+    if (found >= 0) {
+      const RefSlot& slot = refs->slots[h.ref_frame_idx[found]];
+      if (!slot.valid) {
+        *out = h;
+        return invalid("frame size taken from an empty reference slot", error);
+      }
+      h.size_from_reference = true;
+      h.frame_width = slot.upscaled_width;
+      h.height = slot.height;
+      h.render_width = slot.render_width;
+      h.render_height = slot.render_height;
+      size_from_ref = true;
+    }
+  }
+  if (!size_from_ref) {
+    /* frame_size(): with the override the frame codes its own size, without it
+     * the frame is the sequence's maximum size. It is *not* inherited from a
+     * reference without found_ref - a smaller reference does not make a frame
+     * smaller. */
+    if (h.frame_size_override) {
+      h.frame_width = static_cast<int>(r.read(seq.width_n_bits)) + 1;
+      h.height = static_cast<int>(r.read(seq.height_n_bits)) + 1;
+    } else {
+      h.frame_width = seq.max_frame_width;
+      h.height = seq.max_frame_height;
+    }
   }
   h.width = h.frame_width;
+  /* superres_params() is read on both paths: a frame that took its size from a
+   * reference still decides whether to scale that size down. */
   if (seq.enable_superres) {
     h.superres = r.read_bit();
     if (h.superres) {
@@ -885,13 +927,17 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
                          std::min(16, h.frame_width));
     }
   }
-  const bool have_render_size = r.read_bit();
-  if (have_render_size) {
-    h.render_width = static_cast<int>(r.read(16)) + 1;
-    h.render_height = static_cast<int>(r.read(16)) + 1;
-  } else {
-    h.render_width = h.width;
-    h.render_height = h.height;
+  /* render_size() is not coded when the size came from a reference: the render
+   * size was inherited with it. */
+  if (!size_from_ref) {
+    const bool have_render_size = r.read_bit();
+    if (have_render_size) {
+      h.render_width = static_cast<int>(r.read(16)) + 1;
+      h.render_height = static_cast<int>(r.read(16)) + 1;
+    } else {
+      h.render_width = h.width;
+      h.render_height = h.height;
+    }
   }
   /* allow_intrabc is only present on an intra frame: the specification reads
    * it inside `if (FrameIsIntra)`, and UpscaledWidth == FrameWidth rules out

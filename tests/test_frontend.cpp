@@ -656,6 +656,13 @@ struct InterHeaderSpec {
   int deltas[7] = {1, 1, 1, 1, 1, 1, 1};
   bool error_resilient = false;
   int ref_hints[8] = {0, 0, 0, 0, 0, 0, 0, 0}; /* only coded when error_resilient */
+  /* frame_size_override_flag: with it the frame codes a size - its own, or the
+   * index of the reference whose size it copies (found_ref) when it is not
+   * error resilient. */
+  bool size_override = false;
+  int found_ref = -1; /* -1: frame_size(), otherwise frame_size_with_refs() */
+  int width = 640;
+  int height = 360;
   bool reference_select = false;
 };
 
@@ -669,7 +676,7 @@ std::vector<uint8_t> write_inter_frame_header_ids(const SequenceSpec& spec,
   w.bit(false);        /* disable_cdf_update */
   w.bit(false);        /* allow_screen_content_tools */
   if (spec.frame_ids) w.bits(static_cast<uint32_t>(in.frame_id), spec.frame_id_n_bits());
-  w.bit(false);        /* frame_size_override: inherit the reference size */
+  w.bit(in.size_override);
   if (spec.order_hint) w.bits(static_cast<uint32_t>(in.order_hint), 3);
   if (!in.error_resilient) w.bits(0, 3); /* primary_ref_frame: slot 0 */
   w.bits(static_cast<uint32_t>(in.refresh_flags), 8);
@@ -690,7 +697,26 @@ std::vector<uint8_t> write_inter_frame_header_ids(const SequenceSpec& spec,
       w.bits(static_cast<uint32_t>(in.deltas[i] - 1), spec.delta_frame_id_n_bits());
     }
   }
-  w.bit(false);        /* render_and_frame_size_different */
+  /* frame_size_with_refs() is reached with the override on and error resilient
+   * off: one found_ref bit per reference, and the bits after the first one that
+   * is set are not coded. If none is set the frame codes its size as usual. */
+  const bool with_refs = in.size_override && !in.error_resilient;
+  bool inherited = false;
+  if (with_refs) {
+    for (int i = 0; i < 7; ++i) {
+      w.bit(in.found_ref == i);
+      if (in.found_ref == i) {
+        inherited = true;
+        break;
+      }
+    }
+  }
+  if (in.size_override && !inherited) {
+    w.bits(static_cast<uint32_t>(in.width - 1), 10);  /* width_n_bits */
+    w.bits(static_cast<uint32_t>(in.height - 1), 10); /* height_n_bits */
+  }
+  /* render_size() is skipped when the size came from a reference */
+  if (!inherited) w.bit(false); /* render_and_frame_size_different */
   w.bit(false);        /* allow_high_precision_mv */
   w.bit(true);         /* is_filter_switchable */
   w.bit(false);        /* is_motion_mode_switchable */
@@ -748,7 +774,10 @@ void test_inter_frame() {
   CHECK(inter_status == ParseStatus::Ok);
   CHECK(header.type == FrameType::Inter);
   CHECK_EQ(header.show_frame, true);
-  CHECK_EQ(header.size_from_reference, true);
+  /* frame_size_override is off, so the frame is the sequence's maximum size and
+   * no size bits were coded - not the reference's size (they are equal here,
+   * but that is a property of this stream, not of the syntax). */
+  CHECK_EQ(header.size_from_reference, false);
   CHECK_EQ(header.width, 640);
   CHECK_EQ(header.height, 360);
   CHECK_EQ(header.refresh_frame_flags, 1);
@@ -1203,10 +1232,141 @@ void test_short_ref_signaling() {
   for (int i = 0; i < 7; ++i) CHECK(header.ref_frame_idx[i] >= 0 && header.ref_frame_idx[i] < 8);
   CHECK_EQ(header.ref_frame_idx[kRefLast - 1], 3);
   CHECK_EQ(header.ref_frame_idx[kRefGolden - 1], 1);
-  /* the frame the derived list points at LAST is what the size is inherited
-   * from, which is why the mapping has to be right and not merely present */
-  CHECK_EQ(header.size_from_reference, true);
+  /* the derived list is what the frame size and everything after it are read
+   * against, so it has to be right and not merely present */
   CHECK_EQ(header.width, 640);
+  CHECK_EQ(header.height, 360);
+}
+
+/* frame_size_with_refs (5.9.4): a frame that codes frame_size_override may take
+ * its whole geometry from one of its references instead of coding a size. The
+ * found_ref bits come one per reference and stop at the first set one, and the
+ * size, the render size and the superres decision all follow from that frame -
+ * which is how an encoder scales a frame relative to the frame it predicts
+ * from, and why a decoder that read the bits as an explicit size would lose the
+ * bitstream from here on. */
+void test_frame_size_with_refs() {
+  std::printf("frame size with refs\n");
+  SequenceSpec spec; /* 640x360 maximum */
+  const std::vector<uint8_t> seq_bytes = write_sequence_header(spec);
+  SequenceHeader seq;
+  std::string error;
+  CHECK(parse_sequence_header(seq_bytes.data(), seq_bytes.size(), &seq, &error) ==
+        ParseStatus::Ok);
+
+  RefPool pool;
+  pool.slots[0].valid = true;
+  pool.slots[0].upscaled_width = 640;
+  pool.slots[0].width = 640;
+  pool.slots[0].height = 360;
+  pool.slots[0].render_width = 640;
+  pool.slots[0].render_height = 360;
+  /* a frame that was coded at half size and is displayed upscaled */
+  pool.slots[1].valid = true;
+  pool.slots[1].upscaled_width = 320;
+  pool.slots[1].width = 320;
+  pool.slots[1].height = 240;
+  pool.slots[1].render_width = 512;
+  pool.slots[1].render_height = 384;
+  pool.slots[1].type = FrameType::Inter;
+
+  FrameHeader header;
+  {
+    InterHeaderSpec in;
+    in.size_override = true;
+    in.found_ref = 1;
+    in.refresh_flags = 0x04;
+    for (int i = 0; i < 7; ++i) in.slots[i] = 1;
+    const std::vector<uint8_t> bytes = write_inter_frame_header_ids(spec, in);
+    const ParseStatus status =
+        parse_frame_header(seq, bytes.data(), bytes.size(), &header, &error, &pool);
+    if (status != ParseStatus::Ok) std::printf("  found_ref: %s\n", error.c_str());
+    CHECK(status == ParseStatus::Ok);
+    CHECK_EQ(header.size_from_reference, true);
+    CHECK_EQ(header.width, 320);
+    CHECK_EQ(header.height, 240);
+    /* the render size came with it, and was not coded */
+    CHECK_EQ(header.render_width, 512);
+    CHECK_EQ(header.render_height, 384);
+    /* the tile grid follows the inherited size: 320x240 with 64x64 superblocks
+     * is one tile of five by four */
+    CHECK_EQ(header.tiles.cols, 1);
+    CHECK_EQ(header.tiles.rows, 1);
+  }
+
+  /* The bits stop at the first set one: a frame that names its fifth reference
+   * and leaves the sixth alone has "found" it, not "found two". */
+  {
+    InterHeaderSpec in;
+    in.size_override = true;
+    in.found_ref = 4;
+    in.refresh_flags = 0x04;
+    for (int i = 0; i < 7; ++i) in.slots[i] = (i == 4) ? 0 : 1;
+    const std::vector<uint8_t> bytes = write_inter_frame_header_ids(spec, in);
+    const ParseStatus status =
+        parse_frame_header(seq, bytes.data(), bytes.size(), &header, &error, &pool);
+    if (status != ParseStatus::Ok) std::printf("  found_ref 4: %s\n", error.c_str());
+    CHECK(status == ParseStatus::Ok);
+    CHECK_EQ(header.size_from_reference, true);
+    CHECK_EQ(header.width, 640); /* slot 0, the full size frame */
+    CHECK_EQ(header.height, 360);
+    CHECK_EQ(header.render_height, 360);
+  }
+
+  /* No found_ref bit set at all: the frame falls through to frame_size() and
+   * codes its own size. */
+  {
+    InterHeaderSpec in;
+    in.size_override = true;
+    in.found_ref = -1;
+    in.width = 480;
+    in.height = 270;
+    in.refresh_flags = 0x04;
+    for (int i = 0; i < 7; ++i) in.slots[i] = 1;
+    const std::vector<uint8_t> bytes = write_inter_frame_header_ids(spec, in);
+    const ParseStatus status =
+        parse_frame_header(seq, bytes.data(), bytes.size(), &header, &error, &pool);
+    if (status != ParseStatus::Ok) std::printf("  explicit size: %s\n", error.c_str());
+    CHECK(status == ParseStatus::Ok);
+    CHECK_EQ(header.size_from_reference, false);
+    CHECK_EQ(header.width, 480);
+    CHECK_EQ(header.height, 270);
+    CHECK_EQ(header.render_width, 480); /* render_size() defaults to the frame */
+  }
+
+  /* An error resilient frame codes no found_ref bits even with the override on:
+   * it cannot rely on the pool it is re-stating, so it says its size outright. */
+  {
+    InterHeaderSpec in;
+    in.error_resilient = true;
+    in.size_override = true;
+    in.width = 320;
+    in.height = 240;
+    in.refresh_flags = 0x04;
+    for (int i = 0; i < 7; ++i) in.slots[i] = 1;
+    const std::vector<uint8_t> bytes = write_inter_frame_header_ids(spec, in);
+    const ParseStatus status =
+        parse_frame_header(seq, bytes.data(), bytes.size(), &header, &error, &pool);
+    if (status != ParseStatus::Ok) std::printf("  resilient size: %s\n", error.c_str());
+    CHECK(status == ParseStatus::Ok);
+    CHECK_EQ(header.size_from_reference, false);
+    CHECK_EQ(header.width, 320);
+    CHECK_EQ(header.height, 240);
+  }
+
+  /* found_ref naming a slot the pool does not hold is an error, not a size of
+   * zero that would propagate into every buffer this frame touches. */
+  {
+    InterHeaderSpec in;
+    in.size_override = true;
+    in.found_ref = 2;
+    in.refresh_flags = 0x04;
+    for (int i = 0; i < 7; ++i) in.slots[i] = 1;
+    in.slots[2] = 5; /* an empty slot */
+    const std::vector<uint8_t> bytes = write_inter_frame_header_ids(spec, in);
+    CHECK(parse_frame_header(seq, bytes.data(), bytes.size(), &header, &error, &pool) ==
+          ParseStatus::Invalid);
+  }
 }
 
 /* Segmentation is part of the header, not a reason to stop: the flags and the
@@ -1349,7 +1509,12 @@ void test_real_stream() {
           CHECK_EQ(h.height, 240);
         } else {
           seen.inters++;
-          CHECK(h.size_from_reference);
+          /* every frame of this stream is coded at the sequence's maximum size
+           * with frame_size_override off, so no frame inherits a size and no
+           * found_ref bit is coded */
+          CHECK_EQ(h.size_from_reference, false);
+          CHECK_EQ(h.width, 320);
+          CHECK_EQ(h.height, 240);
           order_hints[seen.inters] = h.order_hint;
         }
         CHECK(h.tiles.cols == 1 && h.tiles.rows == 1);
@@ -2320,6 +2485,7 @@ int main() {
   test_sequence_header();
   test_frame_header();
   test_inter_frame();
+  test_frame_size_with_refs();
   test_set_frame_refs();
   test_set_frame_refs_matches_reference();
   test_frame_ids();

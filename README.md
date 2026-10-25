@@ -132,9 +132,10 @@ delta Q / delta LF, the tile grid, quantiser, deblocking levels, CDEF strengths,
 reference and skip mode decisions and the transform set.
 
 Inter frames need to know what came before them - a frame that inherits its size
-from a reference, or that is allowed to use skip mode, depends on the frames the
-decoder has already stored - so the parser takes the `RefPool` the caller
-maintains (`refresh_ref_pool()` applies a parsed frame's refresh flags). That
+from a reference (`found_ref`), that is allowed to use skip mode, or whose
+references have to be verified, depends on the frames the decoder has already
+stored - so the parser takes the `RefPool` the caller maintains
+(`refresh_ref_pool()` applies a parsed frame's refresh flags). That
 pool is also what reference frame ids are checked against, and what
 `frame_refs_short_signaling` derives the five uncoded references from
 (`set_frame_refs()`, 7.8): see `docs/ACCURACY.md`.

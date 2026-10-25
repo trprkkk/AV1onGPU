@@ -16,8 +16,9 @@ streams and parses the complete sequence header and every frame header type -
 KEY, INTRA_ONLY, INTER, SWITCH and `show_existing_frame` - up to the byte where
 the tile data starts: tile grid, quantiser, segmentation, delta Q / delta LF,
 deblock levels, CDEF strengths, reference and skip mode decisions, transform set.
-Inter frames read a `RefPool` the caller keeps up to date, so reference sizes and
-skip mode are derived, not guessed. That pool carries each slot's order hint and
+Inter frames read a `RefPool` the caller keeps up to date, so a size inherited
+through `found_ref` (`frame_size_with_refs`) and skip mode are derived, not
+guessed. That pool carries each slot's order hint and
 frame id, which is what `frame_refs_short_signaling` (7.8) and the frame id
 checks of 5.9.2 - including `mark_ref_frames` and the order hints an error
 resilient frame re-states - work on. Features that are not implemented (superres,

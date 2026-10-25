@@ -482,6 +482,26 @@ change - decodes to only 4 of 110 matching frames on `inter_intra.ivf` while the
 bitstream stays perfectly in sync, which is exactly the kind of error the hash
 tests exist for.
 
+## Frame sizes taken from a reference
+
+A frame that codes `frame_size_override_flag` either says its size outright or
+names one of its references with `found_ref` and copies that frame's size, render
+size and superres decision (`frame_size_with_refs`, 5.9.4). The two were
+conflated here until now: the parser read an explicit size whenever the override
+was set - so a stream that scaled a frame against its reference desynchronised at
+the first such frame - and treated a frame *without* the override as inheriting
+its reference's size, where 5.9.5 says it is the sequence's maximum size.
+
+Both are fixed, and `test_frame_size_with_refs` pins them with written headers: a
+frame that takes 320x240 and a 512x384 render size from a half size reference, a
+`found_ref` on the fifth reference (the bits stop at the first set one), a
+frame that codes its own size when no `found_ref` bit is set, an error resilient
+frame - which codes no `found_ref` bits at all, because it cannot rely on the
+pool it is re-stating - and a `found_ref` naming an empty slot, which is an
+error rather than a size of zero. The real streams here are all coded at their
+sequence's maximum size with the override off, which is exactly why the old
+misreading decoded them bit exactly and why this needed written headers.
+
 ## Reference frame ids and short signalling
 
 Two header features change which stored frame a reference *names*, and both were
