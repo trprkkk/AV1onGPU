@@ -1369,8 +1369,10 @@ void test_frame_size_with_refs() {
   }
 }
 
-/* Segmentation is part of the header, not a reason to stop: the flags and the
- * per segment feature values have to come back so later stages can use them. */
+/* Segmentation is part of the header, not a reason to stop: the flags, the per
+ * segment features, and the three values derived from them - which segments are
+ * lossless, the last active segment, and whether the segment id has to be known
+ * before the skip flag - all come back so that the tile decoder can use them. */
 void test_segmentation() {
   std::printf("segmentation\n");
   SequenceSpec spec;
@@ -1380,67 +1382,250 @@ void test_segmentation() {
   CHECK(parse_sequence_header(seq_bytes.data(), seq_bytes.size(), &seq, &error) ==
         ParseStatus::Ok);
 
-  auto write_head = [](BitWriter* w) {
-    w->bit(false);     /* show_existing_frame */
-    w->bits(0, 2);     /* KEY */
-    w->bit(true);      /* show_frame */
-    w->bit(false);     /* disable_cdf_update */
-    w->bit(false);     /* allow_screen_content_tools */
-    w->bit(false);     /* frame_size_override */
-    w->bit(false);     /* render size */
-    w->bit(true);      /* refresh_frame_context */
-    w->bit(true);      /* uniform tiles */
-    w->bit(false);     /* stop: one column */
-    w->bit(false);     /* stop: one row */
-    w->bits(0, 8);     /* base_q_idx: lossless, so the filter bits disappear */
-    w->bit(false);     /* delta_q_y_dc */
-    w->bit(false);     /* delta_q_u_dc */
-    w->bit(false);     /* delta_q_u_ac */
-    w->bit(false);     /* using_qmatrix */
+  /* A key frame header up to segmentation_params(). base_q_idx is non zero, so
+   * the frame is not lossless and the filter and transform mode fields come
+   * after the segmentation ones, exactly as in write_key_frame_header(). */
+  auto write_prefix = [](BitWriter* w, int base_q) {
+    w->bit(false); /* show_existing_frame */
+    w->bits(0, 2); /* KEY */
+    w->bit(true);  /* show_frame */
+    w->bit(false); /* disable_cdf_update */
+    w->bit(false); /* allow_screen_content_tools */
+    w->bit(false); /* frame_size_override */
+    w->bit(false); /* render_and_frame_size_different */
+    w->bit(true);  /* refresh_frame_context (inverted on the wire) */
+    w->bit(true);  /* uniform_tile_spacing_flag */
+    w->bit(false); /* stop: one column */
+    w->bit(false); /* stop: one row */
+    w->bits(static_cast<uint32_t>(base_q), 8);
+    w->bit(false); /* delta_q_y_dc */
+    w->bit(false); /* delta_q_u_dc */
+    w->bit(false); /* delta_q_u_ac */
+    w->bit(false); /* using_qmatrix */
+  };
+  auto write_suffix = [](BitWriter* w) {
+    w->bit(false);  /* delta_q_present */
+    w->bits(0, 6);  /* loop_filter_level[0] */
+    w->bits(0, 6);  /* loop_filter_level[1] */
+    w->bits(0, 3);  /* loop_filter_sharpness */
+    w->bit(false);  /* loop_filter_delta_enabled */
+    w->bits(0, 2);  /* cdef_damping_minus_3 */
+    w->bits(0, 2);  /* cdef_bits */
+    w->bits(0, 6);  /* cdef y strength */
+    w->bits(0, 6);  /* cdef uv strength */
+    w->bit(true);   /* tx_mode_select */
+    w->bit(false);  /* reduced_tx_set */
+    w->align();
+  };
+  /* feature_enabled[i][j] = (i, j) in `enabled`, with `value` coded as
+   * su(1 + bits) for a signed feature and f(bits) for an unsigned one. */
+  auto write_features = [](BitWriter* w, const bool (&enabled)[kMaxSegments][kSegFeatureCount],
+                           const int (&value)[kMaxSegments][kSegFeatureCount]) {
+    static const int bits[kSegFeatureCount] = {8, 6, 6, 6, 6, 3, 0, 0};
+    static const bool is_signed[kSegFeatureCount] = {true, true, true, true, true,
+                                                     false, false, false};
+    for (int i = 0; i < kMaxSegments; ++i) {
+      for (int j = 0; j < kSegFeatureCount; ++j) {
+        w->bit(enabled[i][j]);
+        if (!enabled[i][j]) continue;
+        if (is_signed[j]) {
+          w->signed_bits(value[i][j], bits[j] + 1);
+        } else {
+          w->bits(static_cast<uint32_t>(value[i][j]), bits[j]);
+        }
+      }
+    }
   };
 
-  /* Segmentation on, map updated, no new feature data. */
+  /* Segmentation on and nothing else: a key frame has primary_ref_frame equal to
+   * PRIMARY_REF_NONE, so update_map / temporal_update / update_data are not on
+   * the wire at all - they are 1 / 0 / 1 by definition. */
+  bool no_features[kMaxSegments][kSegFeatureCount] = {};
+  int no_values[kMaxSegments][kSegFeatureCount] = {};
   BitWriter plain;
-  write_head(&plain);
-  plain.bit(true);  /* segmentation_enabled */
-  plain.bit(true);  /* update_map (primary_ref_frame is PRIMARY_REF_NONE) */
-  plain.bit(false); /* temporal_update */
-  plain.bit(false); /* update_data */
-  plain.bit(false); /* reduced_tx_set */
-  plain.align();
+  write_prefix(&plain, 60);
+  plain.bit(true); /* segmentation_enabled */
+  write_features(&plain, no_features, no_values);
+  write_suffix(&plain);
   const std::vector<uint8_t> plain_bytes = plain.bytes();
   FrameHeader header;
   CHECK(parse_frame_header(seq, plain_bytes.data(), plain_bytes.size(), &header, &error) ==
         ParseStatus::Ok);
   CHECK_EQ(header.segmentation.enabled, true);
   CHECK_EQ(header.segmentation.update_map, true);
-  CHECK_EQ(header.segmentation.update_data, false);
-  CHECK_EQ(header.all_lossless, true);
+  CHECK_EQ(header.segmentation.temporal_update, false);
+  CHECK_EQ(header.segmentation.update_data, true);
+  CHECK_EQ(header.segmentation.last_active_seg_id, 0);
+  CHECK_EQ(header.segmentation.seg_id_pre_skip, false);
+  CHECK_EQ(header.all_lossless, false);
+  for (int i = 0; i < kMaxSegments; ++i) CHECK_EQ(header.segmentation.lossless[i], false);
 
-  /* With feature data: segment 2 turns the quantiser down by 10. */
+  /* Feature data. Every feature that libaom and SVT-AV1 do not emit is here
+   * too, because no stream we can encode uses them: the alternate loop filter
+   * offsets, the per segment reference frame, skip and global motion. */
+  bool enabled[kMaxSegments][kSegFeatureCount] = {};
+  int values[kMaxSegments][kSegFeatureCount] = {};
+  const auto set = [&](int segment, int feature, int value) {
+    enabled[segment][feature] = true;
+    values[segment][feature] = value;
+  };
+  set(0, kSegAltQ, -256);     /* su(9) can code -256; the limit clips it to -255 */
+  set(1, kSegAltQ, -60);      /* 60 - 60 = 0, so segment 1 is lossless */
+  set(2, kSegAltQ, 18);
+  set(3, kSegAltLfYV, -64);   /* su(7) can code -64; the limit clips it to -63 */
+  set(4, kSegAltLfYH, 63);
+  set(5, kSegRefFrame, 3);    /* f(3): segment 5 always predicts from GOLDEN */
+  set(6, kSegSkip, 0);        /* no value: enabling the feature is the signal */
+  set(7, kSegGlobalMv, 0);
   BitWriter data;
-  write_head(&data);
-  data.bit(true);  /* segmentation_enabled */
-  data.bit(true);  /* update_map */
-  data.bit(false); /* temporal_update */
-  data.bit(true);  /* update_data */
-  for (int i = 0; i < kMaxSegments; ++i) {
-    for (int j = 0; j < kSegFeatureCount; ++j) {
-      const bool enabled = i == 2 && j == 0;
-      data.bit(enabled);
-      if (enabled) data.signed_bits(-10, 8);
-    }
-  }
-  data.bit(false); /* reduced_tx_set */
-  data.align();
+  write_prefix(&data, 60);
+  data.bit(true); /* segmentation_enabled */
+  write_features(&data, enabled, values);
+  write_suffix(&data);
   const std::vector<uint8_t> data_bytes = data.bytes();
   CHECK(parse_frame_header(seq, data_bytes.data(), data_bytes.size(), &header, &error) ==
         ParseStatus::Ok);
-  CHECK_EQ(header.segmentation.update_data, true);
-  CHECK_EQ(header.segmentation.feature_enabled[2][0], true);
-  CHECK_EQ(header.segmentation.feature_data[2][0], -10);
-  CHECK_EQ(header.segmentation.feature_enabled[1][0], false);
-  CHECK_EQ(header.segmentation.feature_enabled[2][1], false);
+  const SegmentationParams& seg = header.segmentation;
+  CHECK_EQ(seg.update_data, true);
+  CHECK_EQ(seg.feature_enabled[0][kSegAltQ], true);
+  CHECK_EQ(seg.feature_data[0][kSegAltQ], -255);
+  CHECK_EQ(seg.feature_data[1][kSegAltQ], -60);
+  CHECK_EQ(seg.feature_data[2][kSegAltQ], 18);
+  CHECK_EQ(seg.feature_data[3][kSegAltLfYV], -63);
+  CHECK_EQ(seg.feature_data[4][kSegAltLfYH], 63);
+  CHECK_EQ(seg.feature_enabled[5][kSegRefFrame], true);
+  CHECK_EQ(seg.feature_data[5][kSegRefFrame], 3);
+  CHECK_EQ(seg.feature_enabled[6][kSegSkip], true);
+  CHECK_EQ(seg.feature_data[6][kSegSkip], 0);
+  CHECK_EQ(seg.feature_enabled[7][kSegGlobalMv], true);
+  CHECK_EQ(seg.feature_data[7][kSegGlobalMv], 0);
+  CHECK_EQ(seg.feature_enabled[2][kSegAltLfYV], false);
+  /* The last segment that carries a feature at all, and whether a feature that
+   * is read before the skip flag is among them. */
+  CHECK_EQ(seg.last_active_seg_id, 7);
+  CHECK_EQ(seg.seg_id_pre_skip, true);
+  /* The quantiser is per segment: 60 - 60 = 0, and segment 0's clipped -255
+   * takes it below zero and is clipped at 0 again, so both are lossless; that is
+   * a property of the segment, decided here and used by the tile decoder for the
+   * transform size and for the transform type. No delta_q is in play, so the
+   * frame as a whole is not lossless. */
+  CHECK_EQ(seg.lossless[1], true);
+  CHECK_EQ(seg.lossless[0], true);
+  CHECK_EQ(seg.lossless[2], false);
+  CHECK_EQ(seg.lossless[3], false);
+  CHECK_EQ(header.all_lossless, false);
+  CHECK_EQ(segment_qindex(header, 0), 0);
+  CHECK_EQ(segment_qindex(header, 2), 78);
+
+  /* segmentation_update_data == 0 on a frame that has a primary reference: the
+   * features are inherited from that reference and only the map is on the wire. */
+  const std::vector<uint8_t> key_bytes = write_key_frame_header(spec, KeyFrameSpec());
+  RefPool pool;
+  CHECK(parse_frame_header(seq, key_bytes.data(), key_bytes.size(), &header, &error,
+                           &pool) == ParseStatus::Ok);
+  refresh_ref_pool(header, &pool);
+
+  SegmentationParams inherited;
+  inherited.enabled = true;
+  inherited.update_data = true;
+  inherited.feature_enabled[3][kSegAltQ] = true;
+  inherited.feature_data[3][kSegAltQ] = -12;
+  inherited.last_active_seg_id = 3;
+  pool.slots[0].segmentation = inherited;
+
+  BitWriter keep;
+  keep.bit(false); /* show_existing_frame */
+  keep.bits(1, 2); /* INTER */
+  keep.bit(true);  /* show_frame */
+  keep.bit(false); /* error_resilient_mode */
+  keep.bit(false); /* disable_cdf_update */
+  keep.bit(false); /* allow_screen_content_tools */
+  keep.bit(false); /* frame_size_override: inherit the reference size */
+  keep.bits(0, 3); /* primary_ref_frame: ref_frame_idx[0] = slot 0 */
+  keep.bits(0, 8); /* refresh_frame_flags */
+  keep.bit(false); /* frame_refs_short_signaling */
+  for (int i = 0; i < 7; ++i) keep.bits(0, 3); /* ref_frame_idx: slot 0 */
+  keep.bit(false); /* render_and_frame_size_different */
+  keep.bit(false); /* allow_high_precision_mv */
+  keep.bit(true);  /* is_filter_switchable */
+  keep.bit(false); /* is_motion_mode_switchable */
+  keep.bit(false); /* disable_frame_end_update_cdf */
+  keep.bit(true);  /* uniform_tile_spacing_flag */
+  keep.bit(false); /* stop: one column */
+  keep.bit(false); /* stop: one row */
+  keep.bits(100, 8);
+  keep.bit(false); /* delta_q_y_dc */
+  keep.bit(false); /* delta_q_u_dc */
+  keep.bit(false); /* delta_q_u_ac */
+  keep.bit(false); /* using_qmatrix */
+  keep.bit(true);  /* segmentation_enabled */
+  keep.bit(false); /* update_map */
+  keep.bit(false); /* update_data: keep the features of the primary reference */
+  keep.bit(false); /* delta_q_present */
+  keep.bits(0, 6); /* loop_filter_level[0] */
+  keep.bits(0, 6); /* loop_filter_level[1] */
+  keep.bits(0, 3); /* loop_filter_sharpness */
+  keep.bit(false); /* loop_filter_delta_enabled */
+  keep.bits(0, 2); /* cdef_damping_minus_3 */
+  keep.bits(0, 2); /* cdef_bits */
+  keep.bits(0, 6); /* cdef y strength */
+  keep.bits(0, 6); /* cdef uv strength */
+  keep.bit(false); /* tx_mode_select */
+  keep.bit(false); /* reference_select */
+  keep.bit(false); /* reduced_tx_set */
+  for (int i = 1; i < 8; ++i) keep.bit(false); /* is_global */
+  keep.align();
+  const std::vector<uint8_t> keep_bytes = keep.bytes();
+  CHECK(parse_frame_header(seq, keep_bytes.data(), keep_bytes.size(), &header, &error,
+                           &pool) == ParseStatus::Ok);
+  CHECK_EQ(header.segmentation.enabled, true);
+  CHECK_EQ(header.segmentation.update_map, false);
+  CHECK_EQ(header.segmentation.update_data, false);
+  CHECK_EQ(header.segmentation.feature_enabled[3][kSegAltQ], true);
+  CHECK_EQ(header.segmentation.feature_data[3][kSegAltQ], -12);
+}
+
+/* The segment's alternative loop filter level is added on top of the plane's
+ * level by deblock_level_selection(), which is the only place in the loop filter
+ * that knows about segmentation. */
+void test_segment_deblock_level() {
+  std::printf("segmentation (loop filter level)\n");
+  FrameHeader frame;
+  frame.loop_filter.level_y[0] = 8;
+  frame.loop_filter.level_y[1] = 4;
+  frame.loop_filter.level_u = 6;
+  frame.loop_filter.level_v = 6;
+  frame.loop_filter.mode_ref_delta_enabled = false;
+  frame.segmentation.enabled = true;
+  frame.segmentation.feature_enabled[2][kSegAltLfYV] = true;
+  frame.segmentation.feature_data[2][kSegAltLfYV] = -3;
+  frame.segmentation.feature_enabled[2][kSegAltLfYH] = true;
+  frame.segmentation.feature_data[2][kSegAltLfYH] = 2;
+  frame.segmentation.feature_enabled[2][kSegAltLfU] = true;
+  frame.segmentation.feature_data[2][kSegAltLfU] = -6;
+
+  DeblockGrid grid;
+  grid.mi_cols = 2;
+  grid.mi_rows = 1;
+  grid.size.assign(2, kBlock4x4);
+  grid.skip.assign(2, 0);
+  grid.segment.assign(2, 0);
+  grid.ref_frame.assign(2, 0);
+  grid.mode.assign(2, 0);
+  grid.delta_lf.assign(8, 0);
+  grid.segment[0] = 0; /* no feature: the plane's level comes back unchanged */
+  grid.segment[1] = 2;
+
+  CHECK_EQ(deblock_level_selection(frame, grid, 0, 0, 0, 0), 8);
+  CHECK_EQ(deblock_level_selection(frame, grid, 0, 0, 0, 1), 4);
+  CHECK_EQ(deblock_level_selection(frame, grid, 0, 1, 0, 0), 5);  /* 8 - 3 */
+  CHECK_EQ(deblock_level_selection(frame, grid, 0, 1, 0, 1), 6);  /* 4 + 2 */
+  CHECK_EQ(deblock_level_selection(frame, grid, 0, 1, 1, 0), 0);  /* 6 - 6, and clipped at 0 */
+  CHECK_EQ(deblock_level_selection(frame, grid, 0, 1, 2, 0), 6);  /* plane V has no feature */
+
+  /* A feature that is disabled is ignored even when the frame segments. */
+  frame.segmentation.feature_enabled[2][kSegAltLfYV] = false;
+  CHECK_EQ(deblock_level_selection(frame, grid, 0, 1, 0, 0), 8);
 }
 
 void test_real_stream() {
@@ -2491,6 +2676,7 @@ int main() {
   test_frame_ids();
   test_short_ref_signaling();
   test_segmentation();
+  test_segment_deblock_level();
   test_block_geometry();
   test_projected_motion_vectors();
   test_local_warp();

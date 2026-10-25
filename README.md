@@ -275,9 +275,10 @@ Every inter and intra tool AV1 defines decodes bit exactly - including palette
 coded blocks (`tests/data/palette_sc.ivf`), inter/intra compound
 (`tests/data/inter_intra.ivf`), intra block copy (`tests/data/intrabc.ivf`) and
 skip mode, which the `lw_t2`/`lw_t3`/`inter_intra` fixtures code thousands of
-times. Segmentation and superres are refused by name; film grain uses a
-synthetic template instead of the specification's synthesis filter (see
-`docs/ROADMAP.md`, sections 3 and 4).
+times, and segmentation (`tests/data/seg_altq.ivf`, a different quantiser per
+segment). Superres is refused by name; film grain uses a synthetic template
+instead of the specification's synthesis filter (see `docs/ROADMAP.md`, sections
+3 and 4).
 `av1gpu::synthetic_encode` is a small closed loop test encoder that produces
 valid syntax from a generated clip and does not need any of those.
 

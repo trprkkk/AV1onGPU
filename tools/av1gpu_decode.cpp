@@ -674,7 +674,7 @@ int main(int argc, char** argv) {
 
       /* the tile adapted the probability tables; the slots this frame refreshes
        * hand them on to the frames that name it as their primary reference */
-      refresh_ref_pool(frame, &refs, decoded.ref_mvs, decoded.cdf);
+      refresh_ref_pool(frame, &refs, decoded.ref_mvs, decoded.cdf, decoded.seg_map);
     }
     if (status != 0) break;
   }

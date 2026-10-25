@@ -44,19 +44,6 @@ namespace frontend {
 /* MAX_LOOP_FILTER: levels and the delta-LF syntax are clipped to this. */
 constexpr int kMaxLoopFilter = 63;
 
-/* SEG_LVL_* feature indices, in specification order. The loop filter uses the
- * four ALT_LF ones, starting at SEG_LVL_ALT_LF_Y_V. */
-enum SegmentFeature {
-  kSegAltQ = 0,
-  kSegAltLfYV = 1,
-  kSegAltLfYH = 2,
-  kSegAltLfU = 3,
-  kSegAltLfV = 4,
-  kSegRefFrame = 5,
-  kSegSkip = 6,
-  kSegGlobalMv = 7,
-};
-
 inline int clip3(int lo, int v, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 /* The per-4x4 view of a decoded tile that the loop filter reads. Everything is

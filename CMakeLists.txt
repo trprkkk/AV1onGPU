@@ -147,11 +147,12 @@ if(AV1GPU_BUILD_TESTS)
   # of the reference decoder's output (see tests/data/README.md). lw_t2 and
   # lw_t3 are the only fixtures that code local warped motion and OBMC,
   # palette_sc the only screen content one (palette coded blocks), intrabc the
-  # only one that codes intra block copy and inter_intra the only one that codes
-  # inter/intra compound, with the taper and with wedge masks; every frame of all
-  # five is bit exact.
+  # only one that codes intra block copy, inter_intra the only one that codes
+  # inter/intra compound, with the taper and with wedge masks, and seg_altq the
+  # only one that codes segmentation (a different quantiser per segment); every
+  # frame of all six is bit exact.
   if(TARGET av1gpu_decode)
-    foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra)
+    foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra seg_altq)
       set(frames 30)
       if(stream STREQUAL "palette_sc")
         set(frames 10)
@@ -210,10 +211,13 @@ if(AV1GPU_BUILD_TESTS)
     #                   whose overlap candidates carry their own reference slot
     #   inter_intra     the only one that codes inter/intra compound, so every
     #                   blend runs through the device kernels too
+    #   seg_altq        the only one that codes segmentation, so the per segment
+    #                   quantiser reaches the device kernels
     #   svt_av1_320x240 a different encoder, so a different mix of tools
     # All of it on a machine with no GPU at all.
     if(TARGET av1gpu_decode)
-      foreach(stream palette_sc intrabc lw_t2 lw_t3 inter_intra svt_av1_320x240)
+      foreach(stream palette_sc intrabc lw_t2 lw_t3 inter_intra seg_altq
+                     svt_av1_320x240)
         set(frames 30)
         if(stream STREQUAL "palette_sc")
           set(frames 10)

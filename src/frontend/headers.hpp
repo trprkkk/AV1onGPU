@@ -170,6 +170,18 @@ struct CdefParams {
 constexpr int kSegFeatureCount = 8;
 constexpr int kMaxSegments = 8;
 
+/* SEG_LVL_* feature indices, in specification order. */
+enum SegmentFeature {
+  kSegAltQ = 0,
+  kSegAltLfYV = 1,
+  kSegAltLfYH = 2,
+  kSegAltLfU = 3,
+  kSegAltLfV = 4,
+  kSegRefFrame = 5,
+  kSegSkip = 6,
+  kSegGlobalMv = 7,
+};
+
 struct SegmentationParams {
   bool enabled = false;
   bool update_map = false;
@@ -177,7 +189,23 @@ struct SegmentationParams {
   bool update_data = false;
   bool feature_enabled[kMaxSegments][kSegFeatureCount] = {};
   int feature_data[kMaxSegments][kSegFeatureCount] = {};
+  /* Derived by segmentation_params() (5.11.9): the highest segment that has a
+   * feature at all, whether any segment carries a feature that has to be known
+   * before the skip flag is read (SEG_LVL_REF_FRAME and up), and which segments
+   * are lossless. The last one decides the transform size, the transform type
+   * and whether a coefficient may be coded at all, so it is a property of the
+   * segment, not of the frame. */
+  int last_active_seg_id = 0;
+  bool seg_id_pre_skip = false;
+  bool lossless[kMaxSegments] = {};
 };
+
+/* seg_feature_active(): a feature only applies when segmentation is on and the
+ * segment enables it. */
+inline bool segment_feature_active(const SegmentationParams& seg, int segment, int feature) {
+  return seg.enabled && segment >= 0 && segment < kMaxSegments &&
+         seg.feature_enabled[segment][feature];
+}
 
 /* Global motion models, in specification order. */
 enum GmType {
@@ -263,6 +291,16 @@ int project_mv_component(int mv, int num, int den);
  * comparison every "is this reference in the past" question is built on. */
 int get_relative_dist(const SequenceHeader& seq, int a, int b);
 
+/* The segmentation map of a decoded frame: one segment id per 4x4 cell. A later
+ * frame that predicts its segment ids temporally (segmentation_temporal_update)
+ * reads this map, cropped to the block it is coding, so the map has to survive
+ * as long as any slot holds the frame it belongs to. */
+struct SegmentationMap {
+  int mi_cols = 0;
+  int mi_rows = 0;
+  std::vector<uint8_t> ids;
+};
+
 /* One entry of the reference frame store: enough for the bitstream front-end to
  * resolve inter frame sizes and skip-mode decisions. */
 struct RefSlot {
@@ -299,6 +337,12 @@ struct RefSlot {
    * frame whose primary_ref_frame names this slot starts from them instead of
    * the defaults, which is how AV1 keeps a whole inter frame's symbols cheap. */
   std::shared_ptr<const CdfContext> cdf;
+  /* This frame's segmentation map, kept for a later frame that predicts its
+   * segment ids from it. Null when the frame had no segmentation. */
+  std::shared_ptr<const SegmentationMap> seg_map;
+  /* The segment features the frame was coded with. A later frame with
+   * segmentation_update_data == 0 inherits them instead of coding them. */
+  SegmentationParams segmentation;
 };
 
 /* The eight AV1 reference slots. `parse_frame_header` reads them to resolve
@@ -405,13 +449,27 @@ struct FrameHeader {
   size_t tile_data_offset = 0;
 };
 
+/* get_qindex( ignoreDeltaQ = 1, segmentId ) (7.12.2): the quantiser a segment
+ * names, before the superblock delta. It decides whether a segment is lossless
+ * and whether the transform type symbol is coded at all, so the tile decoder
+ * needs it as well. */
+inline int segment_qindex(const FrameHeader& frame, int segment) {
+  int qindex = frame.base_q_idx;
+  if (segment_feature_active(frame.segmentation, segment, kSegAltQ)) {
+    qindex += frame.segmentation.feature_data[segment][kSegAltQ];
+  }
+  return qindex < 0 ? 0 : (qindex > 255 ? 255 : qindex);
+}
+
 /* Applies `frame.refresh_frame_flags` to the reference pool. `ref_mvs` is the
  * motion vector grid the frame's tile produced, if it was decoded; the slots the
  * frame refreshes keep it for the frames that project from them. `cdf` is the
- * frame's adapted probability context, which a later frame may inherit. */
+ * frame's adapted probability context, which a later frame may inherit, and
+ * `seg_map` its segmentation map, which a later frame may predict from. */
 void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
                       const std::shared_ptr<const RefMvs>& ref_mvs = nullptr,
-                      const std::shared_ptr<const CdfContext>& cdf = nullptr);
+                      const std::shared_ptr<const CdfContext>& cdf = nullptr,
+                      const std::shared_ptr<const SegmentationMap>& seg_map = nullptr);
 
 enum class ParseStatus {
   Ok = 0,

@@ -60,7 +60,13 @@ not disagreements between backends.
   are generated from their definitions in Q12 (`src/core/tables.cpp`). They are
   orthonormal to within 3.3e-4, which is inside the Q12 rounding of the
   transform itself, so a round trip is exact to ±2 LSB over the full sample
-  range (asserted in `test_kernels`). Because the bases are derived instead of
+  range (asserted in `test_kernels`). Where that bites is content far from the
+  fixtures: a libaom `testsrc2` encode of one pixel lines and hard edges puts
+  400 to 800 luma samples per frame 1-2 LSB away from dav1d while *every* range
+  coder event of all 30 frames still matches (251,289 of them, see the
+  segmentation section), so the syntax is exact and the difference is this
+  rounding. That is why only streams that decode exactly are promoted to
+  fixtures. Because the bases are derived instead of
   copied, every size the spec defines exists (4..64 for DCT, 4..16 for DST-IV)
   and no basis table in the source is magic data.
 * **CDEF weights match the spec, its strength selection does not.** The tap
@@ -556,6 +562,78 @@ references match, a frame whose distance is wrong (rejected), a frame whose id
 has pushed the oldest slot out of the window (dropped, and the surviving slot
 still usable), a display of a stored frame with the right and the wrong id, and
 an error resilient frame that drops a slot whose re-stated hint disagrees.
+
+## Segmentation
+
+Segmentation is the one place where the *block* decides its quantiser, its loop
+filter offsets and two of its prediction decisions, and it has to be read before
+anything else about the block: the segment id comes first (before the skip flag
+when the frame says so), and a segment can then force "skip", "intra" or
+"GLOBALMV from this reference" instead of the block coding those symbols.
+
+**Header (5.11.9).** Three details are silent when wrong:
+
+* A frame whose `primary_ref_frame` is `PRIMARY_REF_NONE` does not code
+  `segmentation_update_map`, `segmentation_temporal_update` or
+  `segmentation_update_data` at all - they are 1, 0 and 1 by definition. Reading
+  them costs one to three bits and desynchronises the range coder at the first
+  tile byte. The first version of this code did read them and every frame of a
+  segmented stream came out as noise.
+* Feature widths are per feature and a signed feature is *one bit wider than its
+  table entry*: `Segmentation_Feature_Bits` is `{8, 6, 6, 6, 6, 3, 0, 0}`, a
+  signed value is `su(1 + bits)`, so `SEG_LVL_ALT_Q` is a 9 bit two's complement
+  value and -65 is legal. The value is then `Clip3(±Segmentation_Feature_Max)`.
+  Reading `su(bits)` and a table of `{..., 3, 1, 1}` - which is what was here
+  before - misreads every negative quantiser offset and shifts the rest of the
+  header with it.
+* `SEG_LVL_SKIP` and `SEG_LVL_GLOBALMV` carry no value: enabling the feature is
+  the whole signal, so nothing is read for them.
+
+Three values are derived per frame from those features: `LastActiveSegId` (the
+highest segment with any feature at all), `SegIdPreSkip` (true when a feature at
+or above `SEG_LVL_REF_FRAME` is on, because the tile data then codes the id
+before the skip flag) and `LosslessArray[]`, computed per segment from
+`base_q_idx + ALT_Q` clipped to 0..255. Lossless is therefore a property of the
+*segment*: the transform size, the transform type and whether a residual may be
+coded at all follow from it block by block, not from the frame.
+
+**Tile data.** The id of a block is coded against a prediction - the above and
+left neighbours of this frame's map (three comparisons give context 0, 1 or 2),
+or, when `segmentation_temporal_update` is set, the id at the same place in the
+primary reference frame's stored map, each with a one bit "predicted?" symbol in
+between - and the symbol itself is the distance to that prediction, resolved with
+`neg_deinterleave(diff, pred, LastActiveSegId + 1)`. A block that is skipped
+codes no symbol and inherits its neighbours' prediction. The map of every decoded
+frame is kept (`TileDecodeResult::seg_map`) and stored in the reference slot it
+refreshes, which is what makes the temporal prediction and
+`segmentation_update_data == 0` (inherit the features of a frame's primary
+reference) work.
+
+**What is verified.** `tests/data/seg_altq.ivf` is a 30 frame libaom
+`--aq-mode 3` encode: two per superblock classes, `ALT_Q` -65 and -80 on top of
+`base_q_idx` 160 (quantiser 95 and 80), temporal update on every frame, 207 of
+its 2,586 blocks in segment 2 and 15 in segment 1. Both offsets need the ninth
+bit, so the stream regresses the width bug above. Every frame is bit exact
+against dav1d *and* through the OpenCL kernels (`stream_seg_altq`,
+`opencl_seg_altq`).
+
+A second `--aq-mode 3` encode of a different clip (320x240 `testsrc2`) is not a
+fixture, but it is the one used for the symbol trace: with `AV1GPU_TRACE_SYM=1`
+against dav1d's `DAV1D_MSACLOG=-` all **251,289** range coder events of its 30
+frames agree in value, range and bit count, so the segment id syntax, both
+predictors and the derived values are right event for event.
+
+What no encoder here emits is the rest: `ALT_LF` (libaom uses only `ALT_Q`, SVT-AV1
+does not segment at all) and the forced `REF_FRAME` / `SKIP` / `GLOBALMV`. Those
+are pinned by written headers in `test_segmentation` - the feature widths,
+`su(1 + bits)` including the clipping at the limit, `LastActiveSegId`,
+`SegIdPreSkip`, the per segment `LosslessArray`, and inheritance with
+`update_data == 0` - and by `test_segment_deblock_level`, which adds the
+segment's `ALT_LF` to the plane's level, clips it at zero and shows that a
+disabled feature is ignored. Returning 0 from `read_segment_id_symbol` while
+still reading the symbol - so that every frame parses to the end of its tile -
+decodes only 2 of `seg_altq`'s 30 frames to the recorded pixels (the two before
+segmentation turns on): a pixel error no entropy check would see.
 
 ## Measured quality (synthetic clip, 640×360, CPU reference backend)
 

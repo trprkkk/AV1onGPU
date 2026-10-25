@@ -285,12 +285,14 @@ schedule has to wait for a rectangle of samples rather than for the neighbouring
 edges: the block's vector is clipped to the part of the tile that already exists
 (7.11.5), and the scheduler turns that rectangle into wave dependencies.
 
-Of the tools AV1 defines, what is left is segmentation and superres - both
-refused by name rather than misparsed - plus a film grain synthesis filter
-(section 4). Every inter and intra prediction tool decodes bit exactly, and the
-reference machinery is complete: short signalling, frame ids and the pool
-invalidation rules of 5.9.2 are implemented and pinned by tests (see
-`docs/ACCURACY.md`).
+Of the tools AV1 defines, what is left is superres - refused by name rather
+than misparsed - plus a film grain synthesis filter (section 4). Every inter and
+intra prediction tool decodes bit exactly, and so does segmentation, which is
+not a prediction tool but a per block quantiser and loop filter override with
+three forced decisions attached (`tests/data/seg_altq.ivf`, see
+`docs/ACCURACY.md`). The reference machinery is complete: short signalling,
+frame ids, `frame_size_with_refs` and the pool invalidation rules of 5.9.2 are
+implemented and pinned by tests (see `docs/ACCURACY.md`).
 
 ## 4. Spec-conformant film grain
 

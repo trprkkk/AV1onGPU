@@ -167,6 +167,46 @@ The truncated file is the first 110 frame records of the 160 frame one; every
 frame of it decodes bit exactly against dav1d, and so does the whole stream
 through the CPU backend and through the OpenCL kernels.
 
+`seg_altq.ivf` is the segmentation fixture: 30 frames of 320x240, 30 KB,
+encoded with libaom at `-cpu-used 4 -crf 40 --aq-mode 3 --lag-in-frames 0 -g 30`
+and `-aom-params "enable-restoration=0:tile-columns=0:tile-rows=0"`. `aq-mode 3`
+makes the encoder move whole superblocks between segments, and a segment's only
+feature is its quantiser: `base_q_idx` is 160 and segment 1 asks for `ALT_Q` -65
+while segment 2 asks for -80, so the two classes code at quantiser 95 and 80.
+That means the offsets need nine bits (`su(1 + bits)`), which is exactly the
+width a parser gets wrong by one. Every frame carries `update_map` and
+`temporal_update`, so the segment id of a block is either predicted from the
+previous frame's map or coded as a distance from its neighbours, and 207 of the
+stream's 2,586 blocks end up in segment 2, 15 in segment 1.
+`seg_altq.hash` holds the per frame hashes and `stream_seg_altq` checks them;
+`opencl_seg_altq` replays the same frames through the device kernels. Every frame
+is bit exact against dav1d.
+
+The clip is generated, so it can be rebuilt from nothing:
+
+```python
+import numpy as np
+
+W, H, N = 320, 240, 30
+rng = np.random.default_rng(11)
+yy, xx = np.mgrid[0:H, 0:W]
+base = 60 + xx * 0.30 + yy * 0.25 + rng.integers(-18, 18, (H, W))   # textured
+out = bytearray()
+for f in range(N):
+    img = base.copy()
+    x0 = 20 + (f * 4) % 260                      # a bright bar that sweeps
+    img[30:120, x0:x0 + 56] += 60
+    x1 = 60 + (f * 3) % 200                      # a dark box that slides
+    img[130:220, x1:x1 + 70] -= 45
+    y = np.clip(img, 0, 255).astype(np.uint8)
+    u = np.full((H // 2, W // 2), 128, np.uint8)
+    v = np.full((H // 2, W // 2), 128, np.uint8)
+    u[:, :80] = 96                               # flat chroma, two halves
+    u[:, 80:] = 170
+    out += y.tobytes() + u.tobytes() + v.tobytes()
+open('seg_src.yuv', 'wb').write(bytes(out))
+```
+
 `svt_av1_320x240.ivf` is a real AV1 stream, not a hand written header: six frames
 of a 320x240 gradient at 8 bit 4:2:0, encoded with SVT-AV1 (crf 40, preset 10)
 and muxed into IVF. The front-end tests parse it end to end, so the parser is

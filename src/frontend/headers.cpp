@@ -45,8 +45,15 @@ ParseStatus check_trailing_bits(BitReader* reader, std::string* error) {
   return ParseStatus::Ok;
 }
 
-/* Width of each segmentation feature value, in specification order. */
-constexpr int kSegFeatureBits[kSegFeatureCount] = {8, 6, 6, 6, 6, 3, 1, 1};
+/* Width of each segmentation feature value, in specification order, whether it
+ * carries a sign, and the limit it is clipped to. A signed value is coded as
+ * su(1 + bits), so it costs one bit more than the table says. */
+constexpr int kSegFeatureBits[kSegFeatureCount] = {8, 6, 6, 6, 6, 3, 0, 0};
+constexpr bool kSegFeatureSigned[kSegFeatureCount] = {true, true, true, true, true,
+                                                      false, false, false};
+/* SEG_LVL_SKIP and SEG_LVL_GLOBALMV carry no value: enabling them is the whole
+ * signal, so they read zero bits and their limit is 0. */
+constexpr int kSegFeatureMax[kSegFeatureCount] = {255, 63, 63, 63, 63, 7, 0, 0};
 
 /* decode_subexp(): AV1's subexponential code, used for the global motion
  * parameters. It is a bit reader construct (not arithmetic coded), so it lives
@@ -261,7 +268,8 @@ int project_mv_component(int mv, int num, int den) {
 
 void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
                       const std::shared_ptr<const RefMvs>& ref_mvs,
-                      const std::shared_ptr<const CdfContext>& cdf) {
+                      const std::shared_ptr<const CdfContext>& cdf,
+                      const std::shared_ptr<const SegmentationMap>& seg_map) {
   if (!pool || frame.show_existing_frame) return;
   /* An intra frame codes no motion vectors, so it clears the grid of every slot
    * it refreshes: a later frame must not project the motion vectors of a frame
@@ -283,6 +291,8 @@ void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
       for (int ref = 0; ref < 7; ++ref) slot.ref_poc[ref] = frame.ref_order_hint[ref];
       slot.ref_mvs = stores_mvs ? ref_mvs : nullptr;
       slot.cdf = cdf;
+      slot.seg_map = seg_map;
+      slot.segmentation = frame.segmentation;
     }
   }
 }
@@ -1072,31 +1082,63 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
   seg.enabled = r.read_bit();
   h.segmentation_enabled = seg.enabled;
   if (seg.enabled) {
+    /* A frame that resets the context (a key frame, or one that names no
+     * primary reference) does not code the three flags at all: it updates its
+     * map, does not predict it temporally, and carries its own feature data. */
     if (h.primary_ref_frame == kPrimaryRefNone) {
-      seg.update_map = r.read_bit();
-      if (seg.update_map) {
-        seg.temporal_update = r.read_bit();
-        seg.update_data = r.read_bit();
-      }
+      seg.update_map = true;
+      seg.temporal_update = false;
+      seg.update_data = true;
     } else {
+      seg.update_map = r.read_bit();
+      if (seg.update_map) seg.temporal_update = r.read_bit();
       seg.update_data = r.read_bit();
-      if (seg.update_data) {
-        seg.update_map = r.read_bit();
-        if (seg.update_map) seg.temporal_update = r.read_bit();
-      }
     }
     if (seg.update_data) {
       for (int i = 0; i < kMaxSegments; ++i) {
         for (int j = 0; j < kSegFeatureCount; ++j) {
           seg.feature_enabled[i][j] = r.read_bit();
           if (seg.feature_enabled[i][j]) {
-            seg.feature_data[i][j] = r.read_signed(kSegFeatureBits[j]);
+            const int limit = kSegFeatureMax[j];
+            if (kSegFeatureSigned[j]) {
+              /* su(1 + bits): the sign is one bit of the value */
+              const int value = r.read_signed(kSegFeatureBits[j] + 1);
+              seg.feature_data[i][j] = std::max(-limit, std::min(limit, value));
+            } else {
+              const int value = static_cast<int>(r.read(kSegFeatureBits[j]));
+              seg.feature_data[i][j] = std::max(0, std::min(limit, value));
+            }
+          }
+        }
+      }
+    } else if (refs && h.primary_ref_frame != kPrimaryRefNone) {
+      /* segmentation_update_data == 0: the features of this frame are the ones
+       * the primary reference was decoded with, so the header carries none. */
+      const int slot = h.ref_frame_idx[h.primary_ref_frame];
+      if (slot >= 0 && slot < 8 && refs->slots[slot].valid) {
+        const SegmentationParams& from = refs->slots[slot].segmentation;
+        for (int i = 0; i < kMaxSegments; ++i) {
+          for (int j = 0; j < kSegFeatureCount; ++j) {
+            seg.feature_enabled[i][j] = from.feature_enabled[i][j];
+            seg.feature_data[i][j] = from.feature_data[i][j];
           }
         }
       }
     }
   }
 
+  /* 5.11.9 derives three things from the features that are read here: the
+   * highest segment that has any feature at all (the segment id syntax only
+   * codes values up to it), whether any segment carries a feature that changes
+   * syntax read before the skip flag (SEG_LVL_REF_FRAME and up), and which
+   * segments are lossless. */
+  for (int i = 0; i < kMaxSegments; ++i) {
+    for (int j = 0; j < kSegFeatureCount; ++j) {
+      if (!seg.feature_enabled[i][j]) continue;
+      seg.last_active_seg_id = i;
+      if (j >= kSegRefFrame) seg.seg_id_pre_skip = true;
+    }
+  }
   /* ---- delta q / delta lf ------------------------------------------------ */
   if (h.base_q_idx > 0) {
     h.delta_q_present = r.read_bit();
@@ -1112,10 +1154,22 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
     }
   }
 
+  /* LosslessArray: a *segment* is lossless when its quantiser - the base one
+   * plus its SEG_LVL_ALT_Q, ignoring the superblock delta - is zero and no
+   * delta Q of the frame is set. CodedLossless is then true only when every
+   * segment is, because a frame with one lossless segment still codes
+   * coefficients for the others. */
   const bool delta_lossless = h.delta_q_y_dc == 0 && h.delta_q_u_dc == 0 &&
                               h.delta_q_u_ac == 0 && h.delta_q_v_dc == 0 &&
                               h.delta_q_v_ac == 0;
-  h.coded_lossless = h.base_q_idx == 0 && delta_lossless;
+  h.coded_lossless = true;
+  for (int i = 0; i < kMaxSegments; ++i) {
+    int qindex = h.base_q_idx;
+    if (segment_feature_active(seg, i, kSegAltQ)) qindex += seg.feature_data[i][kSegAltQ];
+    const int clipped = std::max(0, std::min(255, qindex));
+    seg.lossless[i] = clipped == 0 && delta_lossless;
+    if (!seg.lossless[i]) h.coded_lossless = false;
+  }
   h.all_lossless = h.coded_lossless;
 
   /* ---- loop filter ------------------------------------------------------- */

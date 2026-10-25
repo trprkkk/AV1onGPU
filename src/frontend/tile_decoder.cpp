@@ -290,6 +290,9 @@ class TileParser {
     const int sb4 = seq_.use_128x128_superblock ? 32 : 16;
     const BlockSize sb_size = seq_.use_128x128_superblock ? kBlock128x128 : kBlock64x64;
     for (int r = tile_row_start_; r < tile_row_end_; r += sb4) {
+      /* clear_left_context: the segment prediction contexts live per 4x4 row,
+       * so they start over at every superblock row, like the coefficient ones. */
+      std::fill(left_seg_pred_.begin(), left_seg_pred_.end(), 0);
       for (int c = tile_col_start_; c < tile_col_end_; c += sb4) {
         read_deltas_ = frame_.delta_q_present;
         const ParseStatus status = decode_partition(r, c, sb_size);
@@ -312,6 +315,13 @@ class TileParser {
      * intra block copy one) keep the values the frame inherited: a later frame
      * starts from the probabilities this one reached but adapts them at the
      * rate a fresh context adapts. */
+    if (frame_.segmentation.enabled) {
+      auto map = std::make_shared<SegmentationMap>();
+      map->mi_cols = mi_cols();
+      map->mi_rows = mi_rows();
+      map->ids = seg_map_;
+      out_->seg_map = std::move(map);
+    }
     auto published = std::make_shared<CdfContext>(
         frame_.refresh_frame_context ? cdf_ : start_cdf_);
     if (frame_.refresh_frame_context) {
@@ -383,6 +393,154 @@ class TileParser {
 
   bool have_top(int row) const { return row > tile_row_start_; }
   bool have_left(int col) const { return col > tile_col_start_; }
+
+  /* ---- segmentation: the id of a block and what it changes ----------------
+   *
+   * A frame with segmentation on divides itself into up to eight segments and
+   * every block names the segment it belongs to. The map is coded as a distance
+   * from a prediction (7.11.3): the prediction comes from the block's own
+   * above/left neighbours in the map being built, or, when the map is
+   * temporally predicted, from the smallest id in the block's region of the
+   * *previous* frame's map. The distance then goes through neg_deinterleave,
+   * which turns it into an id near the prediction while keeping small values
+   * cheap - an encoder's segments are spatially coherent, so most blocks code
+   * zero.
+   *
+   * The feature a segment carries is what the rest of the frame reads: a
+   * quantiser offset, four loop filter offsets, or - for the three that change
+   * syntax rather than values - a forced skip, reference frame or global
+   * motion. */
+
+  /* neg_deinterleave(): 7.11.3. */
+  static int neg_deinterleave(int diff, int ref, int max) {
+    if (!ref) return diff;
+    if (ref >= max - 1) return max - diff - 1;
+    if (2 * ref < max) {
+      if (diff <= 2 * ref) {
+        if (diff & 1) return ref + ((diff + 1) >> 1);
+        return ref - (diff >> 1);
+      }
+      return diff;
+    }
+    if (diff <= 2 * (max - ref - 1)) {
+      if (diff & 1) return ref + ((diff + 1) >> 1);
+      return ref - (diff >> 1);
+    }
+    return max - (diff + 1);
+  }
+
+  /* get_segment_id(): the smallest id in the block's on-screen region of the
+   * previous frame's map. A frame whose reference is not the same size as this
+   * one has no usable map, and the prediction is then 0. */
+  int temporal_segment_id(int row, int col, int bw4, int bh4) const {
+    if (!prev_seg_map_) return 0;
+    const int cols = mi_cols(), rows = mi_rows();
+    if (prev_seg_map_->mi_cols != cols || prev_seg_map_->mi_rows != rows) return 0;
+    const int xmis = std::min(bw4, cols - col);
+    const int ymis = std::min(bh4, rows - row);
+    int seg = kMaxSegments - 1;
+    for (int y = 0; y < ymis && seg; ++y) {
+      const uint8_t* line =
+          prev_seg_map_->ids.data() + static_cast<size_t>(row + y) * cols + col;
+      for (int x = 0; x < xmis; ++x) seg = std::min<int>(seg, line[x]);
+    }
+    return seg;
+  }
+
+  /* The prediction read_segment_id() codes against: the block's above, left and
+   * above-left neighbours in this frame's map, and the context the three
+   * comparisons select. */
+  int spatial_segment_id(int row, int col, int* ctx) const {
+    const int cols = mi_cols();
+    const bool top = have_top(row), left = have_left(col);
+    if (top && left) {
+      const uint8_t* cell = seg_map_.data() + static_cast<size_t>(row) * cols + col;
+      const int l = cell[-1];
+      const int a = cell[-cols];
+      const int al = cell[-(cols + 1)];
+      if (l == a && al == l) {
+        *ctx = 2;
+      } else if (l == a || al == l || a == al) {
+        *ctx = 1;
+      } else {
+        *ctx = 0;
+      }
+      return a == al ? a : l;
+    }
+    *ctx = 0;
+    if (left) return seg_map_[static_cast<size_t>(row) * cols + col - 1];
+    if (top) return seg_map_[static_cast<size_t>(row - 1) * cols + col];
+    return 0;
+  }
+
+  /* read_segment_id(): `skip` is the block's skip flag, which decides that the
+   * block keeps its neighbours' prediction rather than coding a distance. */
+  int read_segment_id_symbol(int row, int col, bool skip) {
+    int ctx = 0;
+    const int pred = spatial_segment_id(row, col, &ctx);
+    if (skip) return pred;
+    const int diff =
+        static_cast<int>(decoder_.read_symbol(cdf_.mode.seg_id[ctx], kMaxSegments - 1));
+    const int last = frame_.segmentation.last_active_seg_id;
+    int seg = neg_deinterleave(diff, pred, last + 1);
+    /* a stream that codes an id no segment uses is treated as segment 0 */
+    if (seg > last || seg >= kMaxSegments) seg = 0;
+    return seg;
+  }
+
+  void set_segment_prediction_contexts(int row, int col, int bw4, int bh4, bool predicted) {
+    const uint8_t value = predicted ? 1 : 0;
+    for (int i = 0; i < bw4; ++i) above_seg_pred_[static_cast<size_t>(col) + i] = value;
+    for (int i = 0; i < bh4; ++i) left_seg_pred_[static_cast<size_t>(row) + i] = value;
+  }
+
+  /* inter_segment_id( preSkip ) / intra_segment_id(): the segment id of one
+   * block. `pre_skip` says which of the two calls this is - a frame whose
+   * segments force a skip, a reference or global motion has to know the segment
+   * before the skip flag, and codes the id first (5.11.9's SegIdPreSkip). */
+  int read_segment_id_block(bool pre_skip, bool skip, bool intra_frame, int row, int col,
+                            int bw4, int bh4) {
+    const SegmentationParams& seg = frame_.segmentation;
+    const int predicted = temporal_segment_id(row, col, bw4, bh4);
+    if (!seg.update_map) return predicted;
+    if (intra_frame) {
+      /* An intra frame codes the id plainly: the temporal prediction symbol
+       * belongs to inter frames, whose map usually follows the previous
+       * frame's. */
+      if (pre_skip != seg.seg_id_pre_skip) return 0;
+      return read_segment_id_symbol(row, col, false);
+    }
+    if (pre_skip && !seg.seg_id_pre_skip) return 0;
+    if (!pre_skip) {
+      if (skip) {
+        /* a skipped block keeps its neighbours' prediction, and says so with a
+         * context of zero for the blocks that follow */
+        set_segment_prediction_contexts(row, col, bw4, bh4, false);
+        return read_segment_id_symbol(row, col, true);
+      }
+      if (!seg.temporal_update) return read_segment_id_symbol(row, col, false);
+    }
+    if (seg.temporal_update) {
+      const int ctx = above_seg_pred_[static_cast<size_t>(col)] +
+                      left_seg_pred_[static_cast<size_t>(row)];
+      const bool predicted_id = decoder_.read_symbol(cdf_.mode.seg_pred[ctx], 1) != 0;
+      set_segment_prediction_contexts(row, col, bw4, bh4, predicted_id);
+      if (predicted_id) return predicted;
+      return read_segment_id_symbol(row, col, false);
+    }
+    return read_segment_id_symbol(row, col, false);
+  }
+
+  /* The map keeps the id of every 4x4 cell of the block: the next block's
+   * spatial prediction and the next frame's temporal one both read it. */
+  void mark_segment(int row, int col, int bw4, int bh4, int segment_id) {
+    const int cols = mi_cols(), rows = mi_rows();
+    const uint8_t value = static_cast<uint8_t>(segment_id);
+    for (int y = row; y < row + bh4 && y < rows; ++y) {
+      uint8_t* line = seg_map_.data() + static_cast<size_t>(y) * cols;
+      for (int x = col; x < col + bw4 && x < cols; ++x) line[x] = value;
+    }
+  }
 
   /* partition: how the neighbours were split, as the specification defines it -
    * a neighbour that is smaller than this block pushes towards a split. */
@@ -2142,8 +2300,24 @@ class TileParser {
     const bool compound_allowed = std::min(bw4, bh4) > 1;
     const int mv_prec = (frame_.allow_high_precision_mv ? 1 : 0) - (frame_.force_integer_mv ? 1 : 0);
 
-    /* is_inter: a skip mode block is inter by definition and codes no flag */
+    const SegmentationParams& seg = frame_.segmentation;
+    const auto seg_active = [&](int feature) {
+      return segment_feature_active(seg, block->segment_id, feature);
+    };
+    const bool seg_ref = seg_active(kSegRefFrame);
+    const bool seg_gmv = seg_active(kSegGlobalMv);
+    const bool seg_skip = seg_active(kSegSkip);
+
+    /* read_is_inter: a skip mode block is inter by definition and codes no flag;
+     * a segment can force the answer as well - SEG_LVL_REF_FRAME says whether
+     * this block is inter at all (its value is a reference frame, and
+     * INTRA_FRAME is one of the values it can take), SEG_LVL_GLOBALMV makes it
+     * an inter block predicted by its reference's global model. */
     if (block->skip_mode) {
+      block->is_inter = true;
+    } else if (seg_ref) {
+      block->is_inter = seg.feature_data[block->segment_id][kSegRefFrame] != kRefIntra;
+    } else if (seg_gmv) {
       block->is_inter = true;
     } else {
       block->is_inter = decoder_.read_symbol(cdf_.inter.is_inter[intra_context(row, col)], 1) != 0;
@@ -2161,6 +2335,11 @@ class TileParser {
       compound = true;
       ref0 = frame_.skip_mode_frame[0];
       ref1 = frame_.skip_mode_frame[1];
+    } else if (seg_ref || seg_gmv || seg_skip) {
+      /* read_ref_frames(): the segment names the reference - LAST_FRAME for the
+       * two features that do not carry one - and no reference syntax follows. */
+      ref0 = seg_ref ? seg.feature_data[block->segment_id][kSegRefFrame] : kRefLast;
+      ref1 = kRefIntra;
     } else {
       if (frame_.reference_select && compound_allowed) {
         const int ctx = comp_context(row, col);
@@ -2270,6 +2449,12 @@ class TileParser {
       lower_mv_precision(&mv0x, &mv0y);
       lower_mv_precision(&mv1x, &mv1y);
       has_subpel_filter = false;
+    } else if (seg_skip || seg_gmv) {
+      /* YMode = GLOBALMV: one vector, taken from the reference's global motion
+       * model. No mode symbol is coded. */
+      block->inter_mode = kModeGlobalMv;
+      global_mv(gm0, row, col, bw4, bh4, &mv0x, &mv0y);
+      has_subpel_filter = std::min(bw4, bh4) == 1 || gm0.translation_only();
     } else if (compound) {
       const int symbol = static_cast<int>(decoder_.read_symbol(cdf_.inter.compound_mode[ctx], 7));
       if (trace_) {
@@ -2782,29 +2967,56 @@ class TileParser {
     block.have_above = have_top(row);
     block.have_left = have_left(col);
 
-    if (frame_.segmentation_enabled) {
-      return fail(error_, "tile: segment id syntax is not implemented");
+    const bool intra_frame =
+        frame_.type == FrameType::Key || frame_.type == FrameType::IntraOnly;
+    const SegmentationParams& seg = frame_.segmentation;
+    /* The three features that change syntax rather than values: a segment can
+     * force a skip, a reference frame or global motion, and a frame that uses
+     * any of them codes the segment id before the skip flag so that the flag
+     * can follow from it. */
+    const auto seg_active = [&](int feature) {
+      return segment_feature_active(seg, block.segment_id, feature);
+    };
+    block.segment_id = 0;
+    if (seg.enabled && seg.seg_id_pre_skip) {
+      block.segment_id = read_segment_id_block(true, false, intra_frame, row, col, bw4, bh4);
     }
 
     /* read_skip_mode, then read_skip. A frame that allows skip mode codes a
      * flag before the skip flag; a block that uses it is always skipped, always
      * inter and always compound, so it codes neither of the two flags that
-     * would say so. */
-    const bool intra_frame =
-        frame_.type == FrameType::Key || frame_.type == FrameType::IntraOnly;
+     * would say so. A block whose segment forces a reference, global motion or
+     * a skip codes no skip mode flag either: the segment already decided. */
+    const bool seg_forces = seg_active(kSegRefFrame) || seg_active(kSegGlobalMv) ||
+                            seg_active(kSegSkip);
     block.skip_mode = false;
-    if (!intra_frame && frame_.skip_mode_present && std::min(bw4, bh4) > 1) {
+    if (!intra_frame && !seg_forces && frame_.skip_mode_present && std::min(bw4, bh4) > 1) {
       const int smctx = (have_top(row) ? mi_skip_mode(row - 1, col) : 0) +
                         (have_left(col) ? mi_skip_mode(row, col - 1) : 0);
       block.skip_mode = decoder_.read_symbol(cdf_.inter.skip_mode[smctx], 1) != 0;
     }
     if (block.skip_mode) {
       block.skip = true;
+    } else if (seg_active(kSegSkip)) {
+      /* read_skip: a segment with SEG_LVL_SKIP skips every block it holds */
+      block.skip = true;
     } else {
       const int sctx = skip_context(row, col);
       block.skip = decoder_.read_symbol(cdf_.skip.row(sctx), 1) != 0;
     }
     trace_point(row, col, "skip");
+
+    /* The other half of the segment id syntax: normally it is coded after the
+     * skip flag, because a skipped block does not code one at all. */
+    if (seg.enabled && !seg.seg_id_pre_skip) {
+      block.segment_id = read_segment_id_block(false, block.skip, intra_frame, row, col, bw4, bh4);
+    }
+    if (seg.enabled) {
+      mark_segment(row, col, bw4, bh4, block.segment_id);
+      if (trace_) {
+        std::fprintf(stderr, "SG %d %d %d\n", col, row, block.segment_id);
+      }
+    }
 
     /* read_cdef: the first block of a 64x64 that is not skipped carries the
      * index the whole 64x64 filters with; a 64x64 that only holds skipped
@@ -2986,8 +3198,13 @@ class TileParser {
       std::snprintf(tag, sizeof(tag), "tx%d/%d", tx_size_row, tx_depth_context);
       trace_point(row, col, tag);
     }
+    /* get_qindex(0, segment_id): the segment's own quantiser offset applies on
+     * top of the frame's base (or the superblock delta when delta_q is on). */
     block.qindex = current_q_;
-
+    if (segment_feature_active(seg, block.segment_id, kSegAltQ)) {
+      block.qindex = current_q_ + seg.feature_data[block.segment_id][kSegAltQ];
+      block.qindex = std::max(0, std::min(255, block.qindex));
+    }
     for (int i = 0; i < 4; ++i) block.delta_lf[i] = delta_lf_[i];
 
     /* A block copy block records DC_PRED where an intra block records its mode,
@@ -3928,6 +4145,13 @@ class TileParser {
 
   std::vector<MiRef> mi_ref_;
   std::vector<uint8_t> mi_size_;
+  /* The segmentation map being built, the previous frame's map when this frame
+   * predicts from it, and the per 4x4 contexts the temporal prediction symbol
+   * is coded with. */
+  std::vector<uint8_t> seg_map_;
+  const SegmentationMap* prev_seg_map_ = nullptr;
+  std::vector<uint8_t> above_seg_pred_;
+  std::vector<uint8_t> left_seg_pred_;
   std::vector<uint8_t> skip_map_;
   std::vector<uint8_t> skip_mode_map_;
   /* cdef_idx per 64x64, -1 until a block that is not skipped reads it */
@@ -3967,6 +4191,9 @@ class TileParser {
     }
     above_tx_lw_.assign(static_cast<size_t>(cols), 0);
     left_tx_lh_.assign(static_cast<size_t>(rows), 0);
+    seg_map_.assign(static_cast<size_t>(cols) * rows, 0);
+    above_seg_pred_.assign(static_cast<size_t>(cols), 0);
+    left_seg_pred_.assign(static_cast<size_t>(rows), 0);
     tx_cell_lw_.assign(static_cast<size_t>(cols) * rows, 0);
     tx_cell_lh_.assign(static_cast<size_t>(cols) * rows, 0);
     tx_type_map_.assign(static_cast<size_t>(cols) * rows, coef_tables::kDctDct);
@@ -4004,6 +4231,17 @@ class TileParser {
     start_cdf_ = cdf_;
     current_q_ = frame_.base_q_idx;
     for (int i = 0; i < 4; ++i) delta_lf_[i] = 0;
+    /* The map a temporal segment prediction reads: the primary reference's, and
+     * only when it has the same geometry - a segmentation map of another size
+     * says nothing about this frame's blocks. */
+    if (frame_.segmentation.enabled && refs_ &&
+        frame_.primary_ref_frame != kPrimaryRefNone) {
+      const int slot_index = frame_.ref_frame_idx[frame_.primary_ref_frame];
+      if (slot_index >= 0 && slot_index < 8) {
+        const SegmentationMap* map = refs_->slots[slot_index].seg_map.get();
+        if (map && map->mi_cols == cols && map->mi_rows == rows) prev_seg_map_ = map;
+      }
+    }
     decoder_.init(data_, size_, !frame_.disable_cdf_update);
   }
 };

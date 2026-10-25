@@ -320,6 +320,12 @@ struct TileDecodeResult {
    * from this context instead of the defaults. */
   std::shared_ptr<const CdfContext> cdf;
 
+  /* This frame's segmentation map, one id per 4x4 cell. A later frame whose
+   * primary_ref_frame points here reads it to predict its own segment ids, so
+   * it travels with the frame the way the motion vector grid and the tables
+   * do. Null when the frame has no segmentation. */
+  std::shared_ptr<const SegmentationMap> seg_map;
+
   /* Range decoder position at the end, for error reporting. */
   size_t bytes_used = 0;
   bool overrun = false;

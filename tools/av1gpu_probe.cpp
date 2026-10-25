@@ -63,7 +63,8 @@ void print_sequence(const SequenceHeader& seq) {
 
 void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const RefPool* refs,
                  const uint8_t* payload, size_t payload_size, ParseStatus parsed,
-                 std::shared_ptr<const RefMvs>* produced, std::shared_ptr<const CdfContext>* cdf) {
+                 std::shared_ptr<const RefMvs>* produced, std::shared_ptr<const CdfContext>* cdf,
+                 std::shared_ptr<const SegmentationMap>* seg_map) {
   if (hdr.show_existing_frame) {
     std::printf("  show_existing_frame: slot %d (%s frame, %dx%d)\n",
                 hdr.existing_frame_idx, frame_type_name(hdr.type), hdr.width, hdr.height);
@@ -137,7 +138,23 @@ void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const RefPoo
     for (int i = 0; i < count && i < 8; ++i) std::printf(" %d", hdr.cdef.y_strength[i]);
   }
   std::printf("\n");
-  if (hdr.segmentation_enabled) std::printf("  segmentation on\n");
+  if (hdr.segmentation_enabled) {
+    std::printf("  segmentation on");
+    const SegmentationParams& seg = hdr.segmentation;
+    std::printf(" map %d temporal %d data %d last %d preskip %d\n", seg.update_map,
+                seg.temporal_update, seg.update_data, seg.last_active_seg_id,
+                seg.seg_id_pre_skip);
+    for (int s = 0; s < kMaxSegments; ++s) {
+      bool any = false;
+      for (int f = 0; f < kSegFeatureCount; ++f) any = any || seg.feature_enabled[s][f];
+      if (!any) continue;
+      std::printf("    segment %d:", s);
+      for (int f = 0; f < kSegFeatureCount; ++f) {
+        if (seg.feature_enabled[s][f]) std::printf(" f%d=%d", f, seg.feature_data[s][f]);
+      }
+      std::printf("\n");
+    }
+  }
   if (hdr.delta_q_present) {
     std::printf("  delta Q per superblock (res %d)%s\n", hdr.delta_q_res,
                 hdr.delta_lf_present ? ", delta LF" : "");
@@ -175,6 +192,7 @@ void print_frame(const SequenceHeader& seq, const FrameHeader& hdr, const RefPoo
        * frame may inherit */
       if (produced) *produced = decoded.ref_mvs;
       if (cdf) *cdf = decoded.cdf;
+      if (seg_map) *seg_map = decoded.seg_map;
     } else if (status == ParseStatus::Unsupported) {
       std::printf("  tile: %zu block(s) parsed, %zu of %zu bytes used, then: %s\n",
                   decoded.blocks.size(), decoded.bytes_used, tile.size,
@@ -237,11 +255,12 @@ int probe_temporal_unit(const std::vector<uint8_t>& unit, size_t index,
       }
       std::shared_ptr<const RefMvs> produced;
       std::shared_ptr<const CdfContext> cdf;
-      print_frame(*seq, hdr, refs, obu.data, obu.size, parsed, &produced, &cdf);
+      std::shared_ptr<const SegmentationMap> seg_map;
+      print_frame(*seq, hdr, refs, obu.data, obu.size, parsed, &produced, &cdf, &seg_map);
       if (parsed == ParseStatus::Unsupported) {
         std::printf("  front-end: %s\n", error.c_str());
       }
-      refresh_ref_pool(hdr, refs, produced, cdf);
+      refresh_ref_pool(hdr, refs, produced, cdf, seg_map);
     }
   }
   return status;
