@@ -179,8 +179,8 @@ if(AV1GPU_BUILD_TESTS)
   # chroma rows: the filter covers 68 and 36, which is neither the picture size
   # nor the eight sample grid, and CDEF and restoration read the difference),
   # and tiles the only one cut into more than one tile per frame (2x2, at
-  # 128 + 128 samples across and 128 + 32 down, so three of the four tiles have
-  # a neighbour of another tile on two sides).
+  # 128 + 128 samples across and 128 + 32 down, so every one of the four tiles
+  # has a neighbour of another tile on two sides).
   # Every frame of all twenty one is bit exact.
   if(TARGET av1gpu_decode)
     foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra seg_altq superres grain

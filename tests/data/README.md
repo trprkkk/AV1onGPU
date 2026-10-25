@@ -453,7 +453,7 @@ frames of 256x160, 72 KB, `-cpu-used 3 -crf 28 -lag-in-frames 0 -g 4 -tiles 2x2`
 (libaom needs row-mt on, which ffmpeg's `-tiles` turns on, to honour more than
 one tile row). The grid divides 256 into 128 + 128 samples across and 160 into
 128 + 32 down, so the tile row boundary is not at the frame's middle and the
-bottom two tiles are only 32 samples high - three of the four tiles have a
+bottom two tiles are only 32 samples high - every one of the four tiles has a
 neighbour from another tile on two sides. Four frames, the first a key frame, so
 three code inter prediction across the tile edges.
 

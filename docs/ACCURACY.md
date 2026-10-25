@@ -1122,8 +1122,8 @@ from dav1d again by the numbers above, which is how the fixture is known to pin
 them.
 
 `tests/data/tiles.ivf` is 256x160 cut into 2x2 tiles - 128 + 128 across and
-128 + 32 down, so the bottom two tiles are only 32 samples high and three of the
-four tiles have a neighbour from another tile on two sides. Four frames, the
+128 + 32 down, so the bottom two tiles are only 32 samples high and every one of
+the four tiles has a neighbour from another tile on two sides. Four frames, the
 first a key frame, at `-crf 28`; the content pans and zooms, which is what makes
 libaom code local warped motion (699 blocks of the four frames), and the tile row
 boundary runs through a dark band where the encoder spends 4x4 blocks - the
