@@ -473,6 +473,10 @@ class TileParser {
     return 0;
   }
 
+  /* the most 4x4 units a block's coded span exceeds the frame by on either
+   * axis, i.e. the largest block side */
+  static constexpr int kMiPad = 16;
+
   /* read_segment_id(): `skip` is the block's skip flag, which decides that the
    * block keeps its neighbours' prediction rather than coding a distance. */
   int read_segment_id_symbol(int row, int col, bool skip) {
@@ -1903,12 +1907,21 @@ class TileParser {
    * the test that decides whether the block codes a motion mode at all. The
    * odd offsets are the ones a 4x4 aligned blend can reach. */
   bool find_odd_inter(bool top, int row, int col, int bw4, int bh4) const {
-    const int len = top ? (bw4 >> 1) : (bh4 >> 1);
-    for (int n = 0; n < len; ++n) {
-      const int offset = n * 2;
-      const MiRef& n_ref = top ? mi_at(row - 1, col + 1 + offset) : mi_at(row + 1 + offset, col - 1);
-      if (!n_ref.intra) return true;
+    /* The span is clipped to the frame exactly as 7.10.2.6 clips it: a block
+     * at the frame's bottom or right edge runs past MiRows / MiCols (a 64x64
+     * block whose top row is 4 rows above the end covers twelve rows that do
+     * not exist), and the neighbour out there has no syntax to read. Without
+     * the clip this read samples whatever follows the map, which made the
+     * decision - and with it the decoded picture - depend on heap contents. */
+    if (top) {
+      const int end = std::min(mi_cols(), col + bw4);
+      for (int x4 = col; x4 < end; x4 += 2)
+        if (!mi_at(row - 1, x4 | 1).intra) return true;
+      return false;
     }
+    const int end = std::min(mi_rows(), row + bh4);
+    for (int y4 = row; y4 < end; y4 += 2)
+      if (!mi_at(y4 | 1, col - 1).intra) return true;
     return false;
   }
 
@@ -4174,6 +4187,11 @@ class TileParser {
    * is coded with. */
   std::vector<uint8_t> seg_map_;
   const SegmentationMap* prev_seg_map_ = nullptr;
+  /* One entry per 4x4 column / row, plus kMiPad: a block whose top row is a
+   * few rows above the frame's last one still spans its full coded height, so
+   * set_segment_prediction_contexts writes past MiCols / MiRows exactly as
+   * 5.11.9's loop does. Those entries are never read back (the block that would
+   * read them does not exist), but the write has to land inside the array. */
   std::vector<uint8_t> above_seg_pred_;
   std::vector<uint8_t> left_seg_pred_;
   std::vector<uint8_t> skip_map_;
@@ -4216,8 +4234,8 @@ class TileParser {
     above_tx_lw_.assign(static_cast<size_t>(cols), 0);
     left_tx_lh_.assign(static_cast<size_t>(rows), 0);
     seg_map_.assign(static_cast<size_t>(cols) * rows, 0);
-    above_seg_pred_.assign(static_cast<size_t>(cols), 0);
-    left_seg_pred_.assign(static_cast<size_t>(rows), 0);
+    above_seg_pred_.assign(static_cast<size_t>(cols) + kMiPad, 0);
+    left_seg_pred_.assign(static_cast<size_t>(rows) + kMiPad, 0);
     tx_cell_lw_.assign(static_cast<size_t>(cols) * rows, 0);
     tx_cell_lh_.assign(static_cast<size_t>(cols) * rows, 0);
     tx_type_map_.assign(static_cast<size_t>(cols) * rows, coef_tables::kDctDct);
