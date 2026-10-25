@@ -29,6 +29,14 @@ file(READ "${BODY}" body_text)
 string(REPLACE "#include \"av1gpu_kernels.h\"" "" body_text "${body_text}")
 set(source "${header_text}\n${body_text}")
 
+# The source becomes a raw string literal below, which cannot contain its own
+# delimiter. Nothing does today; failing here says so at configure time instead
+# of leaving a C++ compile error that points at generated code.
+string(FIND "${source}" ")AV1GEMBED" delimiter_at)
+if(NOT delimiter_at EQUAL -1)
+  message(FATAL_ERROR "${BODY} contains the raw string delimiter used to embed it")
+endif()
+
 if(LANGUAGE STREQUAL "cuda")
   set(function "cuda")
 else()

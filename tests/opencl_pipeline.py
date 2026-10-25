@@ -189,6 +189,7 @@ class Replay:
         tmp_buf = self.buffer(np.zeros(max(len(coef), len(residual)), dtype=np.int32),
                               readonly=False)
         frame = self.buffer(np.zeros(size, dtype=np.uint16), readonly=False)
+        palette_buf = self.buffer(np.zeros(8, dtype=np.uint8))
 
         for wave in plan["waves"]:
             # ---- inter prediction (reads the reference pool) --------------
@@ -210,8 +211,15 @@ class Replay:
             if wave["intra"]:
                 jobs = wave["intra"]
                 job_buf, pref, total = self.jobs(jobs, [1] * len(jobs))
+                # Palette blocks index a per frame colour map buffer. The dump
+                # does not carry that map yet, so a palette block would read the
+                # wrong entries; the frames replayed here code none. The kernel
+                # side is covered by opencl_selftest.py, and the whole path by
+                # decoding tests/data/palette_sc.ivf with --backend opencl on a
+                # machine that has an ICD loader.
                 self.launch("av1g_k_intra", len(jobs),
-                            (job_buf, np.int32(len(jobs)), frame, np.int32(maxv)))
+                            (job_buf, np.int32(len(jobs)), frame, palette_buf,
+                             np.int32(maxv)))
 
             # ---- inverse transform: rows then columns ----------------------
             if wave["itx"]:

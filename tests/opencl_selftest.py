@@ -132,8 +132,38 @@ int main() {
     job.filter_type = -1;
     job.max_x = stride - 1;
     job.max_y = size - 1;
-    av1g_intra_block(&job, plane.data(), 255);
+    av1g_intra_block(&job, plane.data(), nullptr, 255);
     emit_plane("intra", plane.data(), stride, 8, 8, 8, 8);
+  }
+
+  /* --------------------------------------------------------- intra, palette */
+  /* a palette block ignores its neighbours: every sample is a lookup into the
+   * job's colour table through the coded colour map */
+  {
+    const int stride = 32, size = 32;
+    std::vector<uint16_t> plane((size_t)stride * size, 0);
+    unsigned char map[4 * 4] = {0, 1, 2, 1,
+                                2, 0, 1, 2,
+                                1, 2, 0, 1,
+                                2, 1, 2, 0};
+    Av1gIntraJob job;
+    std::memset(&job, 0, sizeof(job));
+    job.dst_off = 8 * stride + 8;
+    job.dst_stride = stride;
+    job.x = 8;
+    job.y = 8;
+    job.w = 4;
+    job.h = 4;
+    job.bitdepth = 8;
+    job.palette = 1;
+    job.palette_size = 3;
+    job.palette_color[0] = 12;
+    job.palette_color[1] = 200;
+    job.palette_color[2] = 77;
+    job.palette_off = 0;
+    job.palette_stride = 4;
+    av1g_intra_block(&job, plane.data(), map, 255);
+    emit_plane("palette", plane.data(), stride, 8, 8, 4, 4);
   }
 
   /* ---------------------------------------------------------------- cdef */
@@ -184,6 +214,9 @@ int main() {
   F(Av1gIntraJob, luma_off); F(Av1gIntraJob, luma_stride);
   F(Av1gIntraJob, luma_w); F(Av1gIntraJob, luma_h); F(Av1gIntraJob, ss_x);
   F(Av1gIntraJob, ss_y); F(Av1gIntraJob, max_x); F(Av1gIntraJob, max_y);
+  F(Av1gIntraJob, palette); F(Av1gIntraJob, palette_size);
+  FA(Av1gIntraJob, palette_color, 8);
+  F(Av1gIntraJob, palette_off); F(Av1gIntraJob, palette_stride);
   S(Av1gInterJob);
   F(Av1gInterJob, dst_off); F(Av1gInterJob, dst_stride); F(Av1gInterJob, w);
   F(Av1gInterJob, h); F(Av1gInterJob, ref0_off); F(Av1gInterJob, ref0_stride);
@@ -458,8 +491,10 @@ def main():
     plane_buf = upload(plane)
     ipref, itotal = prefix([1])
     ipref_buf = upload(ipref)
+    palette_buf = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                            hostbuf=np.zeros(8, dtype=np.uint8))
     launch(None, program.av1g_k_intra, itotal, ijob_buf, np.int32(1), plane_buf,
-           np.int32(255))
+           palette_buf, np.int32(255))
     queue.finish()
     out = download(plane_buf, plane.shape)
     region = out.reshape(size, stride)[8:16, 8:16].astype(int)
@@ -467,6 +502,43 @@ def main():
     check("intra matches the host kernel", bool((region == want).all()), True)
     check("intra DC is flat", int(region.max() - region.min()), 0)
     check("intra DC value", int(region[0, 0]), (100 * 8 + 200 * 8 + 8) // 16)
+
+    # --------------------------------------------------------- intra, palette
+    print("palette prediction")
+    plane = np.zeros(stride * size, dtype=np.uint16)
+    # a 4x4 block at (8, 8) with a 4x4 colour map and three colours: the kernel
+    # has to read the map from the palette buffer and look each entry up
+    colour_map = np.array([0, 1, 2, 1,
+                           2, 0, 1, 2,
+                           1, 2, 0, 1,
+                           2, 1, 2, 0], dtype=np.uint8)
+    pj = IntraJob()
+    pj.dst_off = 8 * stride + 8
+    pj.dst_stride = stride
+    pj.x = 8
+    pj.y = 8
+    pj.w = 4
+    pj.h = 4
+    pj.bitdepth = 8
+    pj.palette = 1
+    pj.palette_size = 3
+    pj.palette_color0 = 12
+    pj.palette_color1 = 200
+    pj.palette_color2 = 77
+    pj.palette_off = 0
+    pj.palette_stride = 4
+    pjob_buf = upload(np.frombuffer(pj, dtype=np.uint8).copy())
+    ppal_buf = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                         hostbuf=np.ascontiguousarray(colour_map))
+    pplane_buf = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=plane)
+    launch(None, program.av1g_k_intra, 1, pjob_buf, np.int32(1), pplane_buf,
+           ppal_buf, np.int32(255))
+    queue.finish()
+    out = download(pplane_buf, plane.shape)
+    region = out.reshape(size, stride)[8:12, 8:12].astype(int)
+    want = np.array(tables["host.palette"], dtype=int).reshape(4, 4)
+    check("palette matches the host kernel", bool((region == want).all()), True)
+    check("palette uses every colour", len(set(region.flatten().tolist())), 3)
 
     # ---------------------------------------------------------------- inter
     print("inter prediction")

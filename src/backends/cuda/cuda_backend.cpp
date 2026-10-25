@@ -46,27 +46,41 @@ inline size_t round_up(size_t v, size_t m) { return ((v + m - 1) / m) * m; }
 using cuda::CUdeviceptr;
 
 /* argument pack for cuLaunchKernel: it wants an array of pointers to the
- * argument values, which is easy to get wrong by hand. */
+ * argument values, which is easy to get wrong by hand. The bound is checked
+ * here rather than at the launch site, because writing past the array would
+ * corrupt the caller's stack and the launch would still look fine. */
 class Launcher {
  public:
+  static constexpr int kMaxArgs = 16;
+
   void add_int(int value) {
+    if (count_ >= kMaxArgs) {
+      overflow_ = true;
+      return;
+    }
     ints_[count_] = value;
     slots_[count_] = &ints_[count_];
     ++count_;
   }
   void add_ptr(CUdeviceptr value) {
+    if (count_ >= kMaxArgs) {
+      overflow_ = true;
+      return;
+    }
     ptrs_[count_] = value;
     slots_[count_] = &ptrs_[count_];
     ++count_;
   }
   void** values() { return slots_; }
   int count() const { return count_; }
+  bool ok() const { return !overflow_; }
 
  private:
   int count_ = 0;
-  void* slots_[16] = {nullptr};
-  int ints_[16] = {0};
-  CUdeviceptr ptrs_[16] = {0};
+  bool overflow_ = false;
+  void* slots_[kMaxArgs] = {nullptr};
+  int ints_[kMaxArgs] = {0};
+  CUdeviceptr ptrs_[kMaxArgs] = {0};
 };
 
 class CudaBackend final : public Backend {
@@ -134,10 +148,14 @@ class CudaBackend final : public Backend {
     const PlanLayout g = make_plan_layout(geometry, 64);
     const size_t size = g.buffer_size;
     layout_ = g;
-    ensure(&frame_, &frame_cap_, size * sizeof(uint16_t));
-    ensure(&scratch_, &scratch_cap_, size * sizeof(uint16_t));
-    ensure(&ref_pool_, &ref_cap_, size * kReferenceSlots * sizeof(uint16_t));
-    if (!tables_uploaded_) {
+    /* prepare() has no way to report an error, so record the failure and let
+     * decode() refuse the frame: silently decoding into a null pointer would
+     * either fault the context or, worse, be caught by the sync check much
+     * later as an unexplained device error. */
+    alloc_failed_ = !ensure(&frame_, &frame_cap_, size * sizeof(uint16_t)) ||
+                    !ensure(&scratch_, &scratch_cap_, size * sizeof(uint16_t)) ||
+                    !ensure(&ref_pool_, &ref_cap_, size * kReferenceSlots * sizeof(uint16_t));
+    if (!tables_uploaded_ && !alloc_failed_) {
       upload_tables();
       tables_uploaded_ = true;
     }
@@ -185,20 +203,30 @@ class CudaBackend final : public Backend {
   bool decode(const FramePlan& plan, bool keep_reference, Frame* out, int* out_slot,
               DecodeStats* stats, std::string* error) override {
     error->clear();
+    if (alloc_failed_)
+      return fail(error, "out of device memory (prepare failed to allocate the frame buffers)");
     const double t0 = now_ms();
     const PlanLayout& g = plan.layout;
     const int maxv = plan.maxv;
     int launches = 0;
 
-    ensure(&coef_, &coef_cap_, (plan.coefficients.size() + 1) * sizeof(int));
-    if (!plan.coefficients.empty())
-      driver_.MemcpyHtoD(coef_, plan.coefficients.data(),
-                         plan.coefficients.size() * sizeof(int));
-    ensure(&tmp_, &tmp_cap_, (plan.tmp_size + 1) * sizeof(int));
+    /* Every allocation and every copy is checked: a failed cuMemAlloc leaves a
+     * null device pointer, and a kernel launched against it faults the context
+     * asynchronously, which would surface as wrong pixels in a later frame
+     * rather than as an error in this one. */
+    if (!ensure(&coef_, &coef_cap_, (plan.coefficients.size() + 1) * sizeof(int)) ||
+        !ensure(&tmp_, &tmp_cap_, (plan.tmp_size + 1) * sizeof(int)))
+      return fail(error, "out of device memory for the coefficient buffers");
+    if (!plan.coefficients.empty() &&
+        driver_.MemcpyHtoD(coef_, plan.coefficients.data(),
+                           plan.coefficients.size() * sizeof(int)) != cuda::CUDA_SUCCESS)
+      return fail(error, "coefficient upload failed");
     if (!plan.residual.empty()) {
-      ensure(&residual_, &residual_cap_, (plan.residual.size() + 1) * sizeof(int));
-      driver_.MemcpyHtoD(residual_, plan.residual.data(),
-                         plan.residual.size() * sizeof(int));
+      if (!ensure(&residual_, &residual_cap_, (plan.residual.size() + 1) * sizeof(int)))
+        return fail(error, "out of device memory for the residual buffer");
+      if (driver_.MemcpyHtoD(residual_, plan.residual.data(),
+                             plan.residual.size() * sizeof(int)) != cuda::CUDA_SUCCESS)
+        return fail(error, "residual upload failed");
     }
 
     for (const WaveJobs& wave : plan.waves) {
@@ -341,8 +369,11 @@ class CudaBackend final : public Backend {
     }
 
     if (!plan.cdef.empty()) {
-      ensure(&scratch_, &scratch_cap_, g.buffer_size * sizeof(uint16_t));
-      driver_.MemcpyDtoD(scratch_, frame_, g.buffer_size * sizeof(uint16_t));
+      if (!ensure(&scratch_, &scratch_cap_, g.buffer_size * sizeof(uint16_t)))
+        return fail(error, "out of device memory for the CDEF snapshot");
+      if (driver_.MemcpyDtoD(scratch_, frame_, g.buffer_size * sizeof(uint16_t)) !=
+          cuda::CUDA_SUCCESS)
+        return fail(error, "CDEF snapshot copy failed");
       int total = 0;
       CUdeviceptr job_mem = 0, pref_mem = 0;
       if (!upload_jobs(plan.cdef, &job_mem, &pref_mem, &total,
@@ -361,10 +392,14 @@ class CudaBackend final : public Backend {
     }
 
     if (!plan.grain.empty()) {
-      ensure(&grain_, &grain_cap_, plan.grain_template.size());
-      driver_.MemcpyHtoD(grain_, plan.grain_template.data(), plan.grain_template.size());
-      ensure(&lut_, &lut_cap_, sizeof(plan.grain_lut));
-      driver_.MemcpyHtoD(lut_, plan.grain_lut, sizeof(plan.grain_lut));
+      if (!ensure(&grain_, &grain_cap_, plan.grain_template.size()) ||
+          !ensure(&lut_, &lut_cap_, sizeof(plan.grain_lut)))
+        return fail(error, "out of device memory for the film grain tables");
+      if (driver_.MemcpyHtoD(grain_, plan.grain_template.data(),
+                             plan.grain_template.size()) != cuda::CUDA_SUCCESS ||
+          driver_.MemcpyHtoD(lut_, plan.grain_lut, sizeof(plan.grain_lut)) !=
+              cuda::CUDA_SUCCESS)
+        return fail(error, "film grain table upload failed");
       int total = 0;
       CUdeviceptr job_mem = 0, pref_mem = 0;
       if (!upload_jobs(plan.grain, &job_mem, &pref_mem, &total,
@@ -383,7 +418,18 @@ class CudaBackend final : public Backend {
       ++launches;
     }
 
-    driver_.CtxSynchronize();
+    /* The single point where a device side fault becomes visible. OpenCL's
+     * clFinish is checked the same way: a kernel that reads out of bounds - a
+     * stale slot offset, an empty job array - must fail the frame loudly
+     * instead of handing back whatever the device happened to leave behind. */
+    {
+      const cuda::CUresult rc = driver_.CtxSynchronize();
+      if (rc != cuda::CUDA_SUCCESS) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "CUDA kernel execution failed (cuCtxSynchronize = %d)", rc);
+        return fail(error, buf);
+      }
+    }
     const double t2 = now_ms();
 
     if (out) {
@@ -392,7 +438,9 @@ class CudaBackend final : public Backend {
         out->allocate(g.frame.width, g.frame.height, g.frame.bit_depth, g.frame.ss_x,
                       g.frame.ss_y);
       if (staging_.size() < g.buffer_size) staging_.resize(g.buffer_size);
-      driver_.MemcpyDtoH(staging_.data(), frame_, g.buffer_size * sizeof(uint16_t));
+      if (driver_.MemcpyDtoH(staging_.data(), frame_, g.buffer_size * sizeof(uint16_t)) !=
+          cuda::CUDA_SUCCESS)
+        return fail(error, "frame read back failed");
       for (int p = 0; p < 3; ++p) {
         const int w = g.plane_w[p];
         const int h = g.plane_h[p];
@@ -413,7 +461,8 @@ class CudaBackend final : public Backend {
           ref_pool_ + static_cast<size_t>(slot) * g.buffer_size * sizeof(uint16_t), frame_,
           g.buffer_size * sizeof(uint16_t));
       if (rc != cuda::CUDA_SUCCESS) return fail(error, "reference copy failed");
-      driver_.CtxSynchronize();
+      if (driver_.CtxSynchronize() != cuda::CUDA_SUCCESS)
+        return fail(error, "reference copy did not complete");
       slots_[slot] = true;
     }
     if (out_slot) *out_slot = slot;
@@ -495,9 +544,15 @@ class CudaBackend final : public Backend {
       *error = "av1g_k_color failed";
       return false;
     }
-    driver_.CtxSynchronize();
+    if (driver_.CtxSynchronize() != cuda::CUDA_SUCCESS) {
+      *error = "av1g_k_color failed";
+      return false;
+    }
     rgb->resize(rgb_bytes);
-    driver_.MemcpyDtoH(rgb->data(), rgb_, rgb_bytes);
+    if (driver_.MemcpyDtoH(rgb->data(), rgb_, rgb_bytes) != cuda::CUDA_SUCCESS) {
+      *error = "RGB read back failed";
+      return false;
+    }
     return true;
   }
 
@@ -510,19 +565,25 @@ class CudaBackend final : public Backend {
   /* one pool slot per AV1 reference slot plus the picture being decoded; see
    * the CPU backend */
   static constexpr int kReferenceSlots = 9;
+  /* the smallest device allocation ensure() hands out; see ensure() */
+  static constexpr size_t kMinAllocation = 1024;
 
   void shutdown() {
     if (module_ && driver_.ModuleLoadDataEx) {
       /* no cuModuleUnload in the minimal set: the context teardown frees it */
     }
-    CUdeviceptr buffers[] = {frame_,    scratch_, coef_,     tmp_,   residual_,
-                             filters_,  ref_pool_, grain_,
-                             lut_,      rgb_,     job_,      pref_};
+    /* every allocation: the palette map and the second prefix table were
+     * missing from this list, so a backend that decoded a palette stream leaked
+     * them when it was destroyed */
+    CUdeviceptr buffers[] = {frame_,    scratch_, coef_,   tmp_,     residual_,
+                             filters_,  ref_pool_, grain_, lut_,     rgb_,
+                             job_,      pref_,    pref_b_, palette_};
     for (CUdeviceptr b : buffers)
       if (b && driver_.MemFree) driver_.MemFree(b);
     frame_ = scratch_ = coef_ = tmp_ = residual_ = 0;
     filters_ = ref_pool_ = grain_ = 0;
-    lut_ = rgb_ = job_ = pref_ = pref_b_ = 0;
+    lut_ = rgb_ = job_ = pref_ = pref_b_ = palette_ = 0;
+    palette_cap_ = 0;
     if (context_ && driver_.CtxDestroy) driver_.CtxDestroy(context_);
     context_ = nullptr;
     if (driver_lib_) {
@@ -543,46 +604,74 @@ class CudaBackend final : public Backend {
       *error = "nvrtcCreateProgram failed";
       return false;
     }
-    /* NVRTC spells the minor version as two digits for 10.x and later, so
-     * build the string with enough room for "compute_1200" */
+    /* NVRTC spells the minor version as one digit from 5 upwards (8.6 becomes
+     * compute_86) and ignores it below that (6.0 becomes compute_60), so the
+     * minor is only added when it is at least five - and "compute_100" for a
+     * 10.0 part needs the full major printed, which is why this is not just two
+     * characters. */
+    if (compute_major_ <= 0) {
+      *error = "the driver reported no compute capability (cuDeviceGetAttribute failed)";
+      nvrtc_.DestroyProgram(&program);
+      return false;
+    }
     char arch[48];
-    std::snprintf(arch, sizeof(arch), "--gpu-architecture=compute_%d%d", compute_major_,
-                  compute_minor_ >= 5 ? compute_minor_ : 0);
+    if (compute_minor_ >= 5)
+      std::snprintf(arch, sizeof(arch), "--gpu-architecture=compute_%d%d", compute_major_,
+                    compute_minor_);
+    else
+      std::snprintf(arch, sizeof(arch), "--gpu-architecture=compute_%d0", compute_major_);
+    /* -default-device: the kernels are a library, not a translation unit with a
+     * main function. */
     const char* options[] = {arch, "-default-device"};
-    int rc = nvrtc_.CompileProgram(program, 2, options);
+    const int rc = nvrtc_.CompileProgram(program, 2, options);
     size_t log_size = 0;
     nvrtc_.GetProgramLogSize(program, &log_size);
     std::string log(log_size + 1, '\0');
     if (log_size) nvrtc_.GetProgramLog(program, &log[0]);
     if (rc != 0) {
-      *error = "NVRTC build failed:\n" + log;
+      *error = std::string("NVRTC build failed (") + arch + "):\n" + log;
       nvrtc_.DestroyProgram(&program);
       return false;
     }
     if (options_.verbose) error->append(log);
+
     size_t ptx_size = 0;
-    nvrtc_.GetPTXSize(program, &ptx_size);
+    if (nvrtc_.GetPTXSize(program, &ptx_size) != 0 || ptx_size == 0) {
+      *error = "NVRTC produced no PTX";
+      nvrtc_.DestroyProgram(&program);
+      return false;
+    }
     std::vector<char> ptx(ptx_size + 1, 0);
-    nvrtc_.GetPTX(program, ptx.data());
+    if (nvrtc_.GetPTX(program, ptx.data()) != 0) {
+      *error = "NVRTC GetPTX failed";
+      nvrtc_.DestroyProgram(&program);
+      return false;
+    }
     nvrtc_.DestroyProgram(&program);
 
-    if (driver_.ModuleLoadDataEx(&module_, ptx.data(), 0, nullptr, nullptr) !=
-        cuda::CUDA_SUCCESS) {
-      *error = "cuModuleLoadDataEx failed";
+    const cuda::CUresult load = driver_.ModuleLoadDataEx(&module_, ptx.data(), 0, nullptr, nullptr);
+    if (load != cuda::CUDA_SUCCESS) {
+      *error = "cuModuleLoadDataEx failed (" + std::to_string(load) + ") for " + arch;
       return false;
     }
     return true;
   }
 
+  /* cuMemAlloc rejects a request of zero bytes, and callers legitimately ask
+   * for zero: a frame with no palette coded block has an empty palette map, and
+   * passing that straight through failed the whole decode with "palette map
+   * upload failed". Allocate a minimum block instead, so the buffer is always a
+   * valid (if unused) device pointer. */
   bool ensure(CUdeviceptr* buffer, size_t* capacity, size_t bytes) {
-    if (*buffer && *capacity >= bytes) return true;
+    const size_t size = std::max<size_t>(bytes, kMinAllocation);
+    if (*buffer && *capacity >= size) return true;
     if (*buffer) driver_.MemFree(*buffer);
     *buffer = 0;
-    if (driver_.MemAlloc(buffer, bytes) != cuda::CUDA_SUCCESS) {
+    if (driver_.MemAlloc(buffer, size) != cuda::CUDA_SUCCESS) {
       *capacity = 0;
       return false;
     }
-    *capacity = bytes;
+    *capacity = size;
     return true;
   }
 
@@ -643,7 +732,7 @@ class CudaBackend final : public Backend {
 
   bool launch(const char* name, int elements, Launcher& launcher) {
     if (elements <= 0) return true;
-    if (launcher.count() > 16) return false;
+    if (!launcher.ok()) return false;
     auto it = functions_.find(name);
     CUfunction function = nullptr;
     if (it != functions_.end()) {
@@ -691,6 +780,7 @@ class CudaBackend final : public Backend {
   size_t residual_cap_ = 0, filters_cap_ = 0, ref_cap_ = 0;
   size_t grain_cap_ = 0, lut_cap_ = 0, rgb_cap_ = 0, palette_cap_ = 0;
   size_t job_cap_ = 0, pref_cap_ = 0, pref_b_cap_ = 0;
+  bool alloc_failed_ = false;
   std::vector<uint16_t> staging_;
   bool slots_[kReferenceSlots] = {};
   int last_slot_ = -1;
@@ -728,7 +818,9 @@ bool load_driver(Driver* driver, void** library, std::string* error) {
       "libcuda.so.1", "libcuda.so",
 #endif
   };
-  *library = open_first(names, 2);
+  /* the count must follow the array: the Windows list has one entry, not two,
+   * and a hard coded bound reads past its end */
+  *library = open_first(names, static_cast<int>(sizeof(names) / sizeof(names[0])));
   if (!*library) {
     *error = "no CUDA driver library (libcuda.so.1)";
     return false;
@@ -773,7 +865,7 @@ bool load_nvrtc(Nvrtc* nvrtc, void** library, std::string* error) {
       "libnvrtc.so.10.2", "libnvrtc.so",
 #endif
   };
-  *library = open_first(names, 6);
+  *library = open_first(names, static_cast<int>(sizeof(names) / sizeof(names[0])));
   if (!*library) {
     *error = "no NVRTC library (libnvrtc.so); install the CUDA toolkit or the "
              "cuda-nvrtc package";
@@ -834,6 +926,12 @@ std::vector<DeviceInfo> list_cuda_devices() {
   }
   int count = 0;
   driver.DeviceGetCount(&count);
+  /* cuDeviceTotalMem needs a current context (the attribute queries do not), so
+   * without this the listing used to report 0 bytes of device memory. Creating
+   * a context is not free, but a device listing that lies about the size of the
+   * device is worse than spending a few milliseconds. */
+  cuda::CUcontext context = nullptr;
+  driver.CtxCreate(&context, 0, 0);
   for (int i = 0; i < count; ++i) {
     cuda::CUdevice device;
     if (driver.DeviceGet(&device, i) != cuda::CUDA_SUCCESS) continue;
@@ -858,6 +956,7 @@ std::vector<DeviceInfo> list_cuda_devices() {
     info.available = true;
     out.push_back(info);
   }
+  if (context) driver.CtxDestroy(context);
   cuda::close_library(library);
   return out;
 }

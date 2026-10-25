@@ -133,12 +133,13 @@ endif()
 
 if(AV1GPU_BUILD_TESTS)
   enable_testing()
-  foreach(test test_kernels test_pipeline test_frontend test_entropy)
+  foreach(test test_kernels test_pipeline test_frontend test_entropy test_gpu_sources)
     add_executable(${test} tests/${test}.cpp)
     target_link_libraries(${test} PRIVATE av1gpu)
     set_target_properties(${test} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     target_compile_definitions(${test} PRIVATE
-      AV1GPU_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+      AV1GPU_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+      AV1GPU_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME ${test} COMMAND ${test})
   endforeach()
 
