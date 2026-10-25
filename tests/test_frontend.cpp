@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -88,6 +89,18 @@ struct SequenceSpec {
   bool cdef = true;
   bool film_grain = false;
   bool order_hint = false;
+  /* frame_id_numbers_present: the sequence carries frame ids, so every frame
+   * header names its id and every reference names how far back it is. */
+  bool frame_ids = false;
+  int delta_frame_id_minus_2 = 1;
+  int additional_frame_id_length_minus_1 = 0;
+
+  /* idLen, the number of bits a frame id occupies */
+  int frame_id_n_bits() const {
+    return additional_frame_id_length_minus_1 + delta_frame_id_minus_2 + 3;
+  }
+  /* deltaFrameIdLength: the width of the "how far back" field */
+  int delta_frame_id_n_bits() const { return delta_frame_id_minus_2 + 2; }
 };
 
 std::vector<uint8_t> write_sequence_header(const SequenceSpec& spec) {
@@ -106,7 +119,11 @@ std::vector<uint8_t> write_sequence_header(const SequenceSpec& spec) {
   w.bits(9, 4);  /* frame_height_bits_minus_1 */
   w.bits(static_cast<uint32_t>(spec.width - 1), 10);
   w.bits(static_cast<uint32_t>(spec.height - 1), 10);
-  w.bit(false); /* frame_id_numbers_present */
+  w.bit(spec.frame_ids); /* frame_id_numbers_present */
+  if (spec.frame_ids) {
+    w.bits(static_cast<uint32_t>(spec.delta_frame_id_minus_2), 4);
+    w.bits(static_cast<uint32_t>(spec.additional_frame_id_length_minus_1), 3);
+  }
   w.bit(false); /* use_128x128_superblock */
   w.bit(false); /* enable_filter_intra */
   w.bit(false); /* enable_intra_edge_filter */
@@ -143,6 +160,9 @@ struct KeyFrameSpec {
   int base_q_idx = 60;
   int log2_cols = 0;
   bool show = true;
+  /* only written when the sequence carries frame ids */
+  int frame_id = 0;
+  int order_hint = 0;
 };
 
 std::vector<uint8_t> write_key_frame_header(const SequenceSpec& seq_spec,
@@ -153,7 +173,10 @@ std::vector<uint8_t> write_key_frame_header(const SequenceSpec& seq_spec,
   w.bit(spec.show);
   w.bit(false);            /* disable_cdf_update */
   w.bit(false);            /* allow_screen_content_tools */
+  if (seq_spec.frame_ids) w.bits(static_cast<uint32_t>(spec.frame_id),
+                                 seq_spec.frame_id_n_bits());
   w.bit(false);            /* frame_size_override_flag */
+  if (seq_spec.order_hint) w.bits(static_cast<uint32_t>(spec.order_hint), 3);
   w.bit(false);            /* render_and_frame_size_different */
   w.bit(true);             /* refresh_frame_context (inverted on the wire) */
 
@@ -605,6 +628,99 @@ std::vector<uint8_t> write_inter_frame_header(const SequenceSpec& spec, int orde
   return w.bytes();
 }
 
+/* show_existing_frame: no tile data, just the slot to display - and, once the
+ * sequence carries frame ids, the id that frame was stored with. */
+std::vector<uint8_t> write_show_existing_frame(const SequenceSpec& spec, int slot,
+                                               int display_frame_id) {
+  BitWriter w;
+  w.bit(true);  /* show_existing_frame */
+  w.bits(static_cast<uint32_t>(slot), 3);
+  if (spec.frame_ids) w.bits(static_cast<uint32_t>(display_frame_id), spec.frame_id_n_bits());
+  w.align();
+  return w.bytes();
+}
+
+/* An inter frame header written field by field for a sequence that carries
+ * order hints and/or frame ids - the two things `write_inter_frame_header`
+ * above leaves out, because its sequence has neither. `slots` is the reference
+ * list the frame codes (ignored when `short_signaling` is set) and `deltas` the
+ * "how far back" value for each of the seven references. */
+struct InterHeaderSpec {
+  int order_hint = 4;
+  int frame_id = 0;
+  int refresh_flags = 0x01;
+  bool short_signaling = false;
+  int last_frame_idx = 0;
+  int gold_frame_idx = 0;
+  int slots[7] = {0, 0, 0, 0, 0, 0, 0};
+  int deltas[7] = {1, 1, 1, 1, 1, 1, 1};
+  bool error_resilient = false;
+  int ref_hints[8] = {0, 0, 0, 0, 0, 0, 0, 0}; /* only coded when error_resilient */
+  bool reference_select = false;
+};
+
+std::vector<uint8_t> write_inter_frame_header_ids(const SequenceSpec& spec,
+                                                  const InterHeaderSpec& in) {
+  BitWriter w;
+  w.bit(false);        /* show_existing_frame */
+  w.bits(1, 2);        /* frame_type = INTER */
+  w.bit(true);         /* show_frame */
+  w.bit(in.error_resilient);
+  w.bit(false);        /* disable_cdf_update */
+  w.bit(false);        /* allow_screen_content_tools */
+  if (spec.frame_ids) w.bits(static_cast<uint32_t>(in.frame_id), spec.frame_id_n_bits());
+  w.bit(false);        /* frame_size_override: inherit the reference size */
+  if (spec.order_hint) w.bits(static_cast<uint32_t>(in.order_hint), 3);
+  if (!in.error_resilient) w.bits(0, 3); /* primary_ref_frame: slot 0 */
+  w.bits(static_cast<uint32_t>(in.refresh_flags), 8);
+  if (in.error_resilient && spec.order_hint) {
+    /* an error resilient frame re-states the order hint of every slot */
+    for (int i = 0; i < 8; ++i) w.bits(static_cast<uint32_t>(in.ref_hints[i]), 3);
+  }
+  w.bit(in.short_signaling);
+  if (in.short_signaling) {
+    w.bits(static_cast<uint32_t>(in.last_frame_idx), 3);
+    w.bits(static_cast<uint32_t>(in.gold_frame_idx), 3);
+  } else {
+    for (int i = 0; i < 7; ++i) w.bits(static_cast<uint32_t>(in.slots[i]), 3);
+  }
+  if (spec.frame_ids) {
+    for (int i = 0; i < 7; ++i) {
+      /* the field is delta_frame_id_minus_1: one less than the distance */
+      w.bits(static_cast<uint32_t>(in.deltas[i] - 1), spec.delta_frame_id_n_bits());
+    }
+  }
+  w.bit(false);        /* render_and_frame_size_different */
+  w.bit(false);        /* allow_high_precision_mv */
+  w.bit(true);         /* is_filter_switchable */
+  w.bit(false);        /* is_motion_mode_switchable */
+  w.bit(false);        /* disable_frame_end_update_cdf */
+  w.bit(true);         /* uniform_tile_spacing_flag */
+  w.bit(false);        /* stop: one tile column */
+  w.bit(false);        /* stop: one tile row */
+  w.bits(100, 8);      /* base_q_idx */
+  w.bit(false);        /* delta_q_y_dc */
+  w.bit(false);        /* delta_q_u_dc */
+  w.bit(false);        /* delta_q_u_ac */
+  w.bit(false);        /* using_qmatrix */
+  w.bit(false);        /* segmentation_enabled */
+  w.bit(false);        /* delta_q_present */
+  w.bits(0, 6);        /* loop_filter_level[0] */
+  w.bits(0, 6);        /* loop_filter_level[1] */
+  w.bits(0, 3);        /* loop_filter_sharpness */
+  w.bit(false);        /* loop_filter_delta_enabled */
+  w.bits(0, 2);        /* cdef_damping_minus_3 */
+  w.bits(0, 2);        /* cdef_bits */
+  w.bits(0, 6);        /* cdef y strength */
+  w.bits(0, 6);        /* cdef uv strength */
+  w.bit(false);        /* tx_mode_select */
+  w.bit(in.reference_select);
+  w.bit(false);        /* reduced_tx_set */
+  for (int ref = 1; ref < 8; ++ref) w.bit(false); /* is_global */
+  w.align();
+  return w.bytes();
+}
+
 void test_inter_frame() {
   std::printf("inter frame header\n");
   SequenceSpec spec;
@@ -672,6 +788,425 @@ void test_inter_frame() {
   /* The same header with an empty pool is invalid. */
   CHECK(parse_frame_header(seq, existing.data(), existing.size(), &header, &error,
                            &empty) == ParseStatus::Invalid);
+}
+
+/* set_frame_refs (7.8): a frame that codes only LAST_FRAME and GOLDEN_FRAME
+ * still ends up with all seven references, derived from the order hints the
+ * slots carry. The pools here are hand built, because the interesting cases
+ * (nothing in the future, two slots with the same hint) are ones an encoder
+ * rarely produces and a real stream therefore cannot test. */
+void test_set_frame_refs() {
+  std::printf("set frame refs\n");
+  SequenceSpec spec;
+  spec.order_hint = true;
+  const std::vector<uint8_t> seq_bytes = write_sequence_header(spec);
+  SequenceHeader seq;
+  std::string error;
+  CHECK(parse_sequence_header(seq_bytes.data(), seq_bytes.size(), &seq, &error) ==
+        ParseStatus::Ok);
+  CHECK_EQ(seq.order_hint_n_bits, 3);
+
+  auto make_pool = [](const int (&hints)[8]) {
+    RefPool pool;
+    for (int i = 0; i < 8; ++i) {
+      pool.slots[i].valid = true;
+      pool.slots[i].order_hint = hints[i];
+      pool.slots[i].frame_id = -1;
+    }
+    return pool;
+  };
+
+  /* Hints 1 and 3 are coded as LAST and GOLDEN, 6 and 7 wait in the future,
+   * and two slots share hint 4. curFrameHint is 1 << (3 - 1) = 4, so a frame
+   * three hints back sits at 1 and one hint ahead at 5. */
+  {
+    const int hints[8] = {1, 2, 3, 6, 7, 4, 4, 3};
+    const RefPool pool = make_pool(hints);
+    FrameHeader h;
+    h.order_hint = 5;
+    h.last_frame_idx = 0;
+    h.gold_frame_idx = 2;
+    set_frame_refs(seq, &h, pool);
+    CHECK_EQ(h.ref_frame_idx[kRefLast - 1], 0);
+    CHECK_EQ(h.ref_frame_idx[kRefGolden - 1], 2);
+    /* ALTREF is the frame with the highest output order, BWDREF the closest of
+     * the remaining ones - so the two future frames land in that order. */
+    CHECK_EQ(h.ref_frame_idx[kRefAltref - 1], 4);
+    CHECK_EQ(h.ref_frame_idx[kRefBwdref - 1], 3);
+    /* no future frame is left for ALTREF2, so it falls through to a forward
+     * one: the latest unused, which is hint 3 at slot 7. */
+    CHECK_EQ(h.ref_frame_idx[kRefAltref2 - 1], 7);
+    /* LAST2 and LAST3 take the two slots sharing hint 4, later index first */
+    CHECK_EQ(h.ref_frame_idx[kRefLast2 - 1], 6);
+    CHECK_EQ(h.ref_frame_idx[kRefLast3 - 1], 5);
+    /* all seven references resolve to seven different slots */
+    for (int i = 0; i < 7; ++i)
+      for (int j = i + 1; j < 7; ++j) CHECK(h.ref_frame_idx[i] != h.ref_frame_idx[j]);
+  }
+
+  /* Nothing in the future at all: the backward scans come up empty, and every
+   * reference comes from the forward list, deepest first. */
+  {
+    const int hints[8] = {1, 2, 3, 4, 4, 3, 2, 1};
+    const RefPool pool = make_pool(hints);
+    FrameHeader h;
+    h.order_hint = 5;
+    h.last_frame_idx = 3; /* hint 4, the nearest */
+    h.gold_frame_idx = 0; /* hint 1, the furthest */
+    set_frame_refs(seq, &h, pool);
+    CHECK_EQ(h.ref_frame_idx[kRefLast - 1], 3);
+    CHECK_EQ(h.ref_frame_idx[kRefGolden - 1], 0);
+    CHECK_EQ(h.ref_frame_idx[kRefLast2 - 1], 4);  /* hint 4, the other slot */
+    CHECK_EQ(h.ref_frame_idx[kRefLast3 - 1], 5);  /* hint 3, later slot on the tie */
+    CHECK_EQ(h.ref_frame_idx[kRefBwdref - 1], 2); /* hint 3 as well */
+    CHECK_EQ(h.ref_frame_idx[kRefAltref2 - 1], 6);
+    CHECK_EQ(h.ref_frame_idx[kRefAltref - 1], 1);
+    for (int i = 0; i < 7; ++i) CHECK(h.ref_frame_idx[i] >= 0 && h.ref_frame_idx[i] < 8);
+    /* and none of them is a frame from the future */
+    for (int i = 0; i < 7; ++i) {
+      const int slot = h.ref_frame_idx[i];
+      CHECK(get_relative_dist(seq, pool.slots[slot].order_hint, h.order_hint) < 0);
+    }
+  }
+
+  /* A pool with a single usable slot: every scan finds nothing, so all five
+   * derived references land on the one frame there is. Wrong, but defined -
+   * a decoder that left them at -1 would index out of bounds instead. */
+  {
+    const int hints[8] = {2, 0, 0, 0, 0, 0, 0, 0};
+    RefPool pool = make_pool(hints);
+    for (int i = 1; i < 8; ++i) pool.slots[i].valid = false;
+    FrameHeader h;
+    h.order_hint = 3;
+    h.last_frame_idx = 0;
+    h.gold_frame_idx = 0;
+    set_frame_refs(seq, &h, pool);
+    for (int i = 0; i < 7; ++i) CHECK_EQ(h.ref_frame_idx[i], 0);
+  }
+}
+
+/* The scans above have several places where the order of two candidates - and
+ * what happens when they are equal - decides which frame a reference names. No
+ * encoder we have emits short signaling, so a stream cannot settle those cases;
+ * the reference decoder can. dav1d resolves the same list from the same order
+ * hints with a different structure (plain signed differences and a "used"
+ * marker instead of shifted hints and a used array), so its result is an
+ * independent answer to compare ours against. The transcription below is
+ * dav1d's src/obu.c, keeping its sentinels so the comparison is literal. */
+std::vector<int> dav1d_set_frame_refs(const SequenceHeader& seq, const int (&hints)[8], int cur,
+                                      int last, int gold) {
+  const int kUsed = INT32_MIN;
+  int off[8];
+  for (int i = 0; i < 8; ++i) off[i] = get_relative_dist(seq, hints[i], cur);
+  int earliest_ref = -1;
+  for (int i = 0, earliest = INT32_MAX; i < 8; ++i) {
+    if (off[i] < earliest) {
+      earliest = off[i];
+      earliest_ref = i;
+    }
+  }
+  off[last] = kUsed;
+  off[gold] = kUsed;
+
+  std::vector<int> refs(7, -1);
+  refs[0] = last;
+  refs[3] = gold;
+  int refidx = -1;
+  for (int i = 0, latest = 0; i < 8; ++i) {
+    if (off[i] >= latest) {
+      latest = off[i];
+      refidx = i;
+    }
+  }
+  if (refidx >= 0) off[refidx] = kUsed;
+  refs[6] = refidx;
+  for (int i = 4; i < 6; ++i) {
+    unsigned earliest = 255; /* UINT8_MAX: only non-negative offsets qualify */
+    refidx = -1;
+    for (int j = 0; j < 8; ++j) {
+      const unsigned hint = static_cast<unsigned>(off[j]);
+      if (hint < earliest) {
+        earliest = hint;
+        refidx = j;
+      }
+    }
+    if (refidx >= 0) off[refidx] = kUsed;
+    refs[i] = refidx;
+  }
+  for (int i = 1; i < 7; ++i) {
+    if (refs[i] < 0) {
+      unsigned latest = ~255u; /* negative offsets, largest first */
+      refidx = -1;
+      for (int j = 0; j < 8; ++j) {
+        const unsigned hint = static_cast<unsigned>(off[j]);
+        if (hint >= latest) {
+          latest = hint;
+          refidx = j;
+        }
+      }
+      if (refidx >= 0) off[refidx] = kUsed;
+      refs[i] = refidx >= 0 ? refidx : earliest_ref;
+    }
+  }
+  return refs;
+}
+
+void test_set_frame_refs_matches_reference() {
+  std::printf("set frame refs against the reference decoder\n");
+  SequenceSpec spec;
+  spec.order_hint = true;
+  const std::vector<uint8_t> seq_bytes = write_sequence_header(spec);
+  SequenceHeader seq;
+  std::string error;
+  CHECK(parse_sequence_header(seq_bytes.data(), seq_bytes.size(), &seq, &error) ==
+        ParseStatus::Ok);
+
+  std::mt19937 rng(20251025u);
+  int ties = 0, future = 0;
+  for (int trial = 0; trial < 400; ++trial) {
+    int hints[8];
+    for (int& hint : hints) hint = static_cast<int>(rng() % 8u);
+    const int cur = static_cast<int>(rng() % 8u);
+    const int last = static_cast<int>(rng() % 8u);
+    const int gold = static_cast<int>(rng() % 8u);
+
+    RefPool pool;
+    for (int i = 0; i < 8; ++i) {
+      pool.slots[i].valid = true;
+      pool.slots[i].order_hint = hints[i];
+      pool.slots[i].frame_id = -1;
+    }
+    FrameHeader h;
+    h.order_hint = cur;
+    h.last_frame_idx = last;
+    h.gold_frame_idx = gold;
+    set_frame_refs(seq, &h, pool);
+
+    const std::vector<int> want = dav1d_set_frame_refs(seq, hints, cur, last, gold);
+    for (int i = 0; i < 7; ++i) {
+      if (h.ref_frame_idx[i] != want[i]) {
+        std::printf("  trial %d: reference %d is slot %d, dav1d says %d "
+                    "(cur %d, last %d, gold %d, hints %d %d %d %d %d %d %d %d)\n",
+                    trial, i, h.ref_frame_idx[i], want[i], cur, last, gold, hints[0], hints[1],
+                    hints[2], hints[3], hints[4], hints[5], hints[6], hints[7]);
+      }
+      CHECK_EQ(h.ref_frame_idx[i], want[i]);
+    }
+    for (int i = 0; i < 8; ++i)
+      for (int j = i + 1; j < 8; ++j)
+        if (get_relative_dist(seq, hints[i], cur) == get_relative_dist(seq, hints[j], cur)) {
+          ++ties;
+          i = 8;
+          break;
+        }
+    if (want[6] >= 0) ++future;
+  }
+  /* the trials are only worth much if they reach both interesting shapes */
+  CHECK(ties > 0);
+  CHECK(future > 0);
+}
+
+/* Frame ids (5.9.2 and mark_ref_frames): the header names its own id and, for
+ * every reference, how far back that reference's id has to be. Two things come
+ * out of that - a reference whose id does not match is rejected instead of
+ * being predicted from, and a slot whose id has drifted out of the window is
+ * marked empty, which is how a decoder notices a lost frame. */
+void test_frame_ids() {
+  std::printf("frame ids\n");
+  SequenceSpec spec;
+  spec.frame_ids = true;  /* idLen 4, deltaFrameIdLength 3 */
+  spec.order_hint = true;
+  const std::vector<uint8_t> seq_bytes = write_sequence_header(spec);
+  SequenceHeader seq;
+  std::string error;
+  CHECK(parse_sequence_header(seq_bytes.data(), seq_bytes.size(), &seq, &error) ==
+        ParseStatus::Ok);
+  CHECK_EQ(seq.frame_id_n_bits, 4);
+  CHECK_EQ(seq.delta_frame_id_n_bits, 3);
+
+  RefPool pool;
+  FrameHeader header;
+  KeyFrameSpec key;
+  key.frame_id = 1;
+  key.order_hint = 1;
+  const std::vector<uint8_t> key_bytes = write_key_frame_header(spec, key);
+  CHECK(parse_frame_header(seq, key_bytes.data(), key_bytes.size(), &header, &error,
+                           &pool) == ParseStatus::Ok);
+  CHECK_EQ(header.frame_id_present, true);
+  CHECK_EQ(header.frame_id, 1);
+  refresh_ref_pool(header, &pool);
+  for (int i = 0; i < 8; ++i) {
+    CHECK_EQ(pool.slots[i].valid, true);
+    CHECK_EQ(pool.slots[i].frame_id, 1);
+  }
+
+  /* An inter frame at id 5 refreshing only slot 1. Its reference is the key
+   * frame in slot 0, four ids back. */
+  InterHeaderSpec in;
+  in.frame_id = 5;
+  in.order_hint = 5;
+  in.refresh_flags = 0x02;
+  for (int i = 0; i < 7; ++i) in.slots[i] = 0;
+  for (int i = 0; i < 7; ++i) in.deltas[i] = 4;
+  std::vector<uint8_t> bytes = write_inter_frame_header_ids(spec, in);
+  const ParseStatus first = parse_frame_header(seq, bytes.data(), bytes.size(), &header, &error,
+                                               &pool);
+  if (first != ParseStatus::Ok) std::printf("  inter frame: %s\n", error.c_str());
+  CHECK(first == ParseStatus::Ok);
+  CHECK_EQ(header.ref_frame_idx[0], 0);
+  refresh_ref_pool(header, &pool);
+  CHECK_EQ(pool.slots[1].frame_id, 5);
+  CHECK_EQ(pool.slots[0].frame_id, 1);
+
+  /* A wrong distance is caught: id 5 with delta 1 expects a frame at id 4, and
+   * slot 0 holds the key frame (id 1). */
+  {
+    InterHeaderSpec bad = in;
+    for (int i = 0; i < 7; ++i) bad.deltas[i] = 1;
+    const std::vector<uint8_t> bad_bytes = write_inter_frame_header_ids(spec, bad);
+    CHECK(parse_frame_header(seq, bad_bytes.data(), bad_bytes.size(), &header, &error,
+                             &pool) == ParseStatus::Invalid);
+    CHECK(error.find("frame id") != std::string::npos);
+  }
+
+  /* Now id 12 - seven ids later, still inside the delta window - which marks
+   * every slot older than 12 - 8 = 4 empty. Slot 0 holds id 1 and is dropped;
+   * slot 1 holds id 5 and survives. */
+  {
+    InterHeaderSpec late;
+    late.frame_id = 12;
+    late.order_hint = 0;
+    late.refresh_flags = 0x04; /* refresh slot 2 only */
+    for (int i = 0; i < 7; ++i) late.slots[i] = 0; /* the expired slot */
+    for (int i = 0; i < 7; ++i) late.deltas[i] = 7;
+    const std::vector<uint8_t> late_bytes = write_inter_frame_header_ids(spec, late);
+    CHECK(parse_frame_header(seq, late_bytes.data(), late_bytes.size(), &header, &error,
+                             &pool) == ParseStatus::Invalid);
+    CHECK_EQ(pool.slots[0].valid, false);
+    CHECK_EQ(pool.slots[1].valid, true); /* 12 - 5 = 7 <= 8, still in the window */
+
+    /* The slot that does survive can be referenced: id 5 is seven ids back. */
+    InterHeaderSpec good;
+    good.frame_id = 12;
+    good.order_hint = 0;
+    good.refresh_flags = 0x04;
+    for (int i = 0; i < 7; ++i) good.slots[i] = 1;
+    for (int i = 0; i < 7; ++i) good.deltas[i] = 7;
+    const std::vector<uint8_t> good_bytes = write_inter_frame_header_ids(spec, good);
+    const ParseStatus status =
+        parse_frame_header(seq, good_bytes.data(), good_bytes.size(), &header, &error, &pool);
+    if (status != ParseStatus::Ok) std::printf("  late inter frame: %s\n", error.c_str());
+    CHECK(status == ParseStatus::Ok);
+    CHECK_EQ(header.ref_frame_idx[0], 1);
+  }
+
+  /* show_existing_frame names a slot and re-states the id it was stored with;
+   * the two have to agree, otherwise the decoder is displaying a frame the
+   * encoder did not mean. */
+  {
+    const std::vector<uint8_t> show = write_show_existing_frame(spec, 1, 5);
+    CHECK(parse_frame_header(seq, show.data(), show.size(), &header, &error, &pool) ==
+          ParseStatus::Ok);
+    CHECK_EQ(header.show_existing_frame, true);
+    CHECK_EQ(header.existing_frame_idx, 1);
+    CHECK_EQ(header.type, FrameType::Inter); /* taken from the slot, not coded */
+    CHECK_EQ(header.order_hint, 5);          /* the slot's own hint */
+
+    const std::vector<uint8_t> wrong = write_show_existing_frame(spec, 1, 4);
+    CHECK(parse_frame_header(seq, wrong.data(), wrong.size(), &header, &error, &pool) ==
+          ParseStatus::Invalid);
+
+    const std::vector<uint8_t> empty = write_show_existing_frame(spec, 3, 5);
+    CHECK(parse_frame_header(seq, empty.data(), empty.size(), &header, &error, &pool) ==
+          ParseStatus::Invalid);
+  }
+
+  /* An error resilient frame re-states the order hint of every slot. A slot
+   * whose hint does not come back the same is empty as far as this frame is
+   * concerned: the decoder's pool went stale while frames were being lost. */
+  {
+    RefPool er_pool;
+    const int ids[3] = {7, 12, 10};
+    const int hints[3] = {3, 0, 2};
+    for (int i = 0; i < 3; ++i) {
+      er_pool.slots[i].valid = true;
+      er_pool.slots[i].frame_id = ids[i];
+      er_pool.slots[i].order_hint = hints[i];
+      er_pool.slots[i].width = 320;
+      er_pool.slots[i].height = 240;
+    }
+    InterHeaderSpec er;
+    er.error_resilient = true;
+    er.frame_id = 13;
+    er.order_hint = 0;
+    er.refresh_flags = 0x08; /* refresh slot 3 only */
+    for (int i = 0; i < 7; ++i) er.slots[i] = 1; /* the one frame it predicts from */
+    for (int i = 0; i < 7; ++i) er.deltas[i] = 1; /* id 12, one id back */
+    er.ref_hints[0] = 3; /* agrees with the pool */
+    er.ref_hints[1] = 0; /* agrees */
+    er.ref_hints[2] = 7; /* slot 2 holds hint 2 - stale, so it is dropped */
+    const std::vector<uint8_t> er_bytes = write_inter_frame_header_ids(spec, er);
+    const ParseStatus status =
+        parse_frame_header(seq, er_bytes.data(), er_bytes.size(), &header, &error, &er_pool);
+    if (status != ParseStatus::Ok) std::printf("  error resilient frame: %s\n", error.c_str());
+    CHECK(status == ParseStatus::Ok);
+    CHECK_EQ(er_pool.slots[0].valid, true);
+    CHECK_EQ(er_pool.slots[1].valid, true);
+    CHECK_EQ(er_pool.slots[2].valid, false); /* the restatement dropped it */
+    refresh_ref_pool(header, &er_pool);
+    CHECK_EQ(er_pool.slots[3].frame_id, 13);
+    CHECK_EQ(er_pool.slots[3].order_hint, 0);
+  }
+}
+
+/* frame_refs_short_signaling: the header codes two slot indices and the rest
+ * come from set_frame_refs. Chained after a key frame, so the pool the derived
+ * list points into is a real one. */
+void test_short_ref_signaling() {
+  std::printf("frame_refs_short_signaling\n");
+  SequenceSpec spec;
+  spec.order_hint = true;
+  const std::vector<uint8_t> seq_bytes = write_sequence_header(spec);
+  SequenceHeader seq;
+  std::string error;
+  CHECK(parse_sequence_header(seq_bytes.data(), seq_bytes.size(), &seq, &error) ==
+        ParseStatus::Ok);
+
+  RefPool pool;
+  FrameHeader header;
+  KeyFrameSpec key;
+  key.order_hint = 4;
+  const std::vector<uint8_t> key_bytes = write_key_frame_header(spec, key);
+  CHECK(parse_frame_header(seq, key_bytes.data(), key_bytes.size(), &header, &error,
+                           &pool) == ParseStatus::Ok);
+  refresh_ref_pool(header, &pool);
+  /* give the other seven slots distinct, older hints */
+  for (int i = 1; i < 8; ++i) {
+    pool.slots[i].valid = true;
+    pool.slots[i].order_hint = i - 1;
+    pool.slots[i].frame_id = -1;
+  }
+
+  InterHeaderSpec in;
+  in.order_hint = 4;
+  in.short_signaling = true;
+  in.last_frame_idx = 3; /* hint 2 */
+  in.gold_frame_idx = 1; /* hint 0 */
+  const std::vector<uint8_t> bytes = write_inter_frame_header_ids(spec, in);
+  const ParseStatus status =
+      parse_frame_header(seq, bytes.data(), bytes.size(), &header, &error, &pool);
+  if (status != ParseStatus::Ok) std::printf("  short signaling: %s\n", error.c_str());
+  CHECK(status == ParseStatus::Ok);
+  CHECK_EQ(header.last_frame_idx, 3);
+  CHECK_EQ(header.gold_frame_idx, 1);
+  /* and the seven references were derived, not read: all of them name slots */
+  for (int i = 0; i < 7; ++i) CHECK(header.ref_frame_idx[i] >= 0 && header.ref_frame_idx[i] < 8);
+  CHECK_EQ(header.ref_frame_idx[kRefLast - 1], 3);
+  CHECK_EQ(header.ref_frame_idx[kRefGolden - 1], 1);
+  /* the frame the derived list points at LAST is what the size is inherited
+   * from, which is why the mapping has to be right and not merely present */
+  CHECK_EQ(header.size_from_reference, true);
+  CHECK_EQ(header.width, 640);
 }
 
 /* Segmentation is part of the header, not a reason to stop: the flags and the
@@ -1785,6 +2320,10 @@ int main() {
   test_sequence_header();
   test_frame_header();
   test_inter_frame();
+  test_set_frame_refs();
+  test_set_frame_refs_matches_reference();
+  test_frame_ids();
+  test_short_ref_signaling();
   test_segmentation();
   test_block_geometry();
   test_projected_motion_vectors();

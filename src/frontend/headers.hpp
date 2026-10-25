@@ -20,8 +20,7 @@
  * caller maintains and `refresh_ref_pool()` applies each frame's refresh flags.
  *
  * Deliberately rejected with a clear message (never silently misparsed)
- *   - superres, intra block copy, restoration filters, film grain *data*,
- *     short reference signalling and frame ids.
+ *   - superres, restoration filters and film grain *data*.
  *
  * The field order and the derived values follow the AV1 specification; where a
  * value is derived from a reference frame (loop filter deltas, segmentation
@@ -271,6 +270,12 @@ struct RefSlot {
   int width = 0;
   int height = 0;
   int order_hint = 0;
+  /* The frame id this slot was stored with, when the sequence carries frame
+   * ids (7.4.1's RefFrameId). -1 for a slot stored by a sequence without them,
+   * and for an empty one. A later frame names the id it expects through
+   * delta_frame_id, which is how a decoder notices that a reference frame is
+   * missing instead of silently predicting from the wrong picture. */
+  int frame_id = -1;
   FrameType type = FrameType::Key;
   /* The frame's global motion model per reference type, which the next frame
    * reads to decode its own model differentially. */
@@ -331,6 +336,11 @@ struct FrameHeader {
    * `size_from_reference` is set when the frame inherits its size from
    * reference frame 0 instead of coding width/height. */
   bool size_from_reference = false;
+  /* frame_refs_short_signaling codes only these two slots and lets
+   * set_frame_refs() derive the rest; both stay -1 when the frame codes its
+   * reference list in full. */
+  int last_frame_idx = -1;
+  int gold_frame_idx = -1;
   int ref_frame_idx[7] = {0, 0, 0, 0, 0, 0, 0};
   int ref_order_hint[7] = {0, 0, 0, 0, 0, 0, 0};
   bool allow_high_precision_mv = false;
@@ -409,10 +419,21 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
 
 /* Parses one frame header OBU payload (or the header part of a frame OBU).
  * `seq` must be the sequence header in force. On success `out->tile_data_offset`
- * is the byte offset of the tile payload inside `data`. */
+ * is the byte offset of the tile payload inside `data`.
+ *
+ * `refs` is both read and written: the header resolves reference frame sizes,
+ * order hints and frame ids through it, and a sequence that carries frame ids
+ * *invalidates* the slots whose id has fallen out of range (mark_ref_frames).
+ * Without `refs` an inter frame cannot be parsed at all, which is reported as
+ * Unsupported rather than guessed. */
 ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, size_t size,
-                               FrameHeader* out, std::string* error,
-                               const RefPool* refs = nullptr);
+                               FrameHeader* out, std::string* error, RefPool* refs = nullptr);
+
+/* set_frame_refs(): fills `h->ref_frame_idx` from just LAST_FRAME and
+ * GOLDEN_FRAME, the way frame_refs_short_signaling codes them (7.8). Exposed
+ * because the tie breaking - several slots can carry the same order hint - is
+ * worth testing on pools a real encoder would not produce. */
+void set_frame_refs(const SequenceHeader& seq, FrameHeader* h, const RefPool& pool);
 
 } /* namespace frontend */
 } /* namespace av1gpu */

@@ -17,9 +17,12 @@ KEY, INTRA_ONLY, INTER, SWITCH and `show_existing_frame` - up to the byte where
 the tile data starts: tile grid, quantiser, segmentation, delta Q / delta LF,
 deblock levels, CDEF strengths, reference and skip mode decisions, transform set.
 Inter frames read a `RefPool` the caller keeps up to date, so reference sizes and
-skip mode are derived, not guessed. Features that are not implemented (superres,
-restoration, short reference signalling, frame ids, film grain data) are reported
-with a message instead of being misparsed.
+skip mode are derived, not guessed. That pool carries each slot's order hint and
+frame id, which is what `frame_refs_short_signaling` (7.8) and the frame id
+checks of 5.9.2 - including `mark_ref_frames` and the order hints an error
+resilient frame re-states - work on. Features that are not implemented (superres,
+restoration, film grain data) are reported with a message instead of being
+misparsed.
 `av1gpu_probe` shows what it found in a real file, and
 `tests/data/svt_av1_320x240.ivf` keeps the parser honest against bytes from a
 real encoder.
@@ -281,9 +284,12 @@ schedule has to wait for a rectangle of samples rather than for the neighbouring
 edges: the block's vector is clipped to the part of the tile that already exists
 (7.11.5), and the scheduler turns that rectangle into wave dependencies.
 
-Of the tools AV1 defines, what is left is segmentation, superres and frame ids -
-all three refused by name rather than misparsed - plus a film grain synthesis
-filter (section 4). Every inter and intra prediction tool decodes bit exactly.
+Of the tools AV1 defines, what is left is segmentation and superres - both
+refused by name rather than misparsed - plus a film grain synthesis filter
+(section 4). Every inter and intra prediction tool decodes bit exactly, and the
+reference machinery is complete: short signalling, frame ids and the pool
+invalidation rules of 5.9.2 are implemented and pinned by tests (see
+`docs/ACCURACY.md`).
 
 ## 4. Spec-conformant film grain
 

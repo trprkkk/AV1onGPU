@@ -482,6 +482,61 @@ change - decodes to only 4 of 110 matching frames on `inter_intra.ivf` while the
 bitstream stays perfectly in sync, which is exactly the kind of error the hash
 tests exist for.
 
+## Reference frame ids and short signalling
+
+Two header features change which stored frame a reference *names*, and both were
+missing until now. Neither can be produced by the encoders available here, so
+they are pinned by written headers rather than by a stream - and, for the part
+that is a choice between equally valid-looking candidates, against the reference
+decoder's own algorithm.
+
+**Short signalling** (`frame_refs_short_signaling`, 7.8) codes two slot indices -
+the frames the encoder committed to as LAST and GOLDEN - and derives the other
+five from the order hints in the reference pool: ALTREF is the frame with the
+highest output order at or after this one, BWDREF the closest of what remains,
+ALTREF2 the next closest, and LAST2/LAST3 plus any leftovers are filled in
+anti-chronological order. `set_frame_refs()` implements it directly from the
+specification text; it is exposed so `av1gpu_probe` and the tests can show the
+list a frame derived.
+
+The scans have three places where two candidates tie: several slots are allowed
+to carry the same order hint. The specification only says the reference
+implementation breaks ties by reference frame index, which is not enough to
+implement from. `test_set_frame_refs_matches_reference` therefore carries a
+transcription of dav1d's `src/obu.c`, which resolves the same list with a
+different structure - plain signed differences and a "used" sentinel instead of
+shifted hints and a used array - and compares the two over 400 pseudo-random
+pools (random hints, random current hint, random LAST/GOLDEN). All 400 agree on
+all seven references. The directed cases next to it pin the shapes that matter:
+two future frames (ALTREF is the furthest, BWDREF the nearest), no future frame
+at all (everything from the forward list, deepest first), and a pool with a
+single usable slot (every derived reference lands on it - wrong, but defined,
+where -1 would index out of bounds).
+
+**Frame ids** (`frame_id_numbers_present_flag`) give every frame an id and make
+each reference state how far back its id must be: `delta_frame_id_minus_1` plus
+one, subtracted from the current id modulo `1 << idLen`. A mismatch means the
+slot does not hold the frame the encoder meant, and the parser returns Invalid
+instead of predicting from the wrong picture. Three rules keep the pool honest
+and all three are implemented:
+
+* a shown key frame empties the pool (`RefValid[]`, `RefFrameId[]` and
+  `RefOrderHint[]`), because it starts a new coded video sequence,
+* `mark_ref_frames()` empties every slot whose id has drifted out of the
+  `1 << deltaFrameIdLen` window, which is how a decoder notices a lost frame -
+  both branches of its two-sided test are exercised, including the wrap,
+* an error resilient frame re-states the order hint of all eight slots and a slot
+  that disagrees is emptied.
+
+`show_existing_frame` carries `display_frame_id` instead - the id the shown frame
+was stored with - and it has to match the slot; the frame type and order hint are
+then taken from the slot, not coded. `test_frame_ids` walks a small stream
+through all of it: a key frame that fills the pool, an inter frame whose
+references match, a frame whose distance is wrong (rejected), a frame whose id
+has pushed the oldest slot out of the window (dropped, and the surviving slot
+still usable), a display of a stored frame with the right and the wrong id, and
+an error resilient frame that drops a slot whose re-stated hint disagrees.
+
 ## Measured quality (synthetic clip, 640×360, CPU reference backend)
 
 PSNR of the decoded picture against the *clean source*, frames 1–11:

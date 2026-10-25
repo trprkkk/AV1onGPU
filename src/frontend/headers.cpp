@@ -274,6 +274,7 @@ void refresh_ref_pool(const FrameHeader& frame, RefPool* pool,
       slot.width = frame.width;
       slot.height = frame.height;
       slot.order_hint = frame.order_hint;
+      slot.frame_id = frame.frame_id_present ? frame.frame_id : -1;
       slot.type = frame.type;
       for (int ref = 0; ref < 8; ++ref) slot.global_motion[ref] = frame.global_motion[ref];
       for (int ref = 0; ref < 7; ++ref) slot.ref_poc[ref] = frame.ref_order_hint[ref];
@@ -503,9 +504,133 @@ ParseStatus parse_sequence_header(const uint8_t* data, size_t size, SequenceHead
   return ParseStatus::Ok;
 }
 
+/* set_frame_refs(): 7.8. A frame may code just LAST_FRAME and GOLDEN_FRAME and
+ * let the decoder fill in the other five from the order hints the slots carry:
+ * the latest and earliest *backward* references (in the future relative to this
+ * frame) become ALTREF and BWDREF, the next closest backward one ALTREF2, and
+ * the remaining forward references go to LAST2, LAST3 and whatever is left in
+ * anti-chronological order. Everything is compared on a shifted hint scale
+ * where this frame sits at 1 << (OrderHintBits - 1), so "before" and "after"
+ * reduce to comparing integers.
+ *
+ * The specification notes that ties are common - several slots can carry the
+ * same order hint - and that the reference decoder breaks them by slot index.
+ * The scans below do the same by visiting slots in order and only replacing
+ * the current best on a strict improvement. */
+void set_frame_refs(const SequenceHeader& seq, FrameHeader* h, const RefPool& pool) {
+  /* Indices into ref_frame_idx, i.e. the reference type minus one. */
+  const int kLastIdx = 0, kLast2Idx = 1, kLast3Idx = 2, kGoldenIdx = 3;
+  const int kBwdrefIdx = 4, kAltref2Idx = 5, kAltrefIdx = 6;
+  const int refs_per_frame = 7;
+  for (int i = 0; i < refs_per_frame; ++i) h->ref_frame_idx[i] = -1;
+  /* the two the frame actually codes */
+  const int last_idx = h->last_frame_idx;
+  const int gold_idx = h->gold_frame_idx;
+  if (last_idx < 0 || last_idx > 7 || gold_idx < 0 || gold_idx > 7) return;
+  h->ref_frame_idx[kLastIdx] = last_idx;
+  h->ref_frame_idx[kGoldenIdx] = gold_idx;
+
+  bool used[8] = {false, false, false, false, false, false, false, false};
+  used[last_idx] = true;
+  used[gold_idx] = true;
+
+  const int cur = 1 << (seq.order_hint_n_bits - 1);
+  int shifted[8];
+  for (int i = 0; i < 8; ++i) {
+    const int hint = pool.slots[i].valid ? pool.slots[i].order_hint : 0;
+    shifted[i] = cur + get_relative_dist(seq, hint, h->order_hint);
+  }
+
+  /* the frame with the highest output order at or after this one */
+  auto latest_backward = [&]() {
+    int ref = -1, best = 0;
+    for (int i = 0; i < 8; ++i) {
+      if (!pool.slots[i].valid || used[i]) continue;
+      const int hint = shifted[i];
+      if (hint < cur) continue;
+      if (ref < 0 || hint >= best) {
+        ref = i;
+        best = hint;
+      }
+    }
+    return ref;
+  };
+  /* ... and the one with the lowest */
+  auto earliest_backward = [&]() {
+    int ref = -1, best = 0;
+    for (int i = 0; i < 8; ++i) {
+      if (!pool.slots[i].valid || used[i]) continue;
+      const int hint = shifted[i];
+      if (hint < cur) continue;
+      if (ref < 0 || hint < best) {
+        ref = i;
+        best = hint;
+      }
+    }
+    return ref;
+  };
+  /* the latest frame strictly before this one */
+  auto latest_forward = [&]() {
+    int ref = -1, best = 0;
+    for (int i = 0; i < 8; ++i) {
+      if (!pool.slots[i].valid || used[i]) continue;
+      const int hint = shifted[i];
+      if (hint >= cur) continue;
+      if (ref < 0 || hint >= best) {
+        ref = i;
+        best = hint;
+      }
+    }
+    return ref;
+  };
+
+  int ref = latest_backward();
+  if (ref >= 0) {
+    h->ref_frame_idx[kAltrefIdx] = ref;
+    used[ref] = true;
+  }
+  ref = earliest_backward();
+  if (ref >= 0) {
+    h->ref_frame_idx[kBwdrefIdx] = ref;
+    used[ref] = true;
+  }
+  ref = earliest_backward();
+  if (ref >= 0) {
+    h->ref_frame_idx[kAltref2Idx] = ref;
+    used[ref] = true;
+  }
+
+  /* Ref_Frame_List, as indices: the two the frame did not code, then BWDREF,
+   * ALTREF2 and ALTREF in case the backward scans found nothing for them and
+   * they still need a forward frame. */
+  static const int kRemaining[] = {kLast2Idx, kLast3Idx, kBwdrefIdx, kAltref2Idx, kAltrefIdx};
+  for (int frame : kRemaining) {
+    if (h->ref_frame_idx[frame] >= 0) continue;
+    ref = latest_forward();
+    if (ref >= 0) {
+      h->ref_frame_idx[frame] = ref;
+      used[ref] = true;
+    }
+  }
+
+  /* Anything still unset takes the frame with the lowest output order overall -
+   * a pool this narrow only happens in a broken stream, but the specification
+   * names a value for every slot, so there is no "undefined" case. */
+  int fallback = -1, earliest = 0;
+  for (int i = 0; i < 8; ++i) {
+    if (!pool.slots[i].valid) continue;
+    if (fallback < 0 || shifted[i] < earliest) {
+      fallback = i;
+      earliest = shifted[i];
+    }
+  }
+  for (int i = 0; i < refs_per_frame; ++i) {
+    if (h->ref_frame_idx[i] < 0) h->ref_frame_idx[i] = fallback;
+  }
+}
+
 ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, size_t size,
-                               FrameHeader* out, std::string* error,
-                               const RefPool* refs) {
+                               FrameHeader* out, std::string* error, RefPool* refs) {
   if (!data || size == 0) return invalid("empty frame header", error);
   const int sb128 = seq.use_128x128_superblock ? 1 : 0;
 
@@ -522,6 +647,8 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
           r.read(seq.timing.frame_presentation_delay_length));
     }
     if (seq.frame_id_numbers_present) {
+      /* display_frame_id: the id the frame being shown was stored with. It is
+       * not an id of this "frame" - a shown frame has none of its own. */
       h.frame_id_present = true;
       h.frame_id = static_cast<int>(r.read(seq.frame_id_n_bits));
     }
@@ -533,6 +660,10 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
     if (!slot.valid) {
       *out = h;
       return invalid("show_existing_frame refers to an empty reference slot", error);
+    }
+    if (h.frame_id_present && slot.frame_id >= 0 && slot.frame_id != h.frame_id) {
+      *out = h;
+      return invalid("show_existing_frame names a frame id the slot does not hold", error);
     }
     /* The frame is a repeat of a stored one: report its geometry so callers can
      * display it without decoding anything. */
@@ -568,6 +699,17 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
   }
 
   const bool key_or_intra = h.type == FrameType::Key || h.type == FrameType::IntraOnly;
+  /* A shown key frame starts a new coded video sequence, so every reference the
+   * decoder was holding belongs to the sequence that just ended: 5.9.2 clears
+   * RefValid[] here, before the refresh flags at the end of the header fill all
+   * eight slots again with this frame. */
+  if (h.type == FrameType::Key && h.show_frame && refs) {
+    for (int i = 0; i < 8; ++i) {
+      refs->slots[i].valid = false;
+      refs->slots[i].frame_id = -1;
+      refs->slots[i].order_hint = 0; /* RefOrderHint[i] = 0 as well */
+    }
+  }
   h.error_resilient_mode =
       (h.type == FrameType::Key && h.show_frame) || h.type == FrameType::Switch ||
       seq.reduced_still_picture_header || r.read_bit();
@@ -597,6 +739,28 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
   if (seq.frame_id_numbers_present) {
     h.frame_id_present = true;
     h.frame_id = static_cast<int>(r.read(seq.frame_id_n_bits));
+    /* mark_ref_frames(): a slot whose id has fallen outside the window the
+     * delta_frame_id field can express can no longer be named, so it is marked
+     * empty. That is how a decoder notices a lost reference frame instead of
+     * predicting from the wrong picture. The window is 1 << deltaFrameIdLen
+     * wide and wraps around the id space, so the test has two branches
+     * depending on which side of the wrap this frame's id sits. */
+    if (refs) {
+      const int span = 1 << seq.delta_frame_id_n_bits;
+      const int limit = 1 << seq.frame_id_n_bits;
+      const int id = h.frame_id;
+      for (int i = 0; i < 8; ++i) {
+        RefSlot& slot = refs->slots[i];
+        if (!slot.valid || slot.frame_id < 0) continue;
+        const bool stale =
+            id > span ? (slot.frame_id > id || slot.frame_id < id - span)
+                      : (slot.frame_id > id && slot.frame_id < limit + id - span);
+        if (stale) {
+          slot.valid = false;
+          slot.frame_id = -1;
+        }
+      }
+    }
   }
 
   if (!seq.reduced_still_picture_header) {
@@ -626,8 +790,23 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
   h.refresh_frame_flags = (h.type == FrameType::Key && h.show_frame)
                               ? 0xff
                               : static_cast<int>(r.read(8));
-  if (h.refresh_frame_flags != 0xff && h.error_resilient_mode && seq.enable_order_hint) {
-    for (int i = 0; i < 8; ++i) r.read(seq.order_hint_n_bits);
+  /* An error resilient frame re-states the order hint of every slot, and a slot
+   * that disagrees with what the decoder holds is marked empty: the encoder is
+   * telling it that its idea of the pool is stale. The outer test is the
+   * specification's "this is not a fresh intra restart", which needs no
+   * correction. */
+  const bool reorder_hints =
+      (!key_or_intra || h.refresh_frame_flags != 0xff) && h.error_resilient_mode &&
+      seq.enable_order_hint;
+  if (reorder_hints) {
+    for (int i = 0; i < 8; ++i) {
+      const int hint = static_cast<int>(r.read(seq.order_hint_n_bits));
+      if (!refs) continue;
+      if (refs->slots[i].order_hint != hint) {
+        refs->slots[i].valid = false;
+        refs->slots[i].frame_id = -1;
+      }
+    }
   }
 
   /* frame_refs(): which of the eight slots this frame predicts from. */
@@ -637,16 +816,44 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
       return unsupported("inter frames need the reference frame pool", error);
     }
     if (r.read_bit()) {
-      *out = h;
-      return unsupported("frame_refs_short_signaling is not implemented", error);
+      /* frame_refs_short_signaling: only the two slots the encoder committed to
+       * are coded, the other five come from the order hints (set_frame_refs). */
+      if (!seq.enable_order_hint) {
+        *out = h;
+        return invalid("frame_refs_short_signaling needs order hints", error);
+      }
+      h.last_frame_idx = static_cast<int>(r.read(3));
+      h.gold_frame_idx = static_cast<int>(r.read(3));
+      set_frame_refs(seq, &h, *refs);
+    } else {
+      for (int i = 0; i < 7; ++i) h.ref_frame_idx[i] = static_cast<int>(r.read(3));
     }
-    for (int i = 0; i < 7; ++i) h.ref_frame_idx[i] = static_cast<int>(r.read(3));
+    /* With frame ids the header names, for each reference, how far back its id
+     * has to be: a decoder that cannot match the value knows the slot does not
+     * hold the frame the encoder meant and says so instead of predicting from
+     * the wrong picture. */
     if (seq.frame_id_numbers_present) {
-      *out = h;
-      return unsupported("frame ids in inter frame references are not implemented", error);
+      const int id_len = seq.frame_id_n_bits;
+      const int n = seq.delta_frame_id_n_bits;
+      for (int i = 0; i < 7; ++i) {
+        const int delta = static_cast<int>(r.read(n)) + 1;
+        const int expected = (h.frame_id + (1 << id_len) - delta) % (1 << id_len);
+        const int slot = h.ref_frame_idx[i];
+        if (slot < 0 || slot > 7) {
+          *out = h;
+          return invalid("a reference frame index is out of range", error);
+        }
+        if (refs->slots[slot].frame_id != expected) {
+          *out = h;
+          return invalid("a reference frame id does not match the frame its slot holds",
+                         error);
+        }
+      }
     }
     for (int i = 0; i < 7; ++i) {
-      h.ref_order_hint[i] = refs->slots[h.ref_frame_idx[i]].order_hint;
+      if (h.ref_frame_idx[i] >= 0) {
+        h.ref_order_hint[i] = refs->slots[h.ref_frame_idx[i]].order_hint;
+      }
     }
   }
 

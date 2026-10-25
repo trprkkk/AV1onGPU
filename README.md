@@ -134,10 +134,13 @@ reference and skip mode decisions and the transform set.
 Inter frames need to know what came before them - a frame that inherits its size
 from a reference, or that is allowed to use skip mode, depends on the frames the
 decoder has already stored - so the parser takes the `RefPool` the caller
-maintains (`refresh_ref_pool()` applies a parsed frame's refresh flags).
+maintains (`refresh_ref_pool()` applies a parsed frame's refresh flags). That
+pool is also what reference frame ids are checked against, and what
+`frame_refs_short_signaling` derives the five uncoded references from
+(`set_frame_refs()`, 7.8): see `docs/ACCURACY.md`.
 
 What is *refused with a message* instead of being misparsed: superres,
-restoration filters, film grain data, short reference signalling and frame ids.
+restoration filters and film grain data.
 
 The tile payload is coded with AV1's boolean range decoder, which
 `src/frontend/range_decoder.hpp` implements: adaptive Q15 symbol CDFs, boolean
@@ -271,8 +274,8 @@ Every inter and intra tool AV1 defines decodes bit exactly - including palette
 coded blocks (`tests/data/palette_sc.ivf`), inter/intra compound
 (`tests/data/inter_intra.ivf`), intra block copy (`tests/data/intrabc.ivf`) and
 skip mode, which the `lw_t2`/`lw_t3`/`inter_intra` fixtures code thousands of
-times. Segmentation, superres and frame ids are refused by name; film grain uses
-a synthetic template instead of the specification's synthesis filter (see
+times. Segmentation and superres are refused by name; film grain uses a
+synthetic template instead of the specification's synthesis filter (see
 `docs/ROADMAP.md`, sections 3 and 4).
 `av1gpu::synthetic_encode` is a small closed loop test encoder that produces
 valid syntax from a generated clip and does not need any of those.
