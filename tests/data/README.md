@@ -429,12 +429,24 @@ copies whole 8x8 blocks and filters against a halo that reaches into that border
 ffmpeg agree with us on every sample.
 
 `tests/data/make_odd_size.py` writes the stream back byte for byte
-(`python3 tests/data/make_odd_size.py tests/data/odd_size.ivf`). Its frames code
-a zero luma level on purpose: the loop filter reading the border of a frame whose
-size is not a multiple of eight is the one place that is still not sample exact
-(one sample off by one on the cases measured), because those samples are only
-defined by the reconstruction - see `docs/ACCURACY.md`, "Frames whose size is not
-a multiple of eight".
+(`python3 tests/data/make_odd_size.py tests/data/odd_size.ivf`).
+
+`edge_grid.ivf` is the fixture for the *third* rounding at the edge of a picture:
+the loop filter (7.14) walks each plane up to the plane size rounded up to
+*four* samples, which is neither the picture size nor the eight sample block
+grid. Four frames of 130x66, 17 KB, `-cpu-used 4 -crf 40 -lag-in-frames 0 -g 4
+-tiles 1x1` with CDEF and restoration enabled, so luma ends two rows and chroma
+one row inside that grid (68 luma rows, 36 chroma rows) and the deringer and the
+restoration filter read the difference. The content is a smoothed random texture
+with fresh noise on every frame plus hard edged panels pinned to the bottom and
+right edges - a smoother clip codes those last rows at level zero and then the
+three roundings agree again, which is why `odd_size.ivf` (130x100, a multiple of
+four in every plane) passes either way. `edge_grid.hash` holds the per frame
+hashes, `stream_edge_grid` checks them and `opencl_edge_grid` replays the same
+plans through the device kernels; dav1d and ffmpeg agree with us on every sample.
+
+`tests/data/make_edge_grid.py` writes the stream back byte for byte
+(`python3 tests/data/make_edge_grid.py tests/data/edge_grid.ivf`).
 
 The three `aom_*` fixtures are the ones that are not 8 bit 4:2:0: twelve frames
 of a 320x240 ramp each, encoded with libaom through ffmpeg's `libaom-av1` at

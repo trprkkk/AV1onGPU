@@ -171,14 +171,18 @@ if(AV1GPU_BUILD_TESTS)
   # aom_444_10bit_320x240 is 4:4:4 and aom_12bit_320x240 is 12 bit, and lossless
   # the only one whose frames code no quantiser at all (so the frame header
   # carries no loop filter levels, no CDEF strengths and no restoration unit, and
-  # the decoder must not filter the picture), and odd_size the only one whose
+  # the decoder must not filter the picture), odd_size the only one whose
   # picture is not a multiple of eight in either direction (so the 4x4 grid the
   # tiles code on is the frame size rounded up to eight, and the filters and the
-  # prediction reach into the border). Every frame of all nineteen is bit exact.
+  # prediction reach into the border), and edge_grid the only one whose planes
+  # end *inside* the four sample grid the loop filter walks (66 luma rows and 33
+  # chroma rows: the filter covers 68 and 36, which is neither the picture size
+  # nor the eight sample grid, and CDEF and restoration read the difference).
+  # Every frame of all twenty is bit exact.
   if(TARGET av1gpu_decode)
     foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra seg_altq superres grain
                  grain_inherit lr lr_10bit lr_12bit lr_444 lr_422 lossless
-                 odd_size aom_10bit_320x240 aom_444_10bit_320x240
+                 odd_size edge_grid aom_10bit_320x240 aom_444_10bit_320x240
                  aom_12bit_320x240)
       set(frames 30)
       # deeper than 8 bit: the hashes are over the samples themselves, so the
@@ -212,6 +216,10 @@ if(AV1GPU_BUILD_TESTS)
       elseif(stream STREQUAL "odd_size")
         # 130x100: not a multiple of eight either way, so MiCols/MiRows round up
         set(frames 6)
+      elseif(stream STREQUAL "edge_grid")
+        # 130x66: the loop filter's four sample grid extends past the picture in
+        # both planes (68 luma rows, 36 chroma rows)
+        set(frames 4)
       elseif(stream STREQUAL "lr_10bit")
         # the same clip at 10 bit, where the restoration filters' bit depth
         # scaling (7.17.3's Round2(a, 2 * (BitDepth - 8))) actually does
@@ -305,12 +313,16 @@ if(AV1GPU_BUILD_TESTS)
     #   odd_size        the only one whose picture is not a multiple of eight, so
     #                   the block grid, the CDEF halo and the prediction clamps
     #                   reach into the border of the plane
+    #   edge_grid       the only one whose planes end inside the four sample grid
+    #                   the loop filter walks, so the filter's extent and the
+    #                   rows CDEF and restoration copy from it show up in the
+    #                   last rows of the picture
     #   svt_av1_320x240 a different encoder, so a different mix of tools
     # All of it on a machine with no GPU at all.
     if(TARGET av1gpu_decode)
       foreach(stream palette_sc intrabc lw_t2 lw_t3 inter_intra seg_altq
                      superres lr lr_10bit lr_12bit lr_444 lr_422 lossless
-                     odd_size grain grain_inherit aom_10bit_320x240
+                     odd_size edge_grid grain grain_inherit aom_10bit_320x240
                      aom_444_10bit_320x240 aom_12bit_320x240
                      svt_av1_320x240)
         set(frames 30)
@@ -326,6 +338,8 @@ if(AV1GPU_BUILD_TESTS)
           set(frames 4)
         elseif(stream STREQUAL "odd_size")
           set(frames 6)
+        elseif(stream STREQUAL "edge_grid")
+          set(frames 4)
         elseif(stream STREQUAL "grain_inherit")
           set(frames 10)
         elseif(stream STREQUAL "lr")

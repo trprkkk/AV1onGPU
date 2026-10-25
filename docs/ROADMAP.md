@@ -148,13 +148,16 @@ the first symbol of the fixture's key frame.
      extent as well. Rounding to four, as this tree did, decoded every such
      frame as garbage; two of the three fixes only show up as a handful of
      samples. `tests/data/odd_size.ivf` (130x100, six frames) is bit exact
-     against dav1d and through the OpenCL replay, and the sweep behind it is
-     listed in `docs/ACCURACY.md`, together with the one place that is still not
-     exact: where the loop filter runs on the last row or column band it reads
-     samples just outside the picture, which only the reconstruction defines.
-     That is one sample off by one in the cases the sweep measured, and up to a
-     few dozen at a very low quantiser (a 160x116 clip at `-crf 18` differs in 25
-     and 36 samples, all by one, all in the chroma rows near the bottom).
+     against dav1d and through the OpenCL replay. The last of the three roundings
+     took longer: the loop filter walks each plane up to the plane size rounded
+     up to *four* (7.14), which for a frame whose size is not a multiple of
+     eight reaches past the picture, and CDEF and restoration read those rows -
+     so filtering only the visible plane left a handful of samples one level off
+     at the bottom edge (a 160x116 clip at `-crf 18` in 25 and 36 samples, all in
+     the chroma rows near the bottom; 128x68 in one to three). The deblocker
+     walks the four sample grid now, `tests/data/edge_grid.ivf` (130x66, where
+     both planes end inside that grid) pins it, and the sweep in
+     `docs/ACCURACY.md` is clean: no size in it differs against dav1d any more.
 
    Two bugs the block level trace found on the way, worth recording because
    both are the kind that decodes plausibly and then desynchronises: the single
@@ -251,7 +254,7 @@ the first symbol of the fixture's key frame.
    output (the final `Clip1` hides it); the table is in `docs/ACCURACY.md`.
 
    The whole fixture set, `lr` and its two higher depths included, also decodes
-   through an ASan/UBSan build (`-DAV1GPU_SANITIZE=ON`): 46/46 tests pass and no
+   through an ASan/UBSan build (`-DAV1GPU_SANITIZE=ON`): 48/48 tests pass and no
    `runtime error` reaches stderr. That sweep found one defect, wherever the
    specification scales a signed value: a left shift of a negative number, which
    is undefined in C++. They are multiplications now; `docs/ACCURACY.md` lists

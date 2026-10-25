@@ -104,6 +104,13 @@ not disagreements between backends.
   | `palette_sc` | 102 | 31 |
   | `lw_t2` | 209 | 125 |
 
+  What each part of that is worth, measured on `lr`'s intra frame: gating the
+  second block on the mode is 7 waves (125 -> 118), the palette skip and the
+  corner guard change nothing on these fixtures (they still do not wait for
+  anything they do not read), and the rest of the drop from 250 comes from
+  dropping the coarse per-cell dependency the schedule used before, which waited
+  for whole cells instead of the samples the predictor reads.
+
   Every fixture stays bit exact through the CPU backend and through the OpenCL
   replay, which runs the jobs of a wave as separate dispatches with no ordering
   between them - a dependency that was dropped by mistake shows up there as a
@@ -384,6 +391,7 @@ was built for.)
 | `lr_444`, `lr_422` | 8 each | loop restoration on chroma planes that are not 4:2:0 |
 | `lossless` | 4 | `all_lossless`: no filter parameters in the header, no filtering |
 | `odd_size` | 6 | a picture that is not a multiple of eight in either direction |
+| `edge_grid` | 4 | a picture whose planes end inside the loop filter's four sample grid |
 
 The four local-warp streams are the ROTZOOM clip re-encoded with libaom at
 `--cpu-used=2` and `--cpu-used=3`, `--crf=30`, `--lag-in-frames=25`,
@@ -1012,33 +1020,42 @@ already clamped to.
 partial stripe at the bottom (100 = 64 + 36), and six frames so the error would
 drift - and it is bit exact against dav1d and ffmpeg, through the CPU backend and
 through the OpenCL replay. `tests/data/make_odd_size.py` rebuilds it byte for
-byte. With the two fixes the sweep that found this is clean: widths 124 to 139 at
-height 64, and 128x97, 128x98, 128x100, 128x101, 128x102, 128x104, 130x64,
-130x68, 130x70, 130x72, 129x99, 132x102, 134x102, 160x116, 126x98, 120x66,
-96x60, 64x52 and 48x36 (decoded against dav1d, two frames each, CDEF and
-restoration on) are sample for sample equal.
+byte.
 
-What is left is smaller and narrower: when the loop filter runs *on the last row
-or column band* of such a frame, it reads samples just outside the picture, and
-those are defined only by the reconstruction. Practical example: a 130x66 clip at
-`-crf 45` differs in exactly one sample (row 65, column 65) and it is off by one.
-Low quantisers make it more visible: a two frame 160x116 clip at `-crf 18` with
-CDEF on differs in 25 and 36 samples, all of them by one and all of them in the
-chroma rows within three of the bottom of the plane - the rows whose 4x4 block
-extends two samples past the picture, so the taps that reach there read samples
-the reference decoder filled in its own way. 128x68 is the same story with one
-to three samples. The samples that are left are exactly the ones the
-specification derives from a padded picture whose padding it does not define.
+**The four sample grid the loop filter walks** is the third rounding, and it is
+neither of the two above: 7.14 iterates mi rows and steps them by `1 << subY` on
+chroma, so each plane is filtered up to *its own* size rounded up to four
+samples, and that is the extent the reference decoders use. For a 130x66 4:2:0 frame that is 132x68 for luma and 68x36 for
+chroma, so the last two luma rows and the last three chroma rows lie outside the
+picture but inside the grid the filter covers - and 7.15 copies whole 8x8 blocks
+that include them, and 7.17.6 borrows two lines across a stripe border from them,
+so a decoder that stops at the visible edge leaves samples the deringer and the
+restoration filter then read at level zero. That was the last of the edge
+residuals: a 160x116 clip at `-crf 18` differed in 25 and 36 samples, all of them
+by one and all of them in the chroma rows within three of the bottom of the
+plane; 128x68 in one to three, a 130x66 clip at `-crf 45` in one. The deblocker
+walks `(plane_size + 3) & ~3` now, in all three planes.
 
-One negative result is worth keeping: the taps themselves must *not* be clamped
-to the visible plane. Doing that (treating samples the mi grid says are available
-as unavailable) took the same 160x116 clip from 25 and 36 wrong samples to 101 and
-145, and 128x68 from one to 588 - the specification makes availability an mi unit
-question (7.15.3's `is_inside_filter_region` against `MiCols`/`MiRows`), not a
-picture size one.
-This is why `odd_size.ivf`'s frames code a zero luma level - the fixture pins the
-grid, the CDEF halo and the clamps, which are fully defined, and not the samples
-the specification leaves to the implementation's border handling.
+`tests/data/edge_grid.ivf` pins it: 130x66, where luma ends two rows and chroma
+one row inside its four sample grid, four frames at `-crf 40` with hard edged
+panels against the bottom and right edges so that the loop filter, CDEF and
+restoration all run at a non-zero level there - a smoother clip codes those rows
+at level zero and then the two roundings agree again. It is bit exact against
+dav1d and ffmpeg, through the CPU backend and through the OpenCL replay. The
+sweep that found the earlier edge bugs is clean with all three fixes: widths 124
+to 139 at height 64, 130x64, 130x65, 130x66, 130x68, 130x69, 130x70, 130x71,
+130x72, 130x73 and 130x75 (so every `height % 8`), 128x97, 128x98, 128x99,
+128x100, 128x101, 128x102, 128x104, 132x102, 134x102, 160x116, 126x98, 120x66,
+96x60, 64x52 and 48x36 at `-crf 32`, plus 321x241 and 640x361 at `-crf 45`,
+131x67 and 255x129 at `-crf 40`, and 128x68, 128x71, 130x68, 130x70, 130x71 and
+130x66 at `-crf 18`, `24` and `45` - two frames each, decoded against dav1d.
+
+One negative result is worth keeping: the CDEF taps themselves must *not* be
+clamped to the visible plane. Doing that - treating samples the mi grid says are
+available as unavailable - with everything else fixed turns 0 wrong samples into
+160 and 199 on the 160x116 clip, 588 on 128x68 and 75 over the four frames of
+`edge_grid`: the specification makes availability an mi unit question (7.15.3's
+`is_inside_filter_region` against `MiCols`/`MiRows`), not a picture size one.
 
 ## Film grain
 
@@ -1129,7 +1146,7 @@ export ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1
 ctest --test-dir build-san -j
 ```
 
-The normal and the sanitizer build are both expected to stay at 46/46, and
+The normal and the sanitizer build are both expected to stay at 48/48, and
 neither is allowed to print a `runtime error` line.
 The option compiles with `-fno-sanitize-recover=all` for exactly that reason:
 UBSan recovers by default, so without it a finding is a line on stderr and a

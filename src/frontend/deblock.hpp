@@ -213,6 +213,20 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
     const int sub_y = plane > 0 ? ss_y : 0;
     const int plane_w = (width + (1 << sub_x) - 1) >> sub_x;
     const int plane_h = (height + (1 << sub_y) - 1) >> sub_y;
+    /* The filter walks each plane up to its own four sample grid: the plane
+     * rounded up to four samples, which is neither the picture size nor the
+     * eight sample grid the blocks are coded on. 7.14 iterates mi rows and steps
+     * them by `1 << subY` on chroma, so a plane is covered in four row groups up
+     * to that rounding - and that is the extent that matches the reference
+     * decoders. All three numbers are the same for a frame whose size is a
+     * multiple of eight, and they are not for any other: a 68 row high frame has
+     * 34 chroma rows, so the chroma grid the reference decoders filter is 36
+     * rows, and a 66 row high frame has 66 luma rows, so the luma grid is 68.
+     * Those samples are never shown, but the deringer reads them - which is why
+     * a frame whose size is not a multiple of eight used to come out a sample or
+     * two off at its bottom and right edge. */
+    const int edge_end_x = (plane_w + 3) & ~3;
+    const int edge_end_y = (plane_h + 3) & ~3;
     const bool chroma = plane > 0;
 
     for (int pass = 0; pass < 2; ++pass) {
@@ -226,10 +240,9 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
           const int prow = row | sub_y, pcol = col | sub_x;
           if (prow >= mi_rows || pcol >= mi_cols) continue;
           const int x = col * 4, y = row * 4;
-          if (x >= width || y >= height) continue;
           if (vertical ? x == 0 : y == 0) continue;
           const int x_p = x >> sub_x, y_p = y >> sub_y;
-          if (x_p >= plane_w || y_p >= plane_h) continue;
+          if (x_p >= edge_end_x || y_p >= edge_end_y) continue;
 
           const int prev_row = prow - (vertical ? 0 : (1 << sub_y));
           const int prev_col = pcol - (vertical ? (1 << sub_x) : 0);
@@ -280,10 +293,10 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
           }
 
           /* One job per 4x4 position: the four samples along the edge share the
-           * level, and the last group of a frame whose size is not a multiple of
-           * four is shortened rather than allowed to run past the plane. */
+           * level, and the four sample grid of the plane is a whole number of
+           * groups, so a group never runs past it. */
           const int along = vertical ? y_p : x_p;
-          const int along_end = vertical ? plane_h : plane_w;
+          const int along_end = vertical ? edge_end_y : edge_end_x;
           const int length = std::min(4, along_end - along);
           if (length <= 0) continue;
           DeblockEdge edge;
