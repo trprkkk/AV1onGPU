@@ -271,6 +271,11 @@ cd build && ctest --output-on-failure
 * `test_pipeline` — closed loop decode of a synthetic clip on every available
   backend; the decoded frames must match the encoder's own reconstruction
   exactly, and the wavefront cell size must not change the output.
+* `fuzz_decode.py` — single byte mutations of every fixture, decoded through
+  `av1gpu_decode`: a stream that is not AV1 has to come back as an error, not as
+  a crash and not as a sanitizer report. Run against the sanitizer build it is
+  the test that carries the palette cache overflow and the transform's 64 bit
+  multiplies (see `docs/ACCURACY.md`).
 * `opencl_selftest.py` — compiles `kernels/av1_opencl.cl` with a real OpenCL
   compiler (pocl works) and checks a job of every kernel against values computed
   in Python. This is the test that catches kernel *source* errors, which the C++

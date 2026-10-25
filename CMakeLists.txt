@@ -263,6 +263,18 @@ if(AV1GPU_BUILD_TESTS)
     set(AV1GPU_TEST_PY "${AV1GPU_TEST_PYTHON}")
   endif()
   if(AV1GPU_TEST_PY)
+    # Single byte mutations of the fixtures, decoded through the decoder under
+    # test: a corrupt stream has to come back as an error, not as a crash or a
+    # sanitizer report. Standard library only, so it runs wherever Python does -
+    # and it is the test that carries the palette cache overflow and the
+    # transform's 64 bit multiplies (see docs/ACCURACY.md).
+    if(TARGET av1gpu_decode)
+      add_test(NAME fuzz_mutations
+               COMMAND ${AV1GPU_TEST_PY} ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_decode.py
+                       --decoder $<TARGET_FILE:av1gpu_decode>)
+      set_tests_properties(fuzz_mutations PROPERTIES TIMEOUT 900)
+    endif()
+
     add_test(NAME opencl_selftest
              COMMAND ${AV1GPU_TEST_PY} ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_selftest.py)
     set_tests_properties(opencl_selftest PROPERTIES SKIP_RETURN_CODE 77)

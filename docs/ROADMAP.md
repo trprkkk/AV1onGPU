@@ -275,7 +275,7 @@ the first symbol of the fixture's key frame.
    output (the final `Clip1` hides it); the table is in `docs/ACCURACY.md`.
 
    The whole fixture set, `lr` and its two higher depths included, also decodes
-   through an ASan/UBSan build (`-DAV1GPU_SANITIZE=ON`): 48/48 tests pass and no
+   through an ASan/UBSan build (`-DAV1GPU_SANITIZE=ON`): 51/51 tests pass and no
    `runtime error` reaches stderr. That sweep found one defect, wherever the
    specification scales a signed value: a left shift of a negative number, which
    is undefined in C++. They are multiplications now; `docs/ACCURACY.md` lists

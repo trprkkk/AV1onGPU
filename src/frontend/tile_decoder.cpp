@@ -268,6 +268,14 @@ constexpr int8_t kFilterIntraToIntraDir[5] = {kModeDc, kModeVertical, kModeHoriz
  * Hash 0 (no neighbour at all) cannot occur either: the first sample of the map
  * is decoded uniformly. */
 constexpr int kPaletteColors = 8;
+/* The *cache* is the merged colour list of the palettes above and to the left,
+ * and it is not capped at a palette: each neighbour contributes up to eight
+ * distinct colours, so it holds sixteen (the specification's PaletteCache is
+ * that size). Only the palette itself is eight colours wide. Writing it into an
+ * eight entry buffer is an out of bounds write on the stack, reachable from a
+ * corrupt stream and from a valid one whose two neighbour palettes are
+ * disjoint. */
+constexpr int kPaletteCache = 2 * kPaletteColors;
 constexpr int kPaletteNumNeighbours = 3;
 constexpr int kPaletteColorHashMultipliers[kPaletteNumNeighbours] = {1, 2, 2};
 constexpr int kPaletteColorContext[9] = {-1, -1, 0, -1, -1, 4, 3, 2, 1};
@@ -3578,7 +3586,9 @@ class TileParser {
   ParseStatus read_palette_plane(TileBlock* block, int plane, int sz_ctx, int row, int col) {
     const int bit_depth = seq_.bit_depth;
     const int max_value = (1 << bit_depth) - 1;
-    uint8_t cache[kPaletteColors] = {0, 0, 0, 0, 0, 0, 0, 0};
+    /* 2 * 8: see kPaletteCache - the cache is the two neighbour palettes merged,
+     * not a palette. */
+    uint8_t cache[kPaletteCache] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     const int cache_n = palette_cache(plane, row, col, cache);
     if (trace_enabled())
       std::fprintf(stderr, "PALQ %d %d pl=%d ctx=%d rng=%u cdf0=%u cdf5=%u\n", col * 4, row * 4,

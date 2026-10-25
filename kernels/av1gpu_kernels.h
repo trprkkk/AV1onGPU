@@ -477,6 +477,21 @@ AV1G_FN int av1g_round2_signed(int v, int n) {
   return -((-v + (1 << (n - 1))) >> n);
 }
 
+/* The transform multiplies a coefficient by a Q12 constant, and 7.13.3 asks a
+ * conformant stream to keep every multiply/add pair inside 31+sign bits. A
+ * stream that does not (a corrupt one can code 19+sign bit coefficients, see
+ * the note in dav1d's itx_1d.c) still has to *decode*: it may not invoke
+ * signed overflow, which is undefined in C++ and in OpenCL C. The products are
+ * therefore formed in 64 bits - the operands are at most 21 and 13 bits wide,
+ * so there is room for both of them and the sum of two terms - and rounded back
+ * into an int, which is where the result belongs again (the shift is 12). For a
+ * conformant stream this is the same number the 32 bit expression gives; the
+ * device backends compute the same expression, so all three agree there too. */
+AV1G_FN int av1g_round2_ll(long long v, int n) {
+  if (n <= 0) return (int)v;
+  return (int)((v + (1LL << (n - 1))) >> n);
+}
+
 /* bit-reversal of `bits` bits of x */
 AV1G_FN int av1g_brev(int bits, int x) {
   int t = 0;
@@ -489,23 +504,24 @@ AV1G_FN int av1g_brev(int bits, int x) {
  * `r` is the intermediate precision the specification declares (it is not
  * needed to compute the rotation, only to state the conformance bound). */
 AV1G_FN void av1g_bfly(int *t, int a, int b, int angle, int flip, int r) {
-  int x, y;
+  long long x, y;
   (void)r;
   if ((angle & 63) == 32) {
     /* cos and sin have the same magnitude here: two fewer multiplies */
     const int v = (angle & 64) ? t[a] + t[b] : t[a] - t[b];
     const int w = (angle & 64) ? -t[a] + t[b] : t[a] + t[b];
-    const int c = av1g_cos128(angle);
+    const long long c = av1g_cos128(angle);
     x = v * c;
     y = w * c;
   } else {
-    const int c = av1g_cos128(angle);
-    const int s = av1g_sin128(angle);
-    x = t[a] * c - t[b] * s;
-    y = t[a] * s + t[b] * c;
+    const long long c = av1g_cos128(angle);
+    const long long s = av1g_sin128(angle);
+    const long long ta = t[a], tb = t[b];
+    x = ta * c - tb * s;
+    y = ta * s + tb * c;
   }
-  t[a] = av1g_round2(x, 12);
-  t[b] = av1g_round2(y, 12);
+  t[a] = av1g_round2_ll(x, 12);
+  t[b] = av1g_round2_ll(y, 12);
   if (flip) {
     const int tmp = t[a];
     t[a] = t[b];
@@ -649,22 +665,23 @@ AV1G_FN void av1g_adst_out_perm(int *t, int n) {
 
 /* Inverse ADST of length 4, in place. */
 AV1G_FN void av1g_adst4(int *t, int r) {
-  int s[7], x[4];
+  /* the products are 64 bit for the same reason as av1g_bfly's */
+  long long s[7], x[4];
   (void)r;
-  s[0] = AV1G_SINPI_1_9 * t[0];
-  s[1] = AV1G_SINPI_2_9 * t[0];
-  s[2] = AV1G_SINPI_3_9 * t[1];
-  s[3] = AV1G_SINPI_4_9 * t[2];
-  s[4] = AV1G_SINPI_1_9 * t[2];
-  s[5] = AV1G_SINPI_2_9 * t[3];
-  s[6] = AV1G_SINPI_4_9 * t[3];
+  s[0] = (long long)AV1G_SINPI_1_9 * t[0];
+  s[1] = (long long)AV1G_SINPI_2_9 * t[0];
+  s[2] = (long long)AV1G_SINPI_3_9 * t[1];
+  s[3] = (long long)AV1G_SINPI_4_9 * t[2];
+  s[4] = (long long)AV1G_SINPI_1_9 * t[2];
+  s[5] = (long long)AV1G_SINPI_2_9 * t[3];
+  s[6] = (long long)AV1G_SINPI_4_9 * t[3];
   {
     const int a7 = t[0] - t[2];
     const int b7 = a7 + t[3];
     s[0] = s[0] + s[3];
     s[1] = s[1] - s[4];
     s[3] = s[2];
-    s[2] = AV1G_SINPI_3_9 * b7;
+    s[2] = (long long)AV1G_SINPI_3_9 * b7;
     s[0] = s[0] + s[5];
     s[1] = s[1] - s[6];
     x[0] = s[0] + s[3];
@@ -673,10 +690,10 @@ AV1G_FN void av1g_adst4(int *t, int r) {
     x[3] = s[0] + s[1];
     x[3] = x[3] - s[3];
   }
-  t[0] = av1g_round2(x[0], 12);
-  t[1] = av1g_round2(x[1], 12);
-  t[2] = av1g_round2(x[2], 12);
-  t[3] = av1g_round2(x[3], 12);
+  t[0] = av1g_round2_ll(x[0], 12);
+  t[1] = av1g_round2_ll(x[1], 12);
+  t[2] = av1g_round2_ll(x[2], 12);
+  t[3] = av1g_round2_ll(x[3], 12);
 }
 
 AV1G_FN void av1g_adst8(int *t, int r) {
@@ -727,11 +744,11 @@ AV1G_FN void av1g_iadst(int *t, int n, int r) {
 AV1G_FN void av1g_iidentity(int *t, int n) {
   int i;
   if (n == 2) {
-    for (i = 0; i < 4; ++i) t[i] = av1g_round2(t[i] * 5793, 12);
+    for (i = 0; i < 4; ++i) t[i] = av1g_round2_ll((long long)t[i] * 5793, 12);
   } else if (n == 3) {
     for (i = 0; i < 8; ++i) t[i] = t[i] * 2;
   } else if (n == 4) {
-    for (i = 0; i < 16; ++i) t[i] = av1g_round2(t[i] * 11586, 12);
+    for (i = 0; i < 16; ++i) t[i] = av1g_round2_ll((long long)t[i] * 11586, 12);
   } else {
     for (i = 0; i < 32; ++i) t[i] = t[i] * 4;
   }
@@ -857,7 +874,7 @@ AV1G_FN void av1g_itx_row(const Av1gItxJob *job, AV1G_GLOBAL const int *coef,
   /* a 2:1 rectangle pre-scales: the round trip through the two passes is not
    * exactly the identity for those sizes */
   if (av1g_abs(log2w - log2h) == 1) {
-    for (j = 0; j < job->w; ++j) t[j] = av1g_round2(t[j] * 2896, 12);
+    for (j = 0; j < job->w; ++j) t[j] = av1g_round2_ll((long long)t[j] * 2896, 12);
   }
 
   if (job->lossless)

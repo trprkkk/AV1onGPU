@@ -1233,8 +1233,8 @@ export ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1
 ctest --test-dir build-san -j
 ```
 
-The normal and the sanitizer build are both expected to stay at 48/48, and
-neither is allowed to print a `runtime error` line.
+The normal and the sanitizer build are both expected to stay at 51/51 (`ctest -N`
+prints the list), and neither is allowed to print a `runtime error` line.
 The option compiles with `-fno-sanitize-recover=all` for exactly that reason:
 UBSan recovers by default, so without it a finding is a line on stderr and a
 green test, and `ctest` never sees it. With halting, a finding aborts the
@@ -1272,6 +1272,34 @@ allowed to assume the value was positive:
 * `src/core/synthetic.cpp`, the synthetic encoder's analysis transform (a pixel
   scaled into 64 bit before the separable pass) and the motion vectors it writes
   into a block.
+
+**A mutation sweep** is the other half: the decoder is the only place that reads
+bytes it did not produce, so the sanitizer build also decodes single byte
+mutations of every fixture. `tests/fuzz_decode.py` is the part of that which
+stays, and `ctest` runs it as `fuzz_mutations`. It found two things, neither of
+which any fixture (or any stream an encoder writes on purpose) would have
+reported:
+
+* `read_palette_plane` merged the palettes above and to the left into an *eight*
+  entry buffer on the stack. Sixteen is what that merge produces - 6.10.3's
+  `get_palette_cache` concatenates two ascending colour lists of up to eight
+  entries each - so a stream with two disjoint eight colour neighbour palettes
+  writes past the end, and after that the effect is whatever the neighbouring
+  stack frame held. The cache is `2 * kPaletteColors` now
+  (`kPaletteCache`); the palette itself is still eight colours.
+* the inverse transform multiplied a coefficient (up to 21 bits with sign) by a
+  Q12 constant (13 bits) in `int`. 7.13.3 asks a *conformant* stream to keep
+  every multiply/add pair inside 31+sign bits, so a stream that follows the
+  specification cannot overflow here - but a 12 bit one that codes 19+sign bit
+  coefficients does, and dav1d's `itx_1d.c` has the same note from the other
+  side (it rewrites its own pairs to stay in range). Signed overflow is
+  undefined in C++ and in OpenCL C alike, so `av1g_bfly`, `av1g_adst4`, the
+  identity transform's 5793/11586 scaling and the 2:1 rectangle pre-scale (2896)
+  form their products in 64 bits and round back into an `int`
+  (`av1g_round2_ll`): the same number a conformant stream got before, and no
+  undefined behaviour on the ones the specification excludes. The device
+  backends compile that same expression, so CPU, OpenCL and CUDA still agree -
+  the `opencl_*` replay tests are what keeps saying so.
 
 The sanitizer build also removed a compiler warning that had been noise for a
 while: `read_palette_plane` sorts its eight byte colour cache up to `size`, and
