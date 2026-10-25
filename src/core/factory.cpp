@@ -204,21 +204,21 @@ void frame_to_yuv16(const Frame& frame, std::vector<uint8_t>* out) {
 }
 
 void frame_to_yuv8(const Frame& frame, std::vector<uint8_t>* out) {
-  const int w = frame.width;
-  const int h = frame.height;
-  out->resize(static_cast<size_t>(w) * h * 3 / 2);
+  /* The size comes from the planes, not from `width * height * 3 / 2`: a 4:4:4
+   * frame's chroma planes are as large as its luma one, so the 4:2:0 formula
+   * leaves the last two thirds of the picture writing past the buffer. */
+  size_t samples = 0;
+  for (int p = 0; p < 3; ++p)
+    samples += static_cast<size_t>(frame.plane_width(p)) * frame.plane_height(p);
+  out->resize(samples);
   const int shift = frame.bit_depth - 8;
   size_t pos = 0;
-  for (int y = 0; y < h; ++y) {
-    const uint16_t* row = frame.plane(0) + static_cast<size_t>(y) * frame.stride[0];
-    for (int x = 0; x < w; ++x) (*out)[pos++] = static_cast<uint8_t>(row[x] >> shift);
-  }
-  for (int p = 1; p < 3; ++p) {
-    const int cw = frame.plane_width(p);
-    const int ch = frame.plane_height(p);
-    for (int y = 0; y < ch; ++y) {
+  for (int p = 0; p < 3; ++p) {
+    const int pw = frame.plane_width(p);
+    const int ph = frame.plane_height(p);
+    for (int y = 0; y < ph; ++y) {
       const uint16_t* row = frame.plane(p) + static_cast<size_t>(y) * frame.stride[p];
-      for (int x = 0; x < cw; ++x) (*out)[pos++] = static_cast<uint8_t>(row[x] >> shift);
+      for (int x = 0; x < pw; ++x) (*out)[pos++] = static_cast<uint8_t>(row[x] >> shift);
     }
   }
 }

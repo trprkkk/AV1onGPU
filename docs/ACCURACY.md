@@ -37,10 +37,16 @@ not disagreements between backends.
   off by one or two - and it only appears on streams where the encoder codes no
   level at all, which is why it survived until a 10 bit libaom clip was compared:
   `tests/data/aom_10bit_320x240.ivf`'s first frame is exactly that case and the
-  fixture is checked sample for sample. The thresholds themselves scale with
-  `1 << (BitDepth - 8)` (7.14.6), and this is the only fixture deeper than 8 bit
-  that exercises that scaling, the 10 bit reconstruction and the 16 bit sample
-  path at once.
+  fixture is checked sample for sample.
+* **Bit depth and chroma.** The thresholds scale with `1 << (BitDepth - 8)`
+  (7.14.6), the reconstruction carries more headroom as the bit depth rises, and
+  a 4:4:4 frame's chroma planes are as large as its luma one. Each of those is
+  pinned by its own fixture - 10 bit 4:2:0, 10 bit 4:4:4 and 12 bit 4:2:0, all
+  three from libaom and all three sample for sample equal to dav1d's, on the CPU
+  backend and through the OpenCL kernels. The 4:4:4 one is also the only test
+  that reaches `frame_to_yuv8` with planes that are not 4:2:0 sized, where the
+  8 bit output path used to size its buffer as `width * height * 3 / 2` and run
+  off the end of it.
 * **Film grain synthesis.** The generator, the auto-regressive filter and the
   overlap blending are the specification's, sample for sample, including the
   chroma coupling that reads the luma grain (7.18.3); the blend is one multiply,

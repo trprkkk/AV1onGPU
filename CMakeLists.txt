@@ -155,12 +155,14 @@ if(AV1GPU_BUILD_TESTS)
   # upscaling process and reference scaling both run) and grain the only one
   # that carries film grain parameters (so the generator, the AR filter and the
   # stripe blending run) and grain_inherit the only one where the grain
-  # parameters are re-used from a reference (update_grain = 0) and
-  # aom_10bit_320x240 the only one deeper than 8 bit; every frame of all ten is
-  # bit exact.
+  # parameters are re-used from a reference (update_grain = 0), and the three
+  # aom_ ones the only ones that are not 8 bit 4:2:0: aom_10bit_320x240 is
+  # 10 bit, aom_444_10bit_320x240 is 4:4:4 and aom_12bit_320x240 is 12 bit.
+  # Every frame of all eleven is bit exact.
   if(TARGET av1gpu_decode)
     foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra seg_altq superres grain
-                 grain_inherit aom_10bit_320x240)
+                 grain_inherit aom_10bit_320x240 aom_444_10bit_320x240
+                 aom_12bit_320x240)
       set(frames 30)
       # deeper than 8 bit: the hashes are over the samples themselves, so the
       # decoder has to write them at full precision
@@ -173,7 +175,7 @@ if(AV1GPU_BUILD_TESTS)
         set(frames 110)
       elseif(stream STREQUAL "grain_inherit")
         set(frames 10)
-      elseif(stream STREQUAL "aom_10bit_320x240")
+      elseif(stream MATCHES "^aom_")
         set(frames 12)
         set(stream_flags --yuv16)
       endif()
@@ -238,17 +240,19 @@ if(AV1GPU_BUILD_TESTS)
     #                   the luma ones
     #   grain_inherit   the only one where a frame re-uses a reference's grain
     #                   parameters instead of coding them
-    #   aom_10bit_320x240 the only one deeper than 8 bit, so the only one where
-    #                   the deblocking thresholds' 1 << (BitDepth - 8) scaling
-    #                   and the 10 bit reconstruction run at all - and its first
-    #                   frame codes a zero luma level with the reference deltas
-    #                   enabled, so it is also the only one that catches a
-    #                   decoder filtering a frame the loop filter never runs on
+    #   the three aom_  the only streams that are not 8 bit 4:2:0, so the only
+    #   streams         ones where the deblocking thresholds' 1 << (BitDepth - 8)
+    #                   scaling, the deeper reconstruction and the wider chroma
+    #                   planes run at all; aom_10bit_320x240's first frame codes
+    #                   a zero luma level with the reference deltas enabled, so
+    #                   it is also the one that catches a decoder filtering a
+    #                   frame the loop filter never runs on
     #   svt_av1_320x240 a different encoder, so a different mix of tools
     # All of it on a machine with no GPU at all.
     if(TARGET av1gpu_decode)
       foreach(stream palette_sc intrabc lw_t2 lw_t3 inter_intra seg_altq
                      superres grain grain_inherit aom_10bit_320x240
+                     aom_444_10bit_320x240 aom_12bit_320x240
                      svt_av1_320x240)
         set(frames 30)
         if(stream STREQUAL "palette_sc")
@@ -261,7 +265,7 @@ if(AV1GPU_BUILD_TESTS)
           set(frames 6)
         elseif(stream STREQUAL "grain_inherit")
           set(frames 10)
-        elseif(stream STREQUAL "aom_10bit_320x240")
+        elseif(stream MATCHES "^aom_")
           set(frames 12)
         endif()
         add_test(NAME opencl_${stream}

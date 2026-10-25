@@ -352,11 +352,16 @@ decoder) already built for VA-API:
 Order matters: inter frames first (a browser cannot use an intra-only decoder),
 then this. None of it touches the kernels.
 
-## 7. Bit depth and chroma coverage
+## 7. Bit depth and chroma coverage (done)
 
-10/12 bit already flows through the kernels (samples are 16 bit, `maxv` is
-derived from the bit depth) but is untested; 4:4:4 is supported by the layout
-code and untested. Both need tests and a real stream to verify against.
+**Done: 10 bit, 12 bit and 4:4:4, each against dav1d.** Three libaom clips pin
+them - `tests/data/aom_10bit_320x240.ivf`, `aom_444_10bit_320x240.ivf` and
+`aom_12bit_320x240.ivf`, rebuilt by `tests/data/make_aom_clip.py` - and every
+sample of every frame is equal to the reference decoder's through the CPU backend
+and through the OpenCL kernels. They found three things the 8 bit streams could
+not: the loop filter ran on frames that code no level at all, `frame_to_yuv8`
+sized its output as 4:2:0 and wrote past its buffer on a 4:4:4 frame, and the
+`1 << (BitDepth - 8)` threshold scaling had never been exercised.
 
 ## 8. Verification on a real GPU
 

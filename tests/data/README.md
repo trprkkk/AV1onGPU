@@ -289,30 +289,45 @@ frame's LAST reference) instead of assuming one; `--inherit-slot` overrides it.
 `stream_grain_inherit` checks the hashes. Every sample of every frame is equal to
 dav1d's.
 
-`aom_10bit_320x240.ivf` is the only fixture deeper than 8 bit: twelve frames of
-a 320x240 ramp at 10 bit 4:2:0, 681 bytes, encoded with libaom through ffmpeg's
-`libaom-av1` at `-crf 40 -cpu-used 8 -lag-in-frames 0`. It is there because the
-10 bit paths are not the 8 bit ones: the deblocking thresholds scale with
-`1 << (BitDepth - 8)`, the reconstruction has two more bits of headroom and the
-grain range is wider. Its first frame is what makes it worth keeping: libaom
-codes a *zero* loop filter level there while still enabling the per-reference
-deltas, and `decode_frame_wrapup` only runs the loop filter when a level was
-coded, so a decoder that applies the deltas anyway filters an edge the reference
-decoder leaves alone (a few thousand samples, off by one or two). The clip is
-generated, so the stream can be rebuilt from nothing:
+The three `aom_*` fixtures are the ones that are not 8 bit 4:2:0: twelve frames
+of a 320x240 ramp each, encoded with libaom through ffmpeg's `libaom-av1` at
+`-crf 40 -cpu-used 8 -lag-in-frames 0`.
+
+| fixture | depth | chroma | bytes | why |
+| --- | --- | --- | --- | --- |
+| `aom_10bit_320x240.ivf` | 10 | 4:2:0 | 681 | 10 bit, and its first frame codes no loop filter level |
+| `aom_444_10bit_320x240.ivf` | 10 | 4:4:4 | 8585 | chroma planes as large as luma |
+| `aom_12bit_320x240.ivf` | 12 | 4:2:0 | 547 | the deepest path, `1 << (BitDepth - 8)` = 16 |
+
+They exist because the deeper and wider paths are not the 8 bit ones: the
+deblocking thresholds scale with `1 << (BitDepth - 8)`, the reconstruction has
+more headroom, the grain range is wider, and a 4:4:4 frame's chroma planes are
+the same size as its luma one - which is where `frame_to_yuv8` used to write past
+the end of its buffer, a crash that nothing in the suite could reach before there
+was a 4:4:4 fixture.
+
+`aom_10bit_320x240.ivf`'s first frame is also the reason its clip is as flat as
+it is: libaom codes a *zero* loop filter level there while still enabling the
+per-reference deltas, and `decode_frame_wrapup` only runs the loop filter when a
+luma level was coded, so a decoder that applies the deltas anyway filters edges a
+reference decoder leaves alone (a few thousand samples, off by one or two). The
+clips are generated, so all three streams can be rebuilt from nothing:
 
 ```
-python3 tests/data/make_aom10.py tests/data/aom_10bit_320x240.ivf
+python3 tests/data/make_aom_clip.py tests/data/aom_10bit_320x240.ivf \
+        --pix-fmt 420p10 --require-unfiltered
+python3 tests/data/make_aom_clip.py tests/data/aom_444_10bit_320x240.ivf --pix-fmt 444p10
+python3 tests/data/make_aom_clip.py tests/data/aom_12bit_320x240.ivf --pix-fmt 420p12
 ```
 
-The script writes the 10 bit clip, encodes it with the ffmpeg that
-`imageio-ffmpeg` installs (`--ffmpeg` selects another), and then refuses to
+The script writes the clip, encodes it with the ffmpeg that `imageio-ffmpeg`
+installs (`--ffmpeg` selects another), and with `--require-unfiltered` refuses to
 finish unless the stream still codes a zero luma level with the deltas on - the
-property the fixture exists for. `aom_10bit_320x240.hash` holds the per frame
-hashes of the *samples*: `stream_aom_10bit_320x240` decodes with `--yuv16` and
-`--hash-check`, and `opencl_aom_10bit_320x240` replays the same plans through the
-device kernels. Every sample of every frame is equal to dav1d's, whose yuv muxer
-writes 16 bit little endian for a stream this deep.
+property that fixture exists for. `aom_*.hash` holds the per frame hashes of the
+*samples*: `stream_aom_*` decodes with `--yuv16` and `--hash-check`, and
+`opencl_aom_*` replays the same plans through the device kernels. Every sample of
+every frame is equal to dav1d's, whose yuv muxer writes 16 bit little endian for
+streams this deep.
 
 `svt_av1_320x240.ivf` is a real AV1 stream, not a hand written header: six frames
 of a 320x240 gradient at 8 bit 4:2:0, encoded with SVT-AV1 (crf 40, preset 10)
