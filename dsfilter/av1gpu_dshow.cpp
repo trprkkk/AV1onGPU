@@ -916,7 +916,11 @@ HRESULT InputPin::EnumMediaTypes(IEnumMediaTypes** out) {
   return *out ? S_OK : E_OUTOFMEMORY;
 }
 
-HRESULT InputPin::EndOfStream() { return output_pin()->deliver_end_of_stream(); }
+HRESULT InputPin::EndOfStream() {
+  /* let the worker show the frames it still has queued before EOS */
+  if (StreamDecoder* core = filter_->core()) core->finish();
+  return output_pin()->deliver_end_of_stream();
+}
 
 HRESULT InputPin::BeginFlush() {
   debug_log("BeginFlush");
@@ -990,14 +994,25 @@ HRESULT InputPin::Receive(IMediaSample* sample) {
   REFERENCE_TIME frame_start = start;
 
   StreamDecoder* core = filter_->core();
-  StreamDecoder::Sink sink = [&](const std::vector<uint8_t>& nv12, int w, int h,
-                                 std::string* sink_error) -> bool {
+  /* The pipeline's worker delivers frames after Receive returned, so the
+   * timing state must outlive this call: shared, value captured. */
+  struct Timing {
+    REFERENCE_TIME dur = 333667;
+    REFERENCE_TIME start = 0;
+    bool discontinuity = false;
+  };
+  auto timing = std::make_shared<Timing>();
+  timing->dur = frame_dur > 0 ? frame_dur : 333667;
+  timing->start = frame_start;
+  timing->discontinuity = discontinuity;
+  StreamDecoder::Sink sink = [out, timing](const std::vector<uint8_t>& nv12, int w, int h,
+                                           std::string* sink_error) -> bool {
     (void)sink_error;
-    const REFERENCE_TIME dur = frame_dur > 0 ? frame_dur : 333667;
-    const HRESULT hr = out->deliver(nv12, w, h, frame_start, frame_start + dur,
-                                    discontinuity);
-    discontinuity = false; /* only the first frame after a seek carries it */
-    frame_start += dur;
+    const HRESULT hr = out->deliver(nv12, w, h, timing->start,
+                                    timing->start + timing->dur,
+                                    timing->discontinuity);
+    timing->discontinuity = false; /* only the first frame after a seek carries it */
+    timing->start += timing->dur;
     if (FAILED(hr)) {
       debug_log("downstream Receive failed: 0x%08lx", static_cast<unsigned long>(hr));
     }

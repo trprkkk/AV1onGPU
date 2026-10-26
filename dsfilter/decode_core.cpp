@@ -62,20 +62,17 @@ struct StreamState {
   frontend::RefPool refs;
 
   /* The decoder's reference pool, exactly as av1gpu_decode keeps it: each AV1
-   * slot names a backend pool slot plus the picture, for show_existing_frame.
-   * A stream may refresh several AV1 slots with one picture, so a backend slot
-   * is released only when no AV1 slot names it any more. */
+   * slot names a backend pool slot. The decoded pictures themselves live in
+   * the StreamDecoder's pipe arrays, because the worker fills them after the
+   * main thread has already moved on to the next frame's plan. A stream may
+   * refresh several AV1 slots with one picture, so a backend slot is released
+   * only when no AV1 slot names it any more. */
   int pool_slot[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
-  Frame pool_picture[8];
-  bool pool_picture_valid[8] = {false, false, false, false, false,
-                                false, false, false};
 
   void clear() {
     refs = frontend::RefPool();
     for (int i = 0; i < 8; ++i) {
       pool_slot[i] = -1;
-      pool_picture[i] = Frame();
-      pool_picture_valid[i] = false;
     }
   }
 };
@@ -145,26 +142,177 @@ StreamDecoder::StreamDecoder(const BackendOptions& options) : options_(options) 
   state_ = new StreamState();
 }
 
-StreamDecoder::~StreamDecoder() { delete static_cast<StreamState*>(state_); }
-
-bool StreamDecoder::init(std::string* error) {
-  decoder_ = Decoder::create(options_, error);
-  return decoder_ != nullptr;
+StreamDecoder::~StreamDecoder() {
+  {
+    std::lock_guard<std::mutex> lk(pipe_mutex_);
+    quitting_ = true;
+  }
+  worker_cv_.notify_all();
+  if (worker_.joinable()) worker_.join();
+  delete static_cast<StreamState*>(state_);
 }
 
-const DeviceInfo& StreamDecoder::device() const { return decoder_->device(); }
+std::string StreamDecoder::notice() const {
+  std::lock_guard<std::mutex> lk(pipe_mutex_);
+  return notice_;
+}
+
+void StreamDecoder::pipe_fail(const std::string& message) {
+  ds_debug_log("pipeline job failed: %s", message.c_str());
+  std::lock_guard<std::mutex> lk(pipe_mutex_);
+  if (!pipe_failed_) {
+    pipe_failed_ = true;
+    if (notice_.empty()) notice_ = message;
+  }
+}
+
+void StreamDecoder::queue_job(PipeJob job, std::string* error) {
+  if (!worker_.joinable()) worker_ = std::thread(&StreamDecoder::worker_loop, this);
+  std::unique_lock<std::mutex> lk(pipe_mutex_);
+  /* back pressure: a bounded queue keeps the decoder a few frames behind the
+   * demuxer instead of planning the whole file into memory */
+  pipe_cv_.wait(lk, [&] { return jobs_.size() < kPipeDepth || pipe_failed_ || quitting_; });
+  if (pipe_failed_ || quitting_) {
+    if (error && error->empty()) *error = notice_;
+    return;
+  }
+  jobs_.push_back(std::move(job));
+  worker_cv_.notify_one();
+}
+
+void StreamDecoder::worker_loop() {
+  std::unique_lock<std::mutex> lk(pipe_mutex_);
+  for (;;) {
+    worker_cv_.wait(lk, [&] { return (quitting_ && jobs_.empty()) || !jobs_.empty(); });
+    if (jobs_.empty()) return; /* quitting_ */
+    PipeJob job = std::move(jobs_.front());
+    jobs_.pop_front();
+    busy_ = true;
+    lk.unlock();
+    run_job(&job);
+    lk.lock();
+    busy_ = false;
+    pipe_cv_.notify_all();
+  }
+}
+
+void StreamDecoder::run_job(PipeJob* job) {
+  if (job->show_existing) {
+    Frame picture;
+    bool valid = false;
+    {
+      std::lock_guard<std::mutex> lk(pipe_mutex_);
+      valid = job->existing_idx >= 0 && job->existing_idx < 8 &&
+              pipe_valid_[job->existing_idx];
+      if (valid) picture = pipe_picture_[job->existing_idx];
+    }
+    if (!valid) {
+      /* the frames this re-show depends on were dropped; skip it rather than
+         break a stream that is otherwise fine */
+      ds_debug_log("show_existing_frame names a slot that was never decoded");
+      return;
+    }
+    std::string err;
+    if (!emit(picture, job->pitch, job->sink, &err)) pipe_fail(err);
+    return;
+  }
+
+  Frame picture;
+  std::string err;
+  if (job->slot >= 0) {
+    const int slot = decoder_->decode_reference_reserved(job->syntax, job->slot, &picture, &err);
+    if (slot < 0) {
+      pipe_fail(err.empty() ? "queued frame decode failed" : err);
+      return;
+    }
+  } else {
+    if (!decoder_->decode(job->syntax, &picture, &err)) {
+      pipe_fail(err.empty() ? "queued frame decode failed" : err);
+      return;
+    }
+  }
+  decoded_.fetch_add(1, std::memory_order_relaxed);
+
+  if (job->show_frame && !emit(picture, job->pitch, job->sink, &err)) {
+    pipe_fail(err);
+    return;
+  }
+
+  if (job->slot >= 0) {
+    std::lock_guard<std::mutex> lk(pipe_mutex_);
+    for (int i = 0; i < 8; ++i) {
+      if (!(job->refresh_flags & (1 << i))) continue;
+      pipe_picture_[i] = picture;
+      pipe_valid_[i] = true;
+    }
+  }
+
+  /* every job queued before this one has finished, so slots dropped at plan
+   * time are safe to hand back now */
+  for (int slot : job->release_slots) decoder_->release_reference(slot);
+}
+
+void StreamDecoder::finish() {
+  if (!worker_.joinable()) return;
+  std::unique_lock<std::mutex> lk(pipe_mutex_);
+  pipe_cv_.wait(lk, [&] { return jobs_.empty() && !busy_; });
+}
+
+void StreamDecoder::abort_pipe() {
+  if (!worker_.joinable()) {
+    std::lock_guard<std::mutex> lk(pipe_mutex_);
+    for (int i = 0; i < 8; ++i) pipe_valid_[i] = false;
+    pipe_failed_ = false;
+    return;
+  }
+  std::vector<int> orphan_slots;
+  {
+    std::unique_lock<std::mutex> lk(pipe_mutex_);
+    for (auto& job : jobs_)
+      if (job.slot >= 0) orphan_slots.push_back(job.slot);
+    jobs_.clear();
+    pipe_cv_.wait(lk, [&] { return !busy_; });
+    for (int i = 0; i < 8; ++i) pipe_valid_[i] = false;
+    pipe_failed_ = false;
+  }
+  /* slots reserved for frames that will now never be decoded */
+  for (int slot : orphan_slots) decoder_->release_reference(slot);
+}
 
 void StreamDecoder::reset_stream() {
+  abort_pipe();
   pending_.clear();
   static_cast<StreamState*>(state_)->clear();
   if (decoder_) decoder_->reset();
 }
+
+bool StreamDecoder::init(std::string* error) {
+  decoder_ = Decoder::create(options_, error);
+  if (!decoder_) return false;
+  /* the pipeline needs a backend that can name a decode's slot before it
+   * runs; without that every frame stays on the synchronous path */
+  const int probe = decoder_->reserve_reference();
+  if (probe >= 0) {
+    pipelined_ = true;
+    decoder_->release_reference(probe);
+  }
+  return true;
+}
+
+const DeviceInfo& StreamDecoder::device() const { return decoder_->device(); }
 
 bool StreamDecoder::push(const uint8_t* data, size_t size, size_t pitch,
                          const Sink& sink, std::string* error) {
   /* A stream whose OBUs never complete would grow the buffer without bound;
    * 64 MiB is far past any real temporal unit. */
   constexpr size_t kPendingLimit = 64u << 20;
+  {
+    std::lock_guard<std::mutex> lk(pipe_mutex_);
+    if (pipe_failed_) {
+      if (error) *error = notice_;
+      return false;
+    }
+  }
   if (pending_.size() + size > kPendingLimit) {
     *error = "the stream's OBU framing is broken (no complete OBU in 64 MiB)";
     pending_.clear();
@@ -206,8 +354,10 @@ bool StreamDecoder::emit(const Frame& picture, size_t pitch, const Sink& sink,
   if (picture.ss_x != 1 || picture.ss_y != 1) {
     /* NV12 cannot carry 4:4:4 or 4:2:2; the output negotiates NV12, so a frame
      * like this is dropped rather than shown with wrong chroma. */
-    if (notice_.empty()) {
-      notice_ = "stream is not 4:2:0; the NV12 output drops those frames";
+    {
+      std::lock_guard<std::mutex> lk(pipe_mutex_);
+      if (notice_.empty())
+        notice_ = "stream is not 4:2:0; the NV12 output drops those frames";
     }
     ++dropped_;
     return true;
@@ -249,7 +399,10 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   if (type == frontend::ObuType::TileList) {
     /* large scale tile: a frame assembled from independently stored tiles; the
      * parser does not read it yet */
-    if (notice_.empty()) notice_ = "OBU_TILE_LIST is not supported";
+    {
+      std::lock_guard<std::mutex> lk(pipe_mutex_);
+      if (notice_.empty()) notice_ = "OBU_TILE_LIST is not supported";
+    }
     ++dropped_;
     return true;
   }
@@ -274,11 +427,20 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
 
   if (frame.show_existing_frame) {
     const int which = frame.existing_frame_idx;
-    if (which < 0 || which >= 8 || !st->pool_picture_valid[which]) {
-      *error = "show_existing_frame names a slot that was never decoded";
+    if (which < 0 || which >= 8) {
+      *error = "show_existing_frame names an out of range slot";
       return false;
     }
-    return emit(st->pool_picture[which], pitch, sink, error);
+    /* The validity check runs on the worker: earlier queued frames may still
+     * owe the picture this frame re-shows. */
+    PipeJob job;
+    job.show_existing = true;
+    job.show_frame = true;
+    job.existing_idx = which;
+    job.pitch = pitch;
+    job.sink = sink;
+    queue_job(std::move(job), error);
+    return true;
   }
 
   frontend::TileGroup group;
@@ -345,6 +507,14 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
                                            : st->refs.slots[which].width;
   }
 
+  /* The reference pool update happens *before* the decode is queued: a
+   * pipelined next frame plans against it while this frame's kernels still
+   * run. It must come after the loop above, because a frame is allowed to
+   * reference a slot it also refreshes, and the refresh would then overwrite
+   * the data the loop still needs. */
+  frontend::refresh_ref_pool(frame, &st->refs, decoded.ref_mvs, decoded.cdf,
+                             decoded.seg_map);
+
   FrameSyntax syntax;
   QueryPerformanceCounter(&pc0);
   if (!frontend::plan_from_tile(st->seq, frame, decoded, quant, &syntax, error,
@@ -355,7 +525,10 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   st_plan.add(perf.ms(pc0, pc1));
 
   /* Free the slots this frame refreshes but does not predict from before it is
-   * decoded; the frame is allowed to refresh a slot it reads, so those stay. */
+   * decoded; the frame is allowed to refresh a slot it reads, so those stay.
+   * On the pipelined path the release is deferred to this frame's job, because
+   * a queued earlier job may still be about to write into the slot. */
+  std::vector<int> deferred_release;
   for (int i = 0; i < 8; ++i) {
     if (!(frame.refresh_frame_flags & (1 << i))) continue;
     bool referenced = false;
@@ -368,10 +541,66 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
     if (referenced) continue;
     const int freed = st->pool_slot[i];
     st->pool_slot[i] = -1;
-    st->pool_picture_valid[i] = false;
-    release_slot(st, decoder_.get(), freed);
+    if (pipelined_) {
+      if (freed >= 0) deferred_release.push_back(freed);
+    } else {
+      release_slot(st, decoder_.get(), freed);
+    }
   }
 
+  /* Decide up front which backend slot the picture will be decoded into, so
+   * the pool names below are final before the decode is queued: later frames
+   * plan against these names while this frame's kernels still run. */
+  bool kept = false;
+  for (int i = 0; i < 8; ++i)
+    if (frame.refresh_frame_flags & (1 << i)) kept = true;
+
+  bool pipelined = pipelined_;
+  int reserved = -1;
+  if (pipelined && kept) {
+    reserved = decoder_->reserve_reference();
+    if (reserved < 0) {
+      if (!fallback_used_) {
+        /* first failure: drain what is queued and finish this frame on the
+         * calling thread; every later frame stays synchronous too */
+        fallback_used_ = true;
+        pipelined_ = false;
+        pipelined = false;
+        finish();
+        /* slots dropped earlier in this frame's plan: no job will carry them */
+        for (int slot : deferred_release) decoder_->release_reference(slot);
+        deferred_release.clear();
+        ds_debug_log("reference reservation failed; falling back to the "
+                     "synchronous decode path");
+      } else {
+        *error = "reference pool exhausted";
+        return false;
+      }
+    }
+  }
+
+  if (pipelined) {
+    for (int i = 0; i < 8; ++i) {
+      if (!(frame.refresh_frame_flags & (1 << i))) continue;
+      const int previous = st->pool_slot[i];
+      st->pool_slot[i] = reserved;
+      if (previous >= 0) deferred_release.push_back(previous);
+    }
+
+    PipeJob job;
+    job.syntax = std::move(syntax);
+    job.slot = reserved;
+    job.refresh_flags = frame.refresh_frame_flags;
+    job.show_frame = frame.show_frame;
+    job.pitch = pitch;
+    job.sink = sink;
+    job.release_slots = std::move(deferred_release);
+    queue_job(std::move(job), error);
+    return true;
+  }
+
+  /* Synchronous path: decode on the calling thread, then do the book keeping
+   * that the pipelined path does at plan time. */
   Frame picture;
   QueryPerformanceCounter(&pc0);
   const int slot = decoder_->decode_reference(syntax, &picture, error);
@@ -396,21 +625,17 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   }
 
   /* Hand the picture to the AV1 slots this frame refreshes. */
-  bool kept = false;
   for (int i = 0; i < 8; ++i) {
     if (!(frame.refresh_frame_flags & (1 << i))) continue;
     const int previous = st->pool_slot[i];
-    st->pool_slot[i] = -1;
-    release_slot(st, decoder_.get(), previous);
     st->pool_slot[i] = slot;
-    st->pool_picture[i] = picture;
-    st->pool_picture_valid[i] = true;
-    kept = true;
+    release_slot(st, decoder_.get(), previous);
+    std::lock_guard<std::mutex> lk(pipe_mutex_);
+    pipe_picture_[i] = picture;
+    pipe_valid_[i] = true;
   }
   if (!kept) release_slot(st, decoder_.get(), slot);
 
-  frontend::refresh_ref_pool(frame, &st->refs, decoded.ref_mvs, decoded.cdf,
-                             decoded.seg_map);
   return true;
 }
 

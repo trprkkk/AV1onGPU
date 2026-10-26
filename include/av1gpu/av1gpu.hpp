@@ -612,6 +612,25 @@ class Decoder {
   virtual int decode_reference(const FrameSyntax& syntax, Frame* out,
                                std::string* error = nullptr) = 0;
 
+  /* Like decode_reference, but stores the picture into `slot`, which a
+   * pipelined caller reserved earlier through reserve_reference. A negative
+   * `slot` decodes and drops the device copy; -1 is returned either way. */
+  virtual int decode_reference_reserved(const FrameSyntax& syntax, int slot, Frame* out,
+                                        std::string* error = nullptr) {
+    (void)syntax;
+    (void)slot;
+    (void)out;
+    if (error) *error = "reserved-slot decode is not supported";
+    return -1;
+  }
+
+  /* Reserves a reference slot before its frame is decoded: a caller that plans
+   * frames ahead of their decode (a pipeline) can name the slot in the plan of
+   * the *next* frame without waiting for this one's kernels. The next
+   * decode_reference call on this decoder uses the returned slot; -1 means the
+   * backend cannot reserve (the caller then decodes synchronously). */
+  virtual int reserve_reference() { return -1; }
+
   /* Convenience wrapper: decode and drop the device copy. */
   virtual bool decode(const FrameSyntax& syntax, Frame* out,
                       std::string* error = nullptr);

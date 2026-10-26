@@ -824,7 +824,13 @@ int main(int argc, char** argv) {
     }
   }
 
-  /* 5. what came out */
+  /* 5. end of stream: the pipelined decoder drains its queue here, so the
+   * frame count below is only final once EOS travelled downstream */
+  hr = in_pin->EndOfStream();
+  if (FAILED(hr)) die("EndOfStream", hr);
+  if (!sink.got_eos()) die("EndOfStream never reached the sink");
+
+  /* what came out */
   const size_t got = sink.frames();
   std::printf("av1gpu_dsgraph: %s: %zu temporal unit(s) in, %zu frame(s) out", stem.c_str(),
               units.size(), got);
@@ -854,11 +860,6 @@ int main(int argc, char** argv) {
     if (mt.pbFormat) CoTaskMemFree(mt.pbFormat);
   }
 
-  /* end of stream travels downstream */
-  hr = in_pin->EndOfStream();
-  if (FAILED(hr)) die("EndOfStream", hr);
-  if (!sink.got_eos()) die("EndOfStream never reached the sink");
-
   /* a flush plus NewSegment is the seek path: the decoder starts over, and
    * the first units decode again from the key frame */
   {
@@ -878,6 +879,9 @@ int main(int argc, char** argv) {
         die("Receive after flush failed on unit " + std::to_string(i), hr);
       }
     }
+    /* drain the pipeline before counting, like the first pass does */
+    hr = in_pin->EndOfStream();
+    if (FAILED(hr)) die("EndOfStream after flush", hr);
     const size_t after = sink.frames() - before;
     std::printf("  after flush+NewSegment: %zu more frame(s) from 3 unit(s)\n", after);
     if (after == 0) die("no frames after a flush and re-feed");

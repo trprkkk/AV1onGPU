@@ -114,6 +114,7 @@ bool decode_all(const std::vector<Unit>& units, size_t chunk,
       }
     }
   }
+  core.finish(); /* let the worker show the frames still queued */
   out->shown = core.shown_frames();
   out->dropped = core.dropped_frames();
   return true;
@@ -235,6 +236,7 @@ int main() {
         all_ok = all_ok && core.push(unit.data.data(), unit.data.size(), pitch, sink, &error);
       }
       CHECK(all_ok);
+      core.finish(); /* drain the pipeline before counting frames */
       (void)first_frame;
       std::string where;
       CHECK(same_frames(whole, redecoded, &where));

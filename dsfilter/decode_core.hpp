@@ -16,11 +16,16 @@
 #ifndef AV1GPU_DSFILTER_DECODE_CORE_HPP
 #define AV1GPU_DSFILTER_DECODE_CORE_HPP
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "av1gpu/av1gpu.hpp"
@@ -33,12 +38,33 @@ namespace dsfilter {
  * cannot produce one (a non 4:2:0 subsampling, or a nonsensical pitch). */
 size_t nv12_size(int width, int height, size_t pitch);
 
+/* One shown frame, already packed. `pitch` is the caller's row stride in
+ * bytes; rows are that wide, padding included. */
+using Sink = std::function<bool(const std::vector<uint8_t>& nv12, int width,
+                                int height, std::string* error)>;
+
+/* One frame the worker thread still owes a decode and (maybe) a show. The
+ * main thread does everything that fixes what later frames read - tile decode,
+ * reference bookkeeping, planning - and then hands the finished plan over, so
+ * the GPU work of frame N overlaps the CPU prep of frame N+1. */
+struct PipeJob {
+  FrameSyntax syntax;      /* the finished plan */
+  int slot = -1;           /* reserved reference slot, or -1 to drop the copy */
+  int refresh_flags = 0;   /* AV1 slots this frame hands its picture to */
+  bool show_frame = false; /* push the picture through the sink */
+  bool show_existing = false; /* re-show an already decoded picture instead */
+  int existing_idx = -1;   /* AV1 slot show_existing_frame names */
+  size_t pitch = 0;
+  Sink sink;
+  /* Backend slots the pool dropped at this frame's plan time. Releasing them
+   * is deferred to after this job's decode: a queued earlier job may still be
+   * about to write its picture into one of them. */
+  std::vector<int> release_slots;
+};
+
 class StreamDecoder {
  public:
-  /* One shown frame, already packed. `pitch` is the caller's row stride in
-   * bytes; rows are that wide, padding included. */
-  using Sink = std::function<bool(const std::vector<uint8_t>& nv12, int width,
-                                  int height, std::string* error)>;
+  using Sink = dsfilter::Sink;
 
   explicit StreamDecoder(const BackendOptions& options);
   ~StreamDecoder();
@@ -63,15 +89,28 @@ class StreamDecoder {
   /* Drops the buffered bytes and every reference. Call on a discontinuity. */
   void reset_stream();
 
-  size_t shown_frames() const { return shown_; }
-  size_t decoded_frames() const { return decoded_; }
-  size_t dropped_frames() const { return dropped_; }
-  const std::string& notice() const { return notice_; }
+  /* Waits for the worker to drain every queued frame. Call at end of stream so
+   * the last frames are shown before EOS is delivered downstream. */
+  void finish();
+
+  /* Drops queued frames and waits for the worker to go idle. Call on flush;
+   * after this the decoder accepts a fresh stream. */
+  void abort_pipe();
+
+  size_t shown_frames() const { return shown_.load(std::memory_order_relaxed); }
+  size_t decoded_frames() const { return decoded_.load(std::memory_order_relaxed); }
+  size_t dropped_frames() const { return dropped_.load(std::memory_order_relaxed); }
+  std::string notice() const;
 
  private:
   bool decode_obu(frontend::ObuType type, const uint8_t* payload, size_t size,
                   size_t pitch, const Sink& sink, std::string* error);
   bool emit(const Frame& picture, size_t pitch, const Sink& sink, std::string* error);
+
+  void queue_job(PipeJob job, std::string* error);
+  void worker_loop();
+  void run_job(PipeJob* job);
+  void pipe_fail(const std::string& message);
 
   BackendOptions options_;
   std::unique_ptr<Decoder> decoder_;
@@ -79,11 +118,30 @@ class StreamDecoder {
 
   std::vector<uint8_t> pending_; /* OBU bytes that wait for their tail */
   bool have_seq_ = false;
+
+  /* The frame pipeline. `pipe_picture_`/`pipe_valid_` are the decoded-picture
+   * half of the reference pool (for show_existing_frame); both the main thread
+   * (synchronous fallback) and the worker write them under `pipe_mutex_`. */
+  std::thread worker_;
+  mutable std::mutex pipe_mutex_;
+  std::condition_variable pipe_cv_;    /* queue space or drain */
+  std::condition_variable worker_cv_;  /* wake the worker */
+  std::deque<PipeJob> jobs_;
+  static constexpr size_t kPipeDepth = 3;
+  bool pipelined_ = false;   /* frames go through the queue */
+  bool fallback_used_ = false; /* a failed reservation switched us to sync */
+  bool quitting_ = false;    /* worker must exit */
+  bool busy_ = false;        /* the worker is inside a job */
+  bool pipe_failed_ = false; /* a queued job failed; the stream is broken */
+  Frame pipe_picture_[8];
+  bool pipe_valid_[8] = {false, false, false, false, false,
+                         false, false, false};
+
   std::string notice_; /* a one shot message worth surfacing once */
 
-  size_t shown_ = 0;
-  size_t decoded_ = 0;
-  size_t dropped_ = 0;
+  std::atomic<size_t> shown_{0};
+  std::atomic<size_t> decoded_{0};
+  std::atomic<size_t> dropped_{0};
 };
 
 } /* namespace dsfilter */

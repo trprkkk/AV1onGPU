@@ -56,8 +56,7 @@ class EngineDecoder final : public av1gpu::Decoder {
 
   void release_reference(int slot) override {
     auto it = std::find(held_slots_.begin(), held_slots_.end(), slot);
-    if (it == held_slots_.end()) return;
-    held_slots_.erase(it);
+    if (it != held_slots_.end()) held_slots_.erase(it);
     backend_->release_reference(slot);
   }
 
@@ -68,7 +67,36 @@ class EngineDecoder final : public av1gpu::Decoder {
     return true;
   }
 
+  int reserve_reference() override { return backend_->reserve_reference(); }
+
   int decode_reference(const FrameSyntax& syntax, Frame* out, std::string* error) override {
+    FramePlan plan;
+    if (!plan_for(syntax, &plan, error)) return -1;
+
+    int slot = -1;
+    if (!backend_->decode(plan, true, out, &slot, &stats_, error)) return -1;
+    if (slot >= 0) held_slots_.push_back(slot);
+    return slot;
+  }
+
+  int decode_reference_reserved(const FrameSyntax& syntax, int slot, Frame* out,
+                                std::string* error) override {
+    if (slot < 0) {
+      /* no reserved slot: decode and drop the device copy */
+      decode(syntax, out, error);
+      return -1;
+    }
+    FramePlan plan;
+    if (!plan_for(syntax, &plan, error)) return -1;
+
+    int got = -1;
+    if (!backend_->decode_reserved(plan, slot, out, &got, &stats_, error)) return -1;
+    if (got >= 0) held_slots_.push_back(got);
+    return got;
+  }
+
+ private:
+  bool plan_for(const FrameSyntax& syntax, FramePlan* plan, std::string* error) {
     std::string local;
     if (!error) error = &local;
     error->clear();
@@ -81,20 +109,15 @@ class EngineDecoder final : public av1gpu::Decoder {
     geom.ss_y = syntax.ss_y;
     if (geom.width <= 0 || geom.height <= 0) {
       *error = "frame has no size";
-      return -1;
+      return false;
     }
 
-    FramePlan plan;
     const int coded_width = syntax.coded_width > 0 ? syntax.coded_width : syntax.width;
-    if (!build_frame_plan(syntax, backend_->prepare(geom, coded_width), options_,
-                          backend_->reference_capacity(), &plan, error))
-      return -1;
-
-    int slot = -1;
-    if (!backend_->decode(plan, true, out, &slot, &stats_, error)) return -1;
-    if (slot >= 0) held_slots_.push_back(slot);
-    return slot;
+    return build_frame_plan(syntax, backend_->prepare(geom, coded_width), options_,
+                            backend_->reference_capacity(), plan, error);
   }
+
+ public:
 
   bool to_rgb(int slot, ColorMatrix matrix, ColorRange range, std::vector<uint8_t>* rgb,
               std::string* error) override {

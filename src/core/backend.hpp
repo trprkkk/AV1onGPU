@@ -202,6 +202,24 @@ class Backend {
   virtual void release_reference(int slot) = 0;
   virtual int reference_capacity() const = 0;
 
+  /* Reserves a slot for a frame that will be decoded later; see
+   * Decoder::reserve_reference. -1 = not supported by this backend. */
+  virtual int reserve_reference() { return -1; }
+
+  /* Decodes into a slot reserved by reserve_reference; see
+   * Decoder::decode_reference_reserved. The default implementation means the
+   * backend does not support it. */
+  virtual bool decode_reserved(const FramePlan& plan, int slot, Frame* out,
+                               int* out_slot, DecodeStats* stats, std::string* error) {
+    (void)plan;
+    (void)slot;
+    (void)out;
+    (void)out_slot;
+    (void)stats;
+    (void)error;
+    return false;
+  }
+
   /* Executes the plan. When `out` is non null the planes are read back into it.
    * When `keep_reference` is true the result is stored in a reference slot and
    * its id is written to `out_slot`. */

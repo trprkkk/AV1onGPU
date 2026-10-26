@@ -123,8 +123,24 @@ class CpuBackend final : public Backend {
 
   int reference_capacity() const override { return kReferenceSlots; }
 
+  int reserve_reference() override {
+    const int slot = allocate_slot();
+    if (slot >= 0) refs_[slot].used = true; /* a later decode_reserved fills it */
+    return slot;
+  }
+
   bool decode(const FramePlan& plan, bool keep_reference, Frame* out, int* out_slot,
               DecodeStats* stats, std::string* error) override {
+    return decode_impl(plan, keep_reference, -1, out, out_slot, stats, error);
+  }
+
+  bool decode_reserved(const FramePlan& plan, int slot, Frame* out, int* out_slot,
+                       DecodeStats* stats, std::string* error) override {
+    return decode_impl(plan, true, slot, out, out_slot, stats, error);
+  }
+
+  bool decode_impl(const FramePlan& plan, bool keep_reference, int forced_slot,
+                   Frame* out, int* out_slot, DecodeStats* stats, std::string* error) {
     std::string local;
     if (!error) error = &local;
     error->clear();
@@ -407,10 +423,15 @@ class CpuBackend final : public Backend {
      * display picture only. */
     int slot = -1;
     if (keep_reference) {
-      slot = allocate_slot();
-      if (slot < 0) {
-        *error = "CPU reference pool exhausted";
-        return false;
+      if (forced_slot >= 0) {
+        /* an explicit slot reserved ahead of time by a pipelined caller */
+        slot = forced_slot;
+      } else {
+        slot = allocate_slot();
+        if (slot < 0) {
+          *error = "CPU reference pool exhausted";
+          return false;
+        }
       }
       RefFrame& ref = refs_[slot];
       ref.used = true;

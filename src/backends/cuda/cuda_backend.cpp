@@ -149,7 +149,22 @@ class CudaBackend final : public Backend {
     return build_module(error);
   }
 
+  /* A pipelined caller decodes from its own thread; make the context current
+   * there (a no-op when it already is). Returns false when that fails. */
+  bool ensure_context(std::string* error) {
+    cuda::CUcontext current = nullptr;
+    if (driver_.CtxGetCurrent &&
+        (driver_.CtxGetCurrent(&current) != cuda::CUDA_SUCCESS || current != context_)) {
+      if (driver_.CtxSetCurrent(context_) != cuda::CUDA_SUCCESS) {
+        if (error) *error = "cuCtxSetCurrent failed";
+        return false;
+      }
+    }
+    return true;
+  }
+
   PlanLayout prepare(const FrameGeometry& geometry, int coded_width) override {
+    ensure_context(nullptr); /* prepare cannot report an error; decode will */
     const PlanLayout g = make_plan_layout(geometry, coded_width, 64);
     const size_t size = g.buffer_size;
     layout_ = g;
@@ -211,9 +226,26 @@ class CudaBackend final : public Backend {
 
   int reference_capacity() const override { return kReferenceSlots; }
 
+  int reserve_reference() override {
+    const int slot = allocate_slot();
+    if (slot >= 0) slots_[slot] = true; /* a later decode_reserved fills it */
+    return slot;
+  }
+
   bool decode(const FramePlan& plan, bool keep_reference, Frame* out, int* out_slot,
               DecodeStats* stats, std::string* error) override {
+    return decode_impl(plan, keep_reference, -1, out, out_slot, stats, error);
+  }
+
+  bool decode_reserved(const FramePlan& plan, int slot, Frame* out, int* out_slot,
+                       DecodeStats* stats, std::string* error) override {
+    return decode_impl(plan, true, slot, out, out_slot, stats, error);
+  }
+
+  bool decode_impl(const FramePlan& plan, bool keep_reference, int forced_slot,
+                   Frame* out, int* out_slot, DecodeStats* stats, std::string* error) {
     error->clear();
+    if (!ensure_context(error)) return false;
     if (alloc_failed_)
       return fail(error, "out of device memory (prepare failed to allocate the frame buffers)");
     const double t0 = now_ms();
@@ -924,8 +956,13 @@ class CudaBackend final : public Backend {
      * display picture only. */
     int slot = -1;
     if (keep_reference) {
-      slot = allocate_slot();
-      if (slot < 0) return fail(error, "CUDA reference pool exhausted");
+      if (forced_slot >= 0) {
+        /* an explicit slot reserved ahead of time by a pipelined caller */
+        slot = forced_slot;
+      } else {
+        slot = allocate_slot();
+        if (slot < 0) return fail(error, "CUDA reference pool exhausted");
+      }
       cuda::CUresult rc = driver_.MemcpyDtoD(
           ref_pool_ + static_cast<size_t>(slot) * g.buffer_size * sizeof(uint16_t), frame_,
           g.buffer_size * sizeof(uint16_t));
