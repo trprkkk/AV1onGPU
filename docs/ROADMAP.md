@@ -492,6 +492,19 @@ decoder) already built for VA-API:
 Order matters: inter frames first (a browser cannot use an intra-only decoder),
 then this. None of it touches the kernels.
 
+**Done: local players, via DirectShow.** `dsfilter/av1gpu_dshow.dll` is a
+DirectShow decoder filter (`dsfilter/README.md` has the setup): an input pin
+that takes the AV1 elementary stream a splitter delivers and an output pin that
+packs NV12 on the device, so MPC-BE, MPC-HC and PotPlayer use it as an external
+filter and every graph editor can insert it by CLSID. The COM surface is hand
+written (no DirectShow base classes; the only dependencies are the Windows SDK
+headers and `strmiids.lib`), the decode core is the same `StreamDecoder` the
+library tests drive, and the harness `tools/av1gpu_dsgraph` exercises the real
+COM path - connection, allocator handshake, frames counted at a sink, flush and
+seek, Stop/Pause. v1 is synchronous, NV12 only and refuses a stream that is not
+4:2:0; the browser path stays open and is what the rest of this section is
+about.
+
 ## 7. Bit depth and chroma coverage (done)
 
 **Done: 10 bit, 12 bit and 4:4:4, each against dav1d.** Three libaom clips pin
@@ -511,7 +524,7 @@ against dav1d and ffmpeg, and the 4:4:4 one found a difference weighted mask
 that was rebuilt from the chroma prediction rather than the luma one - right for
 4:2:0, wrong at 4:4:4 - which is plan format 8.
 
-## 8. Verification on a real GPU
+## 8. Verification on a real GPU (done)
 
 Everything in this repository is checkable without a device except the driver
 interface itself, and that is where a port to another machine usually breaks:
@@ -520,16 +533,27 @@ how much CPU time is left over while the card works. `tests/gpu_verify.py` (and
 `docs/GPU.md`) is that check: synthetic parity against the CPU reference, then the
 fixture streams decoded through the GPU backend with the fallback disabled.
 
-As of this writing it has run on OpenCL — on PoCL, a CPU device, which is enough
-to prove the plumbing and the arithmetic but says nothing about speed — and not at
-all on CUDA, which has had no NVIDIA device here. The first run of that shape is
-what the numbers in this file are waiting for: which frame sizes play in real
-time, what the CPU share looks like next to it, and whether the wave scheduling in
-section 5 is the right thing to attack first.
+**Verified on an NVIDIA GeForce RTX 2060 SUPER** (driver 591.74, Windows, CUDA
+toolkit v11.8 for NVRTC), 2026-10:
 
-`docs/GPU.md` is the runbook for that run: an eight step checklist (each step with
-the line it should print), the driver/ICD packages per vendor, the one command
-(`tests/gpu_verify.py`, whose exit code distinguishes "no GPU here" from "the GPU
-is wrong"), the per fixture matrix of what the device is being asked to prove, the
-benchmark protocol, and the bundle of logs worth attaching to the result. What is
-still open on this page is exactly what that checklist's steps 5 to 8 produce.
+* `gpu_verify: all checks passed on cuda0` and on `opencl1..3` — the synthetic
+  1280x720 clip **bit identical** to the CPU reference (PSNR Y 59.47 on both),
+  and **all 24 fixture streams bit exact, every temporal unit**, with the CPU
+  fallback disabled so the device really produced the pixels. The CUDA backend
+  had never run before this; its review-time fixes (checked `cuCtxSynchronize`,
+  checked copies, allocation failures surfaced) were exactly what the run
+  exercised.
+* Speed, same machine, same build: 720p synthetic clip **145.7 -> 15.4 ms/frame
+  (9.4x) through CUDA and 153.0 -> 15.3 ms/frame (10.0x) through OpenCL**, at 23
+  launches per frame, while the small 320x240 fixtures run in 2-7 ms/frame. The
+  CPU share next to the card is what section 5 attacks next.
+* The whole 35 test suite passes on this machine, including the DirectShow
+  layers: `test_ds_core` (the decode core, chunked pushes, reset + re-decode,
+  and the Auto backend against the CPU reference, bit exact on all seven
+  fixtures) and the four `av1gpu_dsgraph` COM runs.
+
+`docs/GPU.md` holds the runbook (checklist, per vendor setup, the one command
+whose exit code distinguishes "no GPU here" from "the GPU is wrong") and the
+result table to copy on another machine; its "what is still unverified" list is
+down to the pieces that need more than one machine — other vendors' drivers,
+and the browser path of section 6.

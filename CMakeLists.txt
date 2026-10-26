@@ -6,6 +6,15 @@ option(AV1GPU_BUILD_TOOLS "Build av1gpu_info / av1gpu_bench / av1gpu_play" ON)
 option(AV1GPU_ENABLE_OPENCL "Build the OpenCL backend" ON)
 option(AV1GPU_ENABLE_CUDA "Build the CUDA backend" ON)
 option(AV1GPU_ENABLE_OPENMP "Use OpenMP in the CPU reference backend" ON)
+# The DirectShow AV1 decoder filter (dsfilter/): Windows and MSVC only, since
+# it is a COM in process server built against dshow.h.
+if(WIN32 AND MSVC)
+  set(AV1GPU_DSFILTER_DEFAULT ON)
+else()
+  set(AV1GPU_DSFILTER_DEFAULT OFF)
+endif()
+option(AV1GPU_BUILD_DSFILTER "Build the DirectShow AV1 decoder filter"
+       ${AV1GPU_DSFILTER_DEFAULT})
 # ASan + UBSan, with UBSan configured to halt (see the block below). The
 # sweep it is meant for - every fixture decoded, 38/38 tests, no findings -
 # is written down in docs/ACCURACY.md.
@@ -129,6 +138,24 @@ if(UNIX)
 endif()
 
 # ---------------------------------------------------------------------------
+# the DirectShow filter itself (see dsfilter/README.md for registering and for
+# wiring it into MPC-BE / MPC-HC / PotPlayer / graph editors)
+# ---------------------------------------------------------------------------
+if(AV1GPU_BUILD_DSFILTER)
+  if(NOT WIN32 OR NOT MSVC)
+    message(FATAL_ERROR "AV1GPU_BUILD_DSFILTER needs Windows and MSVC")
+  endif()
+  add_library(av1gpu_dshow SHARED
+    dsfilter/decode_core.cpp
+    dsfilter/av1gpu_dshow.cpp
+    dsfilter/av1gpu_dshow.def)
+  target_link_libraries(av1gpu_dshow PRIVATE av1gpu ole32 strmiids uuid advapi32)
+  target_compile_definitions(av1gpu_dshow PRIVATE _CRT_SECURE_NO_WARNINGS)
+  set_target_properties(av1gpu_dshow PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+endif()
+
+# ---------------------------------------------------------------------------
 # tools and tests
 # ---------------------------------------------------------------------------
 if(AV1GPU_BUILD_TOOLS)
@@ -150,6 +177,46 @@ if(AV1GPU_BUILD_TESTS)
       AV1GPU_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME ${test} COMMAND ${test})
   endforeach()
+
+  # The DirectShow decode core without DirectShow: the same NV12 bytes as the
+  # canonical decode walk, incremental OBU parsing, and (when a GPU is present)
+  # bit exact GPU output. Runs on the CPU everywhere; the GPU parity check
+  # only runs when a device is there.
+  if(AV1GPU_BUILD_DSFILTER)
+    add_executable(test_ds_core tests/test_ds_core.cpp dsfilter/decode_core.cpp)
+    target_link_libraries(test_ds_core PRIVATE av1gpu)
+    set_target_properties(test_ds_core PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_include_directories(test_ds_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test_ds_core PRIVATE
+      AV1GPU_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+    add_test(NAME test_ds_core COMMAND test_ds_core)
+    set_tests_properties(test_ds_core PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+    # The real COM surface of the filter, exercised through DllGetClassObject:
+    # factory -> filter -> media type agreement -> allocator handshake ->
+    # samples pushed through a fake source into Receive, frames counted at a
+    # minimal sink. The DLL is loaded with LoadLibrary, the way a player does.
+    add_executable(av1gpu_dsgraph tools/av1gpu_dsgraph.cpp)
+    target_link_libraries(av1gpu_dsgraph PRIVATE av1gpu ole32 uuid strmiids)
+    set_target_properties(av1gpu_dsgraph PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_compile_definitions(av1gpu_dsgraph PRIVATE
+      AV1GPU_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+    if(TARGET av1gpu_dshow)
+      # Fixtures whose every frame is shown, with the frame counts the
+      # stream_* tests above rely on.
+      foreach(stream lw_t2:30 lr:8 tiles:4 grain:30)
+        string(REGEX REPLACE ":.*" "" name ${stream})
+        string(REGEX REPLACE ".*:" "" frames ${stream})
+        add_test(NAME dsgraph_${name}
+                 COMMAND av1gpu_dsgraph --dll $<TARGET_FILE:av1gpu_dshow> --stream
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/${name}.ivf
+                         --expect ${frames})
+        set_tests_properties(dsgraph_${name} PROPERTIES TIMEOUT 300)
+      endforeach()
+    endif()
+  endif()
 
   # Bit exact streams: the whole front end plus the CPU backend against hashes
   # of the reference decoder's output (see tests/data/README.md). lw_t2 and

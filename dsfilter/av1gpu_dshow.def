@@ -1,0 +1,14 @@
+; av1gpu_dshow - exports of the COM in-process server.
+;
+; A module definition file rather than __declspec(dllexport) on the
+; definitions: the Windows SDK headers already declare these entry points
+; (STDAPI in combaseapi.h / olectl.h), and redeclaring them with dllexport
+; trips the compiler's inconsistent-linkage check. PRIVATE keeps the names
+; out of the import lib; nobody links against the DLL directly, players load
+; it and call the entry points.
+LIBRARY av1gpu_dshow
+EXPORTS
+    DllGetClassObject     PRIVATE
+    DllCanUnloadNow       PRIVATE
+    DllRegisterServer     PRIVATE
+    DllUnregisterServer   PRIVATE

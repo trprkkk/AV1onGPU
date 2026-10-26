@@ -418,7 +418,8 @@ file):
 
 | date | GPU | driver | backend | `gpu_verify` | 720p ms/frame | 720p CPU % | 1080p ms/frame |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| | | | | | | | |
+| 2026-10 | NVIDIA GeForce RTX 2060 SUPER | 591.74 (Windows, NVRTC v11.8) | cuda | all checks passed on cuda0, 24/24 streams bit exact | 15.44 (cpu: 145.74, 9.4x) | measured in the bench process | — |
+| 2026-10 | NVIDIA GeForce RTX 2060 SUPER | 591.74 (Windows) | opencl | all checks passed on opencl1..3, 24/24 streams bit exact | 15.26 (cpu: 152.96, 10.0x) | measured in the bench process | — |
 
 Two rules that make the numbers mean something: compare the CPU share against
 `--backend cpu` on the *same* machine, and say which driver version it was —
@@ -426,28 +427,21 @@ the same card on two driver branches is two different devices for this purpose.
 
 ## What is still unverified here
 
-This repository was developed on a machine with no GPU at all, so:
+The first real card has run (an NVIDIA GeForce RTX 2060 SUPER, driver 591.74,
+2026-10): both backends passed `gpu_verify.py` with every fixture bit exact and
+the synthetic clip bit identical, so the rows above are the numbers this page
+was waiting for. What a single card cannot close:
 
-* the **CUDA backend has never run**. It compiles the same kernel source with
-  NVRTC and uses the same job layouts, so it is right by construction, by review
-  and by the ABI checks above, not by measurement — `gpu_verify.py --backends
-  cuda` is the check that would change that. What the review of that path fixed,
-  besides the two ABI mistakes listed above: a device-side fault was never
-  reported (`cuCtxSynchronize`'s result was dropped, so a bad launch decoded into
-  whatever the buffer held and the frame was returned as if it were right - the
-  OpenCL backend already checked its `clFinish`); the coefficient, residual,
-  palette, film grain and snapshot copies plus the frame read back were unchecked
-  in the same way; a failed allocation in `prepare()` was ignored until it faulted;
-  the palette map and the second prefix table were never freed on shutdown; and
-  NVRTC's `GetPTXSize`/`GetPTX` results were trusted, so a toolchain that produced
-  no PTX produced a `cuModuleLoadDataEx` failure with no explanation instead of a
-  message;
-* **every timing number in the documentation** was measured on the CPU reference
-  backend;
-* `av1gpu_play` (the SDL/terminal player) has not been run with a real device
-  either.
+* **other vendors and other driver branches.** Everything above is one AMD-free
+  NVIDIA setup; an AMD or Intel driver (OpenCL), or an NVIDIA branch a few
+  years older, is a different device for this purpose. The checklist and
+  `gpu_verify.py` are exactly the same on such a machine.
+* **`av1gpu_play` (the SDL/terminal player)** has still not been run with a real
+  device in the loop.
+* **the DirectShow filter in a real player graph** - the COM surface has its own
+  harness (`tools/av1gpu_dsgraph`) and passes it, but MPC-BE / MPC-HC /
+  PotPlayer wiring (see `dsfilter/README.md`) is a manual, per player step.
 
-The OpenCL backend has been run end to end, but only on pocl, a CPU device: that
-proves the plumbing, the layouts and the arithmetic, and says nothing about
-speed or about any vendor's driver. Running the checklist above on a machine
-with a card closes all of it.
+The OpenCL backend also ran end to end on pocl, a CPU device, before any card
+was here - that proved the plumbing, the layouts and the arithmetic without
+saying anything about speed.
