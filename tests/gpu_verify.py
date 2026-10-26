@@ -31,7 +31,9 @@ script fails instead, and it also fails if the device it got is not the backend 
 asked for.
 
 Exit codes: 0 everything verified, 1 a mismatch or a backend failure, 77 no GPU
-backend could be initialised (ctest reports that as a skip).
+backend could be initialised (ctest reports that as a skip). A backend named with
+``--backends`` is a requirement, not a preference: asking for one this machine
+does not have is exit 1, so a CI job that names a GPU cannot pass by skipping.
 """
 
 import argparse
@@ -237,6 +239,14 @@ def main():
     for line in errors:
         print("    ! %s" % line)
     if not usable:
+        # A backend named on the command line is a requirement, not a preference:
+        # saying "verify opencl" on a machine that cannot even initialise it has
+        # to fail, or a CI job that asks for the GPU would pass by skipping.
+        if missing:
+            print("\ngpu_verify: %s was requested but no such device is present"
+                  % ", ".join(missing))
+            print("  av1gpu_info lists what this machine has; see docs/GPU.md")
+            return 1
         print("\ngpu_verify: no %s device could be initialised - skipped"
               % "/".join(wanted or GPU_KINDS))
         print("  a machine with a GPU and its OpenCL (or CUDA) driver is needed; "
@@ -244,8 +254,6 @@ def main():
         return SKIP
 
     failures = []
-    for kind in missing:
-        failures.append("%s was requested but no such device is present" % kind)
 
     # ---------------------------------------------------------------- synthetic
     width, height = (int(value) for value in args.bench_size.lower().split("x"))

@@ -280,6 +280,16 @@ if(AV1GPU_BUILD_TESTS)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   set(AV1GPU_TEST_PYTHON "" CACHE FILEPATH
       "Python for the OpenCL tests; must have numpy and pyopencl")
+  # Which OpenCL device the Python tests compile and run on. Empty means the
+  # first one pyopencl reports, which on a machine that has both a card and a
+  # software implementation (pocl, for the driverless tests) is not necessarily
+  # the card. `tests/opencl_selftest.py --list-devices` names them.
+  set(AV1GPU_TEST_OPENCL_DEVICE "" CACHE STRING
+      "OpenCL device index for the OpenCL tests (empty: the first device)")
+  set(AV1GPU_TEST_OPENCL_ARGS "")
+  if(NOT AV1GPU_TEST_OPENCL_DEVICE STREQUAL "")
+    set(AV1GPU_TEST_OPENCL_ARGS --device ${AV1GPU_TEST_OPENCL_DEVICE})
+  endif()
   set(AV1GPU_TEST_PY "${Python3_EXECUTABLE}")
   if(AV1GPU_TEST_PYTHON)
     set(AV1GPU_TEST_PY "${AV1GPU_TEST_PYTHON}")
@@ -302,7 +312,8 @@ if(AV1GPU_BUILD_TESTS)
     endif()
 
     add_test(NAME opencl_selftest
-             COMMAND ${AV1GPU_TEST_PY} ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_selftest.py)
+             COMMAND ${AV1GPU_TEST_PY} ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_selftest.py
+                     ${AV1GPU_TEST_OPENCL_ARGS})
     set_tests_properties(opencl_selftest PROPERTIES SKIP_RETURN_CODE 77)
 
     # Replays real decode plans through the OpenCL kernels and compares whole
@@ -312,6 +323,7 @@ if(AV1GPU_BUILD_TESTS)
       add_test(NAME opencl_pipeline
                COMMAND ${AV1GPU_TEST_PY}
                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_pipeline.py
+                       ${AV1GPU_TEST_OPENCL_ARGS}
                        --dumper $<TARGET_FILE:av1gpu_dump>)
       set_tests_properties(opencl_pipeline PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
@@ -425,6 +437,7 @@ if(AV1GPU_BUILD_TESTS)
         add_test(NAME opencl_${stream}
                  COMMAND ${AV1GPU_TEST_PY}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/opencl_pipeline.py
+                         ${AV1GPU_TEST_OPENCL_ARGS}
                          --input ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/${stream}.ivf
                          --frames ${frames} --decoder $<TARGET_FILE:av1gpu_decode>)
         set_tests_properties(opencl_${stream} PROPERTIES SKIP_RETURN_CODE 77

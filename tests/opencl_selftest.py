@@ -10,6 +10,12 @@ do not have - a pure software implementation does work though:
 
     pip install pyopencl pocl-binary-distribution
     python3 tests/opencl_selftest.py
+    python3 tests/opencl_selftest.py --list-devices   # what a machine has
+    python3 tests/opencl_selftest.py --device 1       # the second one, not the first
+
+On a machine that also has a software OpenCL implementation next to the real
+card, the first device is not always the card: ``--list-devices`` names them and
+``--device`` picks one, so the kernels are compiled by the driver that matters.
 
 The job-struct layouts and the shared tables are not duplicated here: a small
 probe, compiled from ``src/core/tables.cpp`` with the project's own compiler,
@@ -18,6 +24,7 @@ prints them, so the test always exercises the numbers the backends upload.
 Exit codes: 0 all checks passed, 1 failure, 77 OpenCL not available (skip).
 """
 
+import argparse
 import ctypes
 import json
 import os
@@ -474,7 +481,14 @@ def devices():
         return []
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="compile and run the OpenCL kernels")
+    parser.add_argument("--device", type=int, default=0,
+                        help="index into --list-devices (default 0)")
+    parser.add_argument("--list-devices", action="store_true",
+                        help="print every OpenCL device and exit")
+    args = parser.parse_args(argv)
+
     try:
         import numpy as np
         import pyopencl as cl
@@ -486,8 +500,19 @@ def main():
     if not found:
         print("OpenCL self test skipped: no OpenCL platform")
         return 77
-    devices_ = found
-    device = devices_[0]
+    if args.list_devices:
+        for index, entry in enumerate(found):
+            platform = entry.platform
+            print("[%d] %s (%s) on %s" % (index, entry.name, entry.version,
+                                          platform.name))
+        return 0
+    if args.device < 0 or args.device >= len(found):
+        print("device %d does not exist: %d OpenCL device(s) found"
+              % (args.device, len(found)))
+        for index, entry in enumerate(found):
+            print("  [%d] %s" % (index, entry.name))
+        return 1
+    device = found[args.device]
     print("device: %s (%s)" % (device.name, device.version))
 
     source = build_source()

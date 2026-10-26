@@ -517,6 +517,8 @@ def parse_args(argv=None):
     parser.add_argument("--no-grain", action="store_true", help="decode without grain")
     parser.add_argument("--dumper", default=None, help="path to av1gpu_dump")
     parser.add_argument("--decoder", default=None, help="path to av1gpu_decode")
+    parser.add_argument("--device", type=int, default=0,
+                        help="index into opencl_selftest.py --list-devices (default 0)")
     return parser.parse_args(argv)
 
 
@@ -547,7 +549,13 @@ def main(argv=None):
         print("OpenCL pipeline test skipped: %s does not exist" % args.input)
         return 77
 
-    device = found[0]
+    if args.device < 0 or args.device >= len(found):
+        print("device %d does not exist: %d OpenCL device(s) found"
+              % (args.device, len(found)))
+        for index, entry in enumerate(found):
+            print("  [%d] %s" % (index, entry.name))
+        return 1
+    device = found[args.device]
     print("device: %s (%s)" % (device.name, device.version))
     context = cl.Context([device])
     queue = cl.CommandQueue(context)

@@ -261,11 +261,21 @@ then checks the whole backend — context, buffers, job upload, launch order,
 reference copies — against a reference decoder's pictures. `tests/gpu_verify.py`
 does that for every backend and every fixture in one command, with the CPU
 fallback disabled so a run that quietly used the CPU cannot pass; `docs/GPU.md`
-is the page to hand to whoever has the GPU. Every stream in the
-fixture set decodes bit exactly that way on a two-core PoCL device (14 streams),
-and `av1gpu_bench` reports the same PSNR for `--backend cpu` and `--backend
-opencl`. This is an arithmetic and plumbing check, not a performance one: a CPU
+is the page to hand to whoever has the GPU. Every stream the fixture set had when
+this layer was added decodes bit exactly that way on a two-core PoCL device, and
+`av1gpu_bench` reports the same PSNR for `--backend cpu` and `--backend opencl`.
+Fixtures added since then are covered by the same two commands whenever a device
+is present, so the claim is renewed by running them rather than by editing this
+paragraph. This is an arithmetic and plumbing check, not a performance one: a CPU
 OpenCL device runs the kernels on the CPU.
+
+A detail that costs an hour if it is not written down: that C++ layer needs a
+real ICD loader, not the one a pip wheel ships. Pointing `libOpenCL.so.1` at
+pyopencl's bundled loader and its `libpocl.so` at a wheel directory crashes
+inside the loader (`undefined symbol: clGetPlatformIDs`, or a segfault in
+`clGetPlatformIDs`) because the wheel renames its own dependencies; the
+distribution's `ocl-icd-libopencl1` with `pocl-opencl-icd` works. `docs/GPU.md`
+has the recipe and the symptom in its troubleshooting table.
 
 Running that layer for the first time found two bugs the kernel tests could not
 see, because nothing in this tree had ever created a device:

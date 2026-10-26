@@ -526,3 +526,10 @@ all on CUDA, which has had no NVIDIA device here. The first run of that shape is
 what the numbers in this file are waiting for: which frame sizes play in real
 time, what the CPU share looks like next to it, and whether the wave scheduling in
 section 5 is the right thing to attack first.
+
+`docs/GPU.md` is the runbook for that run: an eight step checklist (each step with
+the line it should print), the driver/ICD packages per vendor, the one command
+(`tests/gpu_verify.py`, whose exit code distinguishes "no GPU here" from "the GPU
+is wrong"), the per fixture matrix of what the device is being asked to prove, the
+benchmark protocol, and the bundle of logs worth attaching to the result. What is
+still open on this page is exactly what that checklist's steps 5 to 8 produce.

@@ -296,7 +296,7 @@ cd build && ctest --output-on-failure
   `av1gpu_bench` has to report a GPU result bit identical to the CPU reference,
   and the fixture streams have to decode bit exactly through the GPU backend with
   `--require-device`, so a backend that fell back to the CPU cannot pass. Run it
-  on the machine with the card, see `docs/GPU.md`.
+  on the machine with the card, see [`docs/GPU.md`](docs/GPU.md).
 
 ```sh
 pip install pyopencl          # or pyopencl + pocl-binary-distribution
@@ -323,6 +323,29 @@ export LD_LIBRARY_PATH=$POCL_LIBS:$PYOPENCL_LIBS
 export OPENCL_VENDOR_PATH=$PYOPENCL_LIBS
 ctest --test-dir build -R opencl --output-on-failure
 ```
+
+## On a machine with a GPU
+
+Everything above runs without a device, which is deliberate, but it cannot show
+that a *driver* accepts this backend. On a machine with a card:
+
+```sh
+./build/bin/av1gpu_info                       # has to list [opencl] or [cuda]
+python3 tests/gpu_verify.py -v 2>&1 | tee gpu_verify.log
+```
+
+`gpu_verify` decodes a synthetic clip and all 24 fixture streams through the GPU
+backend with the CPU fallback disabled (`--require-device`), compares every frame
+against the reference decoder's hashes, and prints ms/frame and the CPU share
+next to them. It exits 0 when everything matched, 1 on a mismatch, and 77 when
+this machine has no GPU at all — but a backend named with `--backends` is a
+requirement, so a CI job that asks for `cuda` fails rather than skips.
+
+[`docs/GPU.md`](docs/GPU.md) is the runbook: a step by step checklist with the
+result each step should print, the ICD/driver packages per vendor, how to point
+the Python OpenCL tests at a specific device (`--device`, and
+`-DAV1GPU_TEST_OPENCL_DEVICE` for ctest), what each fixture proves on the device,
+what numbers are worth collecting, and a troubleshooting table.
 
 ## What is not here
 
