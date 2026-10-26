@@ -57,11 +57,21 @@ struct Driver {
   CUresult (*CtxCreate)(CUcontext*, unsigned, CUdevice);
   CUresult (*CtxDestroy)(CUcontext);
   CUresult (*CtxSynchronize)(void);
+  CUresult (*CtxSetCurrent)(CUcontext); /* workers must adopt the context */
+  CUresult (*CtxGetCurrent)(CUcontext*);
+  /* events, for GPU side timing */
+  CUresult (*EventCreate)(void**, unsigned);
+  CUresult (*EventRecord)(void*, CUstream);
+  CUresult (*EventSynchronize)(void*);
+  CUresult (*EventElapsedTime)(float*, void*, void*);
+  CUresult (*EventDestroy)(void*);
   CUresult (*MemAlloc)(CUdeviceptr*, size_t);
   CUresult (*MemFree)(CUdeviceptr);
   CUresult (*MemcpyHtoD)(CUdeviceptr, const void*, size_t);
   CUresult (*MemcpyDtoH)(void*, CUdeviceptr, size_t);
   CUresult (*MemcpyDtoD)(CUdeviceptr, CUdeviceptr, size_t);
+  CUresult (*MemAllocHost)(void**, size_t); /* page-locked host memory */
+  CUresult (*MemFreeHost)(void*);
   CUresult (*ModuleLoadDataEx)(CUmodule*, const void*, unsigned, int*, void**);
   CUresult (*ModuleGetFunction)(CUfunction*, CUmodule, const char*);
   CUresult (*LaunchKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned,

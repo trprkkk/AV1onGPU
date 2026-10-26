@@ -11,11 +11,13 @@
  * actually wants the pixels.
  */
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -195,8 +197,7 @@ class CudaBackend final : public Backend {
     }
     const CUdeviceptr target =
         ref_pool_ + static_cast<size_t>(slot) * size * sizeof(uint16_t);
-    if (driver_.MemcpyHtoD(target, packed.data(), size * sizeof(uint16_t)) !=
-        cuda::CUDA_SUCCESS) {
+    if (!upload_h2d(target, packed.data(), size * sizeof(uint16_t))) {
       if (error) *error = "cuMemcpyHtoD failed";
       return -1;
     }
@@ -219,6 +220,14 @@ class CudaBackend final : public Backend {
     const PlanLayout& g = plan.layout;
     const int maxv = plan.maxv;
     int launches = 0;
+    /* temporary profiling: CPU-side upload vs launch vs wait time */
+    auto qpc = [] { LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart; };
+    LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+    const auto ms_between = [&](LARGE_INTEGER a, LARGE_INTEGER b) {
+      return double(b.QuadPart - a.QuadPart) / double(qf.QuadPart) * 1000.0;
+    };
+    LARGE_INTEGER tp0{}, tp1{};
+    (void)tp0; (void)tp1;
 
     /* Every allocation and every copy is checked: a failed cuMemAlloc leaves a
      * null device pointer, and a kernel launched against it faults the context
@@ -228,70 +237,84 @@ class CudaBackend final : public Backend {
         !ensure(&tmp_, &tmp_cap_, (plan.tmp_size + 1) * sizeof(int)))
       return fail(error, "out of device memory for the coefficient buffers");
     if (!plan.coefficients.empty() &&
-        driver_.MemcpyHtoD(coef_, plan.coefficients.data(),
-                           plan.coefficients.size() * sizeof(int)) != cuda::CUDA_SUCCESS)
+        !upload_h2d(coef_, plan.coefficients.data(),
+                    plan.coefficients.size() * sizeof(int)))
       return fail(error, "coefficient upload failed");
     if (!plan.residual.empty()) {
       if (!ensure(&residual_, &residual_cap_, (plan.residual.size() + 1) * sizeof(int)))
         return fail(error, "out of device memory for the residual buffer");
-      if (driver_.MemcpyHtoD(residual_, plan.residual.data(),
-                             plan.residual.size() * sizeof(int)) != cuda::CUDA_SUCCESS)
+      if (!upload_h2d(residual_, plan.residual.data(),
+                      plan.residual.size() * sizeof(int)))
         return fail(error, "residual upload failed");
     }
 
-    for (const WaveJobs& wave : plan.waves) {
-      if (!wave.inter.empty()) {
-        std::vector<Av1gInterJob> jobs = wave.inter;
-        for (Av1gInterJob& job : jobs) {
-          if (job.ref0_slot >= 0)
-            job.ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
-          if (job.ref1_slot >= 0)
-            job.ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
-          /* a difference weighted chroma block builds its mask on the luma
-           * plane, so those offsets need the same slot rebase */
-          if (job.mask_kind == AV1G_MASK_DIFFWTD) {
+    /* ---- legacy path (AV1GPU_LEGACY=1): upload and launch each wave in
+     * turn, the way this backend worked before the parallel prep existed.
+     * Kept for A/B profiling of the arena layout. */
+    static const bool legacy_wave = [] {
+      char f[8] = {0};
+      return GetEnvironmentVariableA("AV1GPU_LEGACY", f, sizeof(f)) > 0 &&
+             f[0] == '1';
+    }();
+    double gpu_ms = -1.0;
+    void *ev0 = nullptr, *ev1 = nullptr;
+    if (legacy_wave && driver_.EventCreate) {
+      driver_.EventCreate(&ev0, 0);
+      driver_.EventCreate(&ev1, 0);
+      if (ev0) driver_.EventRecord(ev0, nullptr);
+    }
+    double t1 = 0.0; /* end of the wave reconstruction section */
+    if (legacy_wave) {
+      for (const WaveJobs& wave : plan.waves) {
+        if (!wave.inter.empty()) {
+          std::vector<Av1gInterJob> jobs = wave.inter;
+          for (Av1gInterJob& job : jobs) {
             if (job.ref0_slot >= 0)
-              job.luma_ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
+              job.ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
             if (job.ref1_slot >= 0)
-              job.luma_ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
+              job.ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
+            if (job.mask_kind == AV1G_MASK_DIFFWTD) {
+              if (job.ref0_slot >= 0)
+                job.luma_ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
+              if (job.ref1_slot >= 0)
+                job.luma_ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
+            }
+            for (int k = 0; k < job.obmc_count; ++k)
+              if (job.obmc[k].ref_slot >= 0)
+                job.obmc[k].ref_off += job.obmc[k].ref_slot * static_cast<int>(g.buffer_size);
           }
-          for (int k = 0; k < job.obmc_count; ++k)
-            if (job.obmc[k].ref_slot >= 0)
-              job.obmc[k].ref_off += job.obmc[k].ref_slot * static_cast<int>(g.buffer_size);
+          int total = 0;
+          CUdeviceptr job_mem = 0, pref_mem = 0;
+          if (!upload_jobs(jobs, &job_mem, &pref_mem, &total,
+                           [](const Av1gInterJob& j) { return j.w * j.h; }))
+            return fail(error, "inter job upload failed");
+          Launcher a;
+          add_mem(a, job_mem);
+          add_mem(a, pref_mem);
+          add_int(a, static_cast<int>(jobs.size()));
+          add_int(a, total);
+          add_mem(a, frame_);
+          add_mem(a, ref_pool_);
+          add_mem(a, frame_);
+          add_mem(a, filters_);
+          add_int(a, maxv);
+          if (!launch("av1g_k_inter", total, a)) return fail(error, "av1g_k_inter failed");
+          ++launches;
         }
-        int total = 0;
-        CUdeviceptr job_mem = 0, pref_mem = 0;
-        if (!upload_jobs(jobs, &job_mem, &pref_mem, &total,
-                         [](const Av1gInterJob& j) { return j.w * j.h; }))
-          return fail(error, "inter job upload failed");
-        Launcher a;
-        add_mem(a, job_mem);
-        add_mem(a, pref_mem);
-        add_int(a, static_cast<int>(jobs.size()));
-        add_int(a, total);
-        add_mem(a, frame_);
-        add_mem(a, ref_pool_);
-        add_mem(a, frame_);
-        add_mem(a, filters_);
-        add_int(a, maxv);
-        if (!launch("av1g_k_inter", total, a)) return fail(error, "av1g_k_inter failed");
-        ++launches;
-      }
-      if (!wave.intra.empty()) {
-        const int n = static_cast<int>(wave.intra.size());
-        if (!ensure(&palette_, &palette_cap_, plan.palette_map.size()))
-          return fail(error, "palette map upload failed");
-        if (!plan.palette_map.empty() &&
-            driver_.MemcpyHtoD(palette_, plan.palette_map.data(),
-                               plan.palette_map.size()) != cuda::CUDA_SUCCESS)
-          return fail(error, "palette map write failed");
-        int total = 0;
-        CUdeviceptr job_mem = 0, unused = 0;
-        if (!upload_jobs(wave.intra, &job_mem, &unused, &total,
-                         [](const Av1gIntraJob&) { return 1; }))
-          return fail(error, "intra job upload failed");
-        (void)total;
-        {
+        if (!wave.intra.empty()) {
+          const int n = static_cast<int>(wave.intra.size());
+          if (!ensure(&palette_, &palette_cap_, plan.palette_map.size()))
+            return fail(error, "palette map upload failed");
+          if (!plan.palette_map.empty() &&
+              !upload_h2d(palette_, plan.palette_map.data(),
+                          plan.palette_map.size()))
+            return fail(error, "palette map write failed");
+          CUdeviceptr job_mem = 0, unused = 0;
+          int total = 0;
+          if (!upload_jobs(wave.intra, &job_mem, &unused, &total,
+                           [](const Av1gIntraJob&) { return 1; }))
+            return fail(error, "intra job upload failed");
+          (void)total;
           Launcher a;
           add_mem(a, job_mem);
           add_int(a, n);
@@ -301,63 +324,480 @@ class CudaBackend final : public Backend {
           if (!launch("av1g_k_intra", n, a)) return fail(error, "av1g_k_intra failed");
           ++launches;
         }
-      }
-      if (!wave.itx.empty()) {
-        int rows = 0, cols = 0;
-        CUdeviceptr job_mem = 0, row_pref = 0, col_pref = 0;
-        if (!upload_jobs(wave.itx, &job_mem, &row_pref, &rows,
-                         [](const Av1gItxJob& j) { return j.h; }))
-          return fail(error, "itx job upload failed");
-        if (!upload_prefix(wave.itx, &col_pref, &cols,
-                           [](const Av1gItxJob& j) { return j.w; }))
-          return fail(error, "itx prefix upload failed");
-        {
+        if (!wave.itx.empty()) {
+          int rows = 0, cols = 0;
+          CUdeviceptr job_mem = 0, row_pref = 0, col_pref = 0;
+          if (!upload_jobs(wave.itx, &job_mem, &row_pref, &rows,
+                           [](const Av1gItxJob& j) { return j.h; }))
+            return fail(error, "itx job upload failed");
+          if (!upload_prefix(wave.itx, &col_pref, &cols,
+                             [](const Av1gItxJob& j) { return j.w; }))
+            return fail(error, "itx prefix upload failed");
+          {
+            Launcher a;
+            add_mem(a, job_mem);
+            add_mem(a, row_pref);
+            add_int(a, static_cast<int>(wave.itx.size()));
+            add_int(a, rows);
+            add_mem(a, coef_);
+            add_mem(a, tmp_);
+            if (!launch("av1g_k_itx_rows", rows, a))
+              return fail(error, "av1g_k_itx_rows failed");
+            ++launches;
+          }
+          {
+            Launcher a;
+            add_mem(a, job_mem);
+            add_mem(a, col_pref);
+            add_int(a, static_cast<int>(wave.itx.size()));
+            add_int(a, cols);
+            add_mem(a, tmp_);
+            add_mem(a, frame_);
+            add_int(a, maxv);
+            if (!launch("av1g_k_itx_cols", cols, a))
+              return fail(error, "av1g_k_itx_cols failed");
+            ++launches;
+          }
+        }
+        if (!wave.residual.empty()) {
+          int total = 0;
+          CUdeviceptr job_mem = 0, pref_mem = 0;
+          if (!upload_jobs(wave.residual, &job_mem, &pref_mem, &total,
+                           [](const Av1gItxJob& j) { return j.w * j.h; }))
+            return fail(error, "residual job upload failed");
           Launcher a;
           add_mem(a, job_mem);
-          add_mem(a, row_pref);
-          add_int(a, static_cast<int>(wave.itx.size()));
-          add_int(a, rows);
+          add_mem(a, pref_mem);
+          add_int(a, static_cast<int>(wave.residual.size()));
+          add_int(a, total);
+          add_mem(a, residual_);
+          add_mem(a, frame_);
+          add_int(a, maxv);
+          if (!launch("av1g_k_add_residual", total, a))
+            return fail(error, "av1g_k_add_residual failed");
+          ++launches;
+        }
+      }
+      if (ev1) {
+        driver_.EventRecord(ev1, nullptr);
+        driver_.EventSynchronize(ev1);
+        float ms = 0;
+        driver_.EventElapsedTime(&ms, ev0, ev1);
+        gpu_ms = ms;
+        driver_.EventDestroy(ev1);
+        driver_.EventDestroy(ev0);
+      }
+      const double t1p = now_ms();
+      {
+        static double acc_rec = 0, acc_gpu = 0, acc_waves = 0;
+        static long n = 0;
+        acc_rec += t1p - t0;
+        acc_gpu += gpu_ms > 0 ? gpu_ms : 0;
+        acc_waves += plan.waves.size();
+        ++n;
+        if (n % 50 == 0) {
+          char msg[128];
+          std::snprintf(msg, sizeof(msg),
+                        "perf legacy: reconstruct %.1f, gpu kernel %.1f, "
+                        "waves %.0f over %ld",
+                        acc_rec / n, acc_gpu / n, acc_waves / n, n);
+          char path[MAX_PATH];
+          if (GetTempPathA(MAX_PATH, path)) {
+            strncat_s(path, "av1gpu_ds.log", _TRUNCATE);
+            if (FILE* f = std::fopen(path, "a")) {
+              SYSTEMTIME st2;
+              GetLocalTime(&st2);
+              std::fprintf(f, "%02u:%02u:%02u.%03u pid %lu thr %lu  %s\n", st2.wHour,
+                           st2.wMinute, st2.wSecond, st2.wMilliseconds,
+                           GetCurrentProcessId(), GetCurrentThreadId(), msg);
+              std::fclose(f);
+            }
+          }
+        }
+      }
+      t1 = t1p;
+    } else {
+    /* ---- parallel wave prep -------------------------------------------------
+     * A 1080p frame carries ~100k jobs in ~130 dependency waves; preparing a
+     * wave (copy, slot rebase, prefix sums, host to device upload) is pure CPU
+     * work that does not read any other wave, and it dwarfs the 2-3 ms the
+     * kernels actually run. Prepare the waves on worker threads - each adopts
+     * the CUDA context - then launch the kernels from this thread in wave
+     * order. Every wave's arrays land in one per-frame arena at fixed offsets,
+     * so the launch phase only needs the offsets. */
+    struct WaveLaunch {
+      /* per kind pointers: one wave can carry several kinds, and each kernel
+       * needs its own job/prefix slice of the arenas */
+      CUdeviceptr inter_job = 0, inter_pref = 0;
+      int inter_n = 0, inter_total = 0;
+      CUdeviceptr intra_job = 0;
+      int intra_n = 0;
+      CUdeviceptr itx_job = 0, itx_row_pref = 0, itx_col_pref = 0;
+      int itx_n = 0, itx_rows = 0, itx_cols = 0;
+      CUdeviceptr res_job = 0, res_pref = 0;
+      int res_n = 0, res_total = 0;
+      bool inter = false, intra = false, itx = false, residual = false;
+    };
+    std::vector<WaveLaunch> prepped(plan.waves.size());
+    /* Per kind byte offsets into the two arenas. Every region starts on a 64
+     * byte boundary: cumulative struct sizes alone can leave a kind's array
+     * misaligned, and the kernels read the job structs with vector loads. */
+    struct WaveOffsets {
+      size_t inter_job = 0, intra_job = 0, itx_job = 0, res_job = 0;
+      size_t inter_pref = 0, itx_row = 0, itx_col = 0, res_pref = 0;
+      size_t job_bytes = 0, pref_bytes = 0;
+    };
+    auto align64 = [](size_t x) { return (x + 63) & ~size_t(63); };
+    std::vector<WaveOffsets> offs(plan.waves.size());
+    size_t arena_job = 0, arena_pref = 0;
+    for (size_t i = 0; i < plan.waves.size(); ++i) {
+      const WaveJobs& w = plan.waves[i];
+      WaveOffsets& o = offs[i];
+      size_t job = align64(arena_job), pref = align64(arena_pref);
+      if (!w.inter.empty()) {
+        o.inter_job = job;
+        o.inter_pref = pref;
+        job += w.inter.size() * sizeof(Av1gInterJob);
+        pref += (w.inter.size() + 2) * sizeof(int);
+      }
+      if (!w.intra.empty()) {
+        o.intra_job = align64(job);
+        job = o.intra_job + w.intra.size() * sizeof(Av1gIntraJob);
+      }
+      if (!w.itx.empty()) {
+        o.itx_job = align64(job);
+        job = o.itx_job + w.itx.size() * sizeof(Av1gItxJob);
+        o.itx_row = align64(pref);
+        o.itx_col = o.itx_row + (w.itx.size() + 2) * sizeof(int);
+        pref = o.itx_col + (w.itx.size() + 2) * sizeof(int);
+      }
+      if (!w.residual.empty()) {
+        o.res_job = align64(job);
+        job = o.res_job + w.residual.size() * sizeof(Av1gItxJob);
+        o.res_pref = align64(pref);
+        pref = o.res_pref + (w.residual.size() + 2) * sizeof(int);
+      }
+      o.job_bytes = job - align64(arena_job);
+      o.pref_bytes = pref - align64(arena_pref);
+      arena_job = job;
+      arena_pref = pref;
+    }
+    if (!ensure(&job_arena_, &job_arena_cap_, arena_job) ||
+        !ensure(&pref_arena_, &pref_arena_cap_, arena_pref * sizeof(int)))
+      return fail(error, "out of device memory for the wave arena");
+
+    /* the palette map is one shared upload for the whole frame; the buffer is
+     * allocated even when the frame uses no palette, because the intra kernel
+     * takes the pointer unconditionally and a null one would fault the
+     * context asynchronously */
+    if (!ensure(&palette_, &palette_cap_, plan.palette_map.size()))
+      return fail(error, "palette map upload failed");
+    if (!plan.palette_map.empty() &&
+        !upload_h2d(palette_, plan.palette_map.data(), plan.palette_map.size()))
+      return fail(error, "palette map write failed");
+
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned k_workers =
+        plan.waves.size() >= 8 ? std::min<unsigned>(6, std::max(1u, hw - 1)) : 1;
+    std::atomic<bool> prep_ok{true};
+
+    /* one worker's slice: [id, id + K, ...) of the waves */
+    auto prep_waves = [&](unsigned id) {
+      if (k_workers > 1) {
+        if (driver_.CtxSetCurrent(context_) != cuda::CUDA_SUCCESS) {
+          prep_ok = false;
+          return;
+        }
+      }
+      void* pinned = nullptr; /* per worker staging for its uploads */
+      size_t pinned_cap = 0;
+      auto h2d = [&](CUdeviceptr dst, const void* src, size_t bytes) {
+        if (bytes == 0) return true;
+        if (!driver_.MemAllocHost || !driver_.MemFreeHost)
+          return driver_.MemcpyHtoD(dst, src, bytes) == cuda::CUDA_SUCCESS;
+        if (pinned_cap < bytes) {
+          if (pinned) driver_.MemFreeHost(pinned);
+          pinned = nullptr;
+          size_t want = bytes + bytes / 2;
+          if (driver_.MemAllocHost(&pinned, want) != cuda::CUDA_SUCCESS || !pinned) {
+            pinned = nullptr;
+            pinned_cap = 0;
+            return driver_.MemcpyHtoD(dst, src, bytes) == cuda::CUDA_SUCCESS;
+          }
+          pinned_cap = want;
+        }
+        std::memcpy(pinned, src, bytes);
+        return driver_.MemcpyHtoD(dst, pinned, bytes) == cuda::CUDA_SUCCESS;
+      };
+      for (size_t i = id; i < plan.waves.size() && prep_ok; i += k_workers) {
+        const WaveJobs& w = plan.waves[i];
+        WaveLaunch& L = prepped[i];
+        const WaveOffsets& o = offs[i];
+        if (!w.inter.empty()) {
+          std::vector<Av1gInterJob> jobs = w.inter;
+          for (Av1gInterJob& job : jobs) {
+            if (job.ref0_slot >= 0)
+              job.ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
+            if (job.ref1_slot >= 0)
+              job.ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
+            /* a difference weighted chroma block builds its mask on the luma
+             * plane, so those offsets need the same slot rebase */
+            if (job.mask_kind == AV1G_MASK_DIFFWTD) {
+              if (job.ref0_slot >= 0)
+                job.luma_ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
+              if (job.ref1_slot >= 0)
+                job.luma_ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
+            }
+            for (int k = 0; k < job.obmc_count; ++k)
+              if (job.obmc[k].ref_slot >= 0)
+                job.obmc[k].ref_off += job.obmc[k].ref_slot * static_cast<int>(g.buffer_size);
+          }
+          std::vector<int> prefix(jobs.size() + 2, 0);
+          int sum = 0;
+          for (size_t k = 0; k < jobs.size(); ++k) {
+            prefix[k] = sum;
+            sum += jobs[k].w * jobs[k].h;
+          }
+          prefix[jobs.size()] = sum;
+          prefix[jobs.size() + 1] = sum;
+          if (!h2d(job_arena_ + o.inter_job, jobs.data(),
+                   jobs.size() * sizeof(Av1gInterJob)) ||
+              !h2d(pref_arena_ + o.inter_pref, prefix.data(),
+                   prefix.size() * sizeof(int))) {
+            prep_ok = false;
+            break;
+          }
+          L.inter = true;
+          L.inter_job = job_arena_ + o.inter_job;
+          L.inter_pref = pref_arena_ + o.inter_pref;
+          L.inter_n = static_cast<int>(jobs.size());
+          L.inter_total = sum;
+        }
+        if (!w.intra.empty()) {
+          if (!h2d(job_arena_ + o.intra_job, w.intra.data(),
+                   w.intra.size() * sizeof(Av1gIntraJob))) {
+            prep_ok = false;
+            break;
+          }
+          L.intra = true;
+          L.intra_job = job_arena_ + o.intra_job;
+          L.intra_n = static_cast<int>(w.intra.size());
+        }
+        if (!w.itx.empty()) {
+          std::vector<int> row_prefix(w.itx.size() + 2, 0);
+          std::vector<int> col_prefix(w.itx.size() + 2, 0);
+          int rows_sum = 0, cols_sum = 0;
+          for (size_t k = 0; k < w.itx.size(); ++k) {
+            row_prefix[k] = rows_sum;
+            rows_sum += w.itx[k].h;
+            col_prefix[k] = cols_sum;
+            cols_sum += w.itx[k].w;
+          }
+          row_prefix[w.itx.size()] = rows_sum;
+          row_prefix[w.itx.size() + 1] = rows_sum;
+          col_prefix[w.itx.size()] = cols_sum;
+          col_prefix[w.itx.size() + 1] = cols_sum;
+          if (!h2d(job_arena_ + o.itx_job, w.itx.data(),
+                   w.itx.size() * sizeof(Av1gItxJob)) ||
+              !h2d(pref_arena_ + o.itx_row, row_prefix.data(),
+                   row_prefix.size() * sizeof(int)) ||
+              !h2d(pref_arena_ + o.itx_col, col_prefix.data(),
+                   col_prefix.size() * sizeof(int))) {
+            prep_ok = false;
+            break;
+          }
+          L.itx = true;
+          L.itx_job = job_arena_ + o.itx_job;
+          L.itx_row_pref = pref_arena_ + o.itx_row;
+          L.itx_col_pref = pref_arena_ + o.itx_col;
+          L.itx_n = static_cast<int>(w.itx.size());
+          L.itx_rows = rows_sum;
+          L.itx_cols = cols_sum;
+        }
+        if (!w.residual.empty()) {
+          std::vector<int> prefix(w.residual.size() + 2, 0);
+          int sum = 0;
+          for (size_t k = 0; k < w.residual.size(); ++k) {
+            prefix[k] = sum;
+            sum += w.residual[k].w * w.residual[k].h;
+          }
+          prefix[w.residual.size()] = sum;
+          prefix[w.residual.size() + 1] = sum;
+          if (!h2d(job_arena_ + o.res_job, w.residual.data(),
+                   w.residual.size() * sizeof(Av1gItxJob)) ||
+              !h2d(pref_arena_ + o.res_pref, prefix.data(),
+                   prefix.size() * sizeof(int))) {
+            prep_ok = false;
+            break;
+          }
+          L.residual = true;
+          L.res_job = job_arena_ + o.res_job;
+          L.res_pref = pref_arena_ + o.res_pref;
+          L.res_n = static_cast<int>(w.residual.size());
+          L.res_total = sum;
+        }
+      }
+      if (pinned && driver_.MemFreeHost) driver_.MemFreeHost(pinned);
+      if (k_workers > 1) driver_.CtxSetCurrent(nullptr);
+    };
+
+    if (k_workers <= 1) {
+      prep_waves(0);
+    } else {
+      std::vector<std::thread> pool;
+      pool.reserve(k_workers);
+      for (unsigned id = 0; id < k_workers; ++id)
+        pool.emplace_back(prep_waves, id);
+      for (std::thread& t : pool) t.join();
+    }
+    if (!prep_ok) return fail(error, "wave job upload failed");
+    const double t_prep = now_ms(); /* DEBUG */
+    driver_.CtxSynchronize(); /* DEBUG: drain any queued prep work */
+
+    /* launch phase: kernels must start in wave order */
+    static const bool skip_launch = [] {
+      char f[8] = {0};
+      return GetEnvironmentVariableA("AV1GPU_NO_LAUNCH", f, sizeof(f)) > 0 &&
+             f[0] == '1';
+    }();
+    static const unsigned kind_mask = [] {
+      char f[16] = {0};
+      if (GetEnvironmentVariableA("AV1GPU_ONLY_KIND", f, sizeof(f)) == 0)
+        return 0xFu;
+      unsigned m = 0;
+      if (std::strchr(f, 'I')) m |= 1u; /* inter */
+      if (std::strchr(f, 'n')) m |= 2u; /* intra */
+      if (std::strchr(f, 't')) m |= 4u; /* itx */
+      if (std::strchr(f, 'r')) m |= 8u; /* residual */
+      return m ? m : 0xFu;
+    }();
+    void *ev0 = nullptr, *ev1 = nullptr; /* DEBUG: GPU side timing */
+    if (driver_.EventCreate && !skip_launch) {
+      driver_.EventCreate(&ev0, 0);
+      driver_.EventCreate(&ev1, 0);
+      if (ev0) driver_.EventRecord(ev0, nullptr);
+    }
+    for (size_t i = 0; !skip_launch && i < plan.waves.size(); ++i) {
+      const WaveLaunch& L = prepped[i];
+      if (L.inter && (kind_mask & 1u)) {
+        Launcher a;
+        add_mem(a, L.inter_job);
+        add_mem(a, L.inter_pref);
+        add_int(a, L.inter_n);
+        add_int(a, L.inter_total);
+        add_mem(a, frame_);
+        add_mem(a, ref_pool_);
+        add_mem(a, frame_);
+        add_mem(a, filters_);
+        add_int(a, maxv);
+        if (!launch("av1g_k_inter", L.inter_total, a))
+          return fail(error, "av1g_k_inter failed");
+        ++launches;
+      }
+      if (L.intra && (kind_mask & 2u)) {
+        Launcher a;
+        add_mem(a, L.intra_job);
+        add_int(a, L.intra_n);
+        add_mem(a, frame_);
+        add_mem(a, palette_);
+        add_int(a, maxv);
+        if (!launch("av1g_k_intra", L.intra_n, a))
+          return fail(error, "av1g_k_intra failed");
+        ++launches;
+      }
+      if (L.itx && (kind_mask & 4u)) {
+        {
+          Launcher a;
+          add_mem(a, L.itx_job);
+          add_mem(a, L.itx_row_pref);
+          add_int(a, L.itx_n);
+          add_int(a, L.itx_rows);
           add_mem(a, coef_);
           add_mem(a, tmp_);
-          if (!launch("av1g_k_itx_rows", rows, a))
+          if (!launch("av1g_k_itx_rows", L.itx_rows, a))
             return fail(error, "av1g_k_itx_rows failed");
           ++launches;
         }
         {
           Launcher a;
-          add_mem(a, job_mem);
-          add_mem(a, col_pref);
-          add_int(a, static_cast<int>(wave.itx.size()));
-          add_int(a, cols);
+          add_mem(a, L.itx_job);
+          add_mem(a, L.itx_col_pref);
+          add_int(a, L.itx_n);
+          add_int(a, L.itx_cols);
           add_mem(a, tmp_);
           add_mem(a, frame_);
           add_int(a, maxv);
-          if (!launch("av1g_k_itx_cols", cols, a))
+          if (!launch("av1g_k_itx_cols", L.itx_cols, a))
             return fail(error, "av1g_k_itx_cols failed");
           ++launches;
         }
       }
-      if (!wave.residual.empty()) {
-        int total = 0;
-        CUdeviceptr job_mem = 0, pref_mem = 0;
-        if (!upload_jobs(wave.residual, &job_mem, &pref_mem, &total,
-                         [](const Av1gItxJob& j) { return j.w * j.h; }))
-          return fail(error, "residual job upload failed");
+      if (L.residual && (kind_mask & 8u)) {
         Launcher a;
-        add_mem(a, job_mem);
-        add_mem(a, pref_mem);
-        add_int(a, static_cast<int>(wave.residual.size()));
-        add_int(a, total);
+        add_mem(a, L.res_job);
+        add_mem(a, L.res_pref);
+        add_int(a, L.res_n);
+        add_int(a, L.res_total);
         add_mem(a, residual_);
         add_mem(a, frame_);
         add_int(a, maxv);
-        if (!launch("av1g_k_add_residual", total, a))
+        if (!launch("av1g_k_add_residual", L.res_total, a))
           return fail(error, "av1g_k_add_residual failed");
         ++launches;
       }
     }
+    /* A wave kernel that faults must fail this frame loudly: the sync here is
+     * the single point where an out of bounds job array becomes visible. */
+    const double t_launch_end = now_ms(); /* DEBUG */
+    double gpu_ms = -1.0; /* DEBUG: true GPU side time of the wave kernels */
+    if (ev1) {
+      driver_.EventRecord(ev1, nullptr);
+      driver_.EventSynchronize(ev1);
+      float ms = 0;
+      driver_.EventElapsedTime(&ms, ev0, ev1);
+      gpu_ms = ms;
+      driver_.EventDestroy(ev1);
+      driver_.EventDestroy(ev0);
+    }
+    {
+      const CUresult rc = driver_.CtxSynchronize();
+      if (rc != cuda::CUDA_SUCCESS) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "wave kernel fault (sync = %d)", rc);
+        return fail(error, buf);
+      }
+    }
+    const double t_sync_end = now_ms(); /* DEBUG */
 
-    const double t1 = now_ms();
+    t1 = now_ms();
+    /* DEBUG: prep vs launch vs gpu wait split */
+    {
+      static double acc_prep = 0, acc_launch = 0, acc_sync = 0, acc_gpu = 0;
+      static long n2 = 0;
+      acc_prep += t_prep - t0; acc_launch += t_launch_end - t_prep;
+      acc_sync += t_sync_end - t_launch_end; acc_gpu += gpu_ms > 0 ? gpu_ms : 0;
+      ++n2;
+      if (n2 % 50 == 0) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "perf wave prep %.1f, launch %.1f, gpuwait %.1f, "
+                      "gpu kernel %.1f ms over %ld",
+                      acc_prep / n2, acc_launch / n2, acc_sync / n2,
+                      acc_gpu / n2, n2);
+        char path[MAX_PATH];
+        if (GetTempPathA(MAX_PATH, path)) {
+          strncat_s(path, "av1gpu_ds.log", _TRUNCATE);
+          if (FILE* f = std::fopen(path, "a")) {
+            SYSTEMTIME st2; GetLocalTime(&st2);
+            std::fprintf(f, "%02u:%02u:%02u.%03u pid %lu thr %lu  %s\n", st2.wHour,
+                         st2.wMinute, st2.wSecond, st2.wMilliseconds,
+                         GetCurrentProcessId(), GetCurrentThreadId(), msg);
+            std::fclose(f);
+          }
+        }
+      }
+    }
+    } /* legacy/parallel wave path */
 
     /* vertical edges first, then horizontal ones: the two groups cross */
     for (const std::vector<Av1gDeblockJob>* pass : {&plan.deblock_v, &plan.deblock_h}) {
@@ -502,10 +942,8 @@ class CudaBackend final : public Backend {
       if (!ensure(&grain_, &grain_cap_, noise_size) ||
           !ensure(&lut_, &lut_cap_, sizeof(plan.grain_noise.lut)))
         return fail(error, "out of device memory for the film grain tables");
-      if (driver_.MemcpyHtoD(grain_, plan.grain_noise.noise.data(), noise_size) !=
-              cuda::CUDA_SUCCESS ||
-          driver_.MemcpyHtoD(lut_, plan.grain_noise.lut, sizeof(plan.grain_noise.lut)) !=
-              cuda::CUDA_SUCCESS)
+      if (!upload_h2d(grain_, plan.grain_noise.noise.data(), noise_size) ||
+          !upload_h2d(lut_, plan.grain_noise.lut, sizeof(plan.grain_noise.lut)))
         return fail(error, "film grain table upload failed");
       /* chroma first: its noise is scaled by the luma of the picture before any
        * grain was added, so the luma pass has to come after it */
@@ -544,6 +982,47 @@ class CudaBackend final : public Backend {
       }
     }
     const double t2 = now_ms();
+    /* temporary profiling: how much of reconstruct was CPU prep vs GPU wait */
+    {
+      static double acc_sync = 0.0, acc_filter = 0.0, acc_rec = 0.0;
+      static long long acc_bytes = 0;
+      static long n = 0;
+      acc_sync += double(qf.QuadPart ? 0 : 0); /* no-op keeps qf referenced */
+      acc_filter += t2 - t1;
+      acc_rec += t1 - t0;
+      size_t waves = plan.waves.size();
+      acc_bytes += static_cast<long long>(plan.coefficients.size() * 4) +
+                   static_cast<long long>(plan.residual.size() * 4);
+      size_t job_count = 0;
+      for (const WaveJobs& w : plan.waves)
+        job_count += w.inter.size() + w.intra.size() + w.itx.size() + w.residual.size();
+      job_count += plan.deblock_v.size() + plan.deblock_h.size() + plan.cdef.size();
+      ++n;
+      if (n % 50 == 0) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "perf backend: reconstruct %.1f, "
+                      "waves %zu, filter(sync incl) %.1f, "
+                      "jobs %zu, uploads %lld KB, %ld frames",
+                      acc_rec / n, waves,
+                      acc_filter / n, job_count, acc_bytes / 1024, n);
+        OutputDebugStringA("av1gpu: ");
+        OutputDebugStringA(msg);
+        OutputDebugStringA("\n");
+        char path[MAX_PATH];
+        if (GetTempPathA(MAX_PATH, path)) {
+          strncat_s(path, "av1gpu_ds.log", _TRUNCATE);
+          if (FILE* f = std::fopen(path, "a")) {
+            SYSTEMTIME st2;
+            GetLocalTime(&st2);
+            std::fprintf(f, "%02u:%02u:%02u.%03u pid %lu thr %lu  %s\n", st2.wHour,
+                         st2.wMinute, st2.wSecond, st2.wMilliseconds,
+                         GetCurrentProcessId(), GetCurrentThreadId(), msg);
+            std::fclose(f);
+          }
+        }
+      }
+    }
 
     if (out) {
       if (!out->matches(g.frame.width, g.frame.height, g.frame.bit_depth, g.frame.ss_x,
@@ -763,14 +1242,20 @@ class CudaBackend final : public Backend {
     CUdeviceptr buffers[] = {frame_,   scratch_,   coef_,   tmp_,    residual_,
                              filters_, ref_pool_,  grain_,  lut_,    rgb_,
                              job_,     pref_,      pref_b_, palette_,
-                             lr_curr_, lr_cdef_,   lr_prev_up_};
+                             lr_curr_, lr_cdef_,   lr_prev_up_,
+                             job_arena_, pref_arena_};
     for (CUdeviceptr b : buffers)
       if (b && driver_.MemFree) driver_.MemFree(b);
     frame_ = scratch_ = coef_ = tmp_ = residual_ = 0;
     filters_ = ref_pool_ = grain_ = 0;
     lut_ = rgb_ = job_ = pref_ = pref_b_ = palette_ = 0;
     lr_curr_ = lr_cdef_ = lr_prev_up_ = 0;
+    job_arena_ = pref_arena_ = 0;
+    job_arena_cap_ = pref_arena_cap_ = 0;
     palette_cap_ = 0;
+    if (pinned_ && driver_.MemFreeHost) driver_.MemFreeHost(pinned_);
+    pinned_ = nullptr;
+    pinned_cap_ = 0;
     if (context_ && driver_.CtxDestroy) driver_.CtxDestroy(context_);
     context_ = nullptr;
     if (driver_lib_) {
@@ -862,6 +1347,28 @@ class CudaBackend final : public Backend {
     return true;
   }
 
+  /* Large host to device copies go through one page-locked staging buffer:
+   * pageable cuMemcpyHtoD runs at a fraction of the bus speed, and the job
+   * arrays alone are tens of megabytes per 1080p frame. */
+  bool upload_h2d(CUdeviceptr dst, const void* src, size_t bytes) {
+    if (bytes == 0) return true;
+    if (!driver_.MemAllocHost || !driver_.MemFreeHost)
+      return driver_.MemcpyHtoD(dst, src, bytes) == cuda::CUDA_SUCCESS;
+    if (pinned_cap_ < bytes) {
+      if (pinned_) driver_.MemFreeHost(pinned_);
+      pinned_ = nullptr;
+      size_t want = bytes + bytes / 2; /* headroom for the next frames */
+      if (driver_.MemAllocHost(&pinned_, want) != cuda::CUDA_SUCCESS || !pinned_) {
+        pinned_ = nullptr;
+        pinned_cap_ = 0;
+        return driver_.MemcpyHtoD(dst, src, bytes) == cuda::CUDA_SUCCESS;
+      }
+      pinned_cap_ = want;
+    }
+    std::memcpy(pinned_, src, bytes);
+    return driver_.MemcpyHtoD(dst, pinned_, bytes) == cuda::CUDA_SUCCESS;
+  }
+
   void upload_tables() {
     const std::vector<int>& filters = tables::filters();
     if (ensure(&filters_, &filters_cap_, filters.size() * sizeof(int)))
@@ -907,11 +1414,8 @@ class CudaBackend final : public Backend {
     prefix[jobs.size() + 1] = sum;
     *total = sum;
     if (sum == 0) return true;
-    if (driver_.MemcpyHtoD(job_, jobs.data(), jobs.size() * sizeof(JobT)) !=
-        cuda::CUDA_SUCCESS)
-      return false;
-    return driver_.MemcpyHtoD(pref_, prefix.data(), prefix.size() * sizeof(int)) ==
-           cuda::CUDA_SUCCESS;
+    if (!upload_h2d(job_, jobs.data(), jobs.size() * sizeof(JobT))) return false;
+    return upload_h2d(pref_, prefix.data(), prefix.size() * sizeof(int));
   }
 
   void add_mem(Launcher& a, CUdeviceptr value) { a.add_ptr(value); }
@@ -948,6 +1452,14 @@ class CudaBackend final : public Backend {
 
   BackendOptions options_;
   DeviceInfo info_;
+  /* page-locked host staging for the large per frame uploads */
+  void* pinned_ = nullptr;
+  size_t pinned_cap_ = 0;
+  /* per frame arenas the parallel wave prep fills at fixed offsets */
+  CUdeviceptr job_arena_ = 0;
+  size_t job_arena_cap_ = 0;
+  CUdeviceptr pref_arena_ = 0;
+  size_t pref_arena_cap_ = 0;
   cuda::Driver driver_{};
   cuda::Nvrtc nvrtc_{};
   void* driver_lib_ = nullptr;
@@ -1029,11 +1541,20 @@ bool load_driver(Driver* driver, void** library, std::string* error) {
   AV1GPU_CU(CtxCreate, "cuCtxCreate_v2");
   AV1GPU_CU(CtxDestroy, "cuCtxDestroy_v2");
   AV1GPU_CU(CtxSynchronize, "cuCtxSynchronize");
+  AV1GPU_CU(CtxSetCurrent, "cuCtxSetCurrent");
+  AV1GPU_CU(CtxGetCurrent, "cuCtxGetCurrent");
+  AV1GPU_CU(EventCreate, "cuEventCreate");
+  AV1GPU_CU(EventRecord, "cuEventRecord");
+  AV1GPU_CU(EventSynchronize, "cuEventSynchronize");
+  AV1GPU_CU(EventElapsedTime, "cuEventElapsedTime");
+  AV1GPU_CU(EventDestroy, "cuEventDestroy");
   AV1GPU_CU(MemAlloc, "cuMemAlloc_v2");
   AV1GPU_CU(MemFree, "cuMemFree_v2");
   AV1GPU_CU(MemcpyHtoD, "cuMemcpyHtoD_v2");
   AV1GPU_CU(MemcpyDtoH, "cuMemcpyDtoH_v2");
   AV1GPU_CU(MemcpyDtoD, "cuMemcpyDtoD_v2");
+  AV1GPU_CU(MemAllocHost, "cuMemAllocHost_v2");
+  AV1GPU_CU(MemFreeHost, "cuMemFreeHost");
   AV1GPU_CU(ModuleLoadDataEx, "cuModuleLoadDataEx");
   AV1GPU_CU(ModuleGetFunction, "cuModuleGetFunction");
   AV1GPU_CU(LaunchKernel, "cuLaunchKernel");

@@ -159,11 +159,15 @@ endif()
 # tools and tests
 # ---------------------------------------------------------------------------
 if(AV1GPU_BUILD_TOOLS)
-  foreach(tool av1gpu_info av1gpu_bench av1gpu_play av1gpu_dump av1gpu_probe av1gpu_decode)
+  foreach(tool av1gpu_info av1gpu_bench av1gpu_play av1gpu_dump av1gpu_probe av1gpu_decode av1gpu_quartz)
     add_executable(${tool} tools/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE av1gpu)
     set_target_properties(${tool} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
   endforeach()
+  # the quartz graph-build reproduction harness touches real DirectShow
+  if(TARGET av1gpu_quartz)
+    target_link_libraries(av1gpu_quartz PRIVATE ole32 strmiids uuid)
+  endif()
 endif()
 
 if(AV1GPU_BUILD_TESTS)

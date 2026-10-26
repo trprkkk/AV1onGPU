@@ -89,6 +89,20 @@ void debug_log(const char* fmt, ...) {
   OutputDebugStringA("av1gpu: ");
   OutputDebugStringA(line);
   OutputDebugStringA("\n");
+  /* also append to a file: a crash in the host kills DbgView's live view, but
+   * everything logged up to the crash is on disk */
+  char path[MAX_PATH];
+  if (GetTempPathA(MAX_PATH, path)) {
+    strncat_s(path, "av1gpu_ds.log", _TRUNCATE);
+    if (FILE* f = std::fopen(path, "a")) {
+      SYSTEMTIME st;
+      GetLocalTime(&st);
+      std::fprintf(f, "%02u:%02u:%02u.%03u pid %lu thr %lu  %s\n", st.wHour,
+                   st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentProcessId(),
+                   GetCurrentThreadId(), line);
+      std::fclose(f);
+    }
+  }
 }
 
 /* ----------------------------------------------------------- media types */
@@ -275,7 +289,9 @@ class EnumMediaTypesImpl : public IEnumMediaTypes {
   /* `owner` is the pin; `make` builds the type for one index. */
   typedef HRESULT (*MakeFn)(void* owner, int index, AM_MEDIA_TYPE** out);
   EnumMediaTypesImpl(void* owner, MakeFn make, int count)
-      : owner_(owner), make_(make), count_(count) {}
+      : owner_(owner), make_(make), count_(count) {
+    debug_log("EnumMediaTypesImpl %p created", static_cast<void*>(this));
+  }
 
   ULONG __stdcall AddRef() override { return InterlockedIncrement(&refs_); }
   ULONG __stdcall Release() override {
@@ -333,6 +349,7 @@ class EnumMediaTypesImpl : public IEnumMediaTypes {
 class EnumPinsImpl : public IEnumPins {
  public:
   EnumPinsImpl(IPin* const* pins, int count) : count_(count) {
+    debug_log("EnumPinsImpl %p created", static_cast<void*>(this));
     for (int i = 0; i < count; ++i) {
       pins_[i] = pins[i];
       pins_[i]->AddRef();
@@ -430,6 +447,7 @@ class InputPin : public IPin, public IMemInputPin {
   HRESULT __stdcall ConnectionMediaType(AM_MEDIA_TYPE* mt) override;
   HRESULT __stdcall QueryPinInfo(PIN_INFO* info) override;
   HRESULT __stdcall QueryDirection(PIN_DIRECTION* dir) override {
+    debug_log("input QueryDirection");
     if (!dir) return E_POINTER;
     *dir = PINDIR_INPUT;
     return S_OK;
@@ -749,10 +767,16 @@ ULONG OutputPin::Release() { return filter_->Release(); }
 
 OutputPin* InputPin::output_pin() { return filter_->out(); }
 
+/* The internal-connection mapping helper is no longer needed; the real fix
+ * was initializing out-parameters on the failure paths. */
+
 /* ------------------------------------------------------------ input pin */
 
 HRESULT InputPin::ReceiveConnection(IPin* peer, const AM_MEDIA_TYPE* mt) {
   if (!peer || !mt) return E_POINTER;
+  debug_log("input ReceiveConnection: peer=%p format=%08lx cbFormat=%lu",
+            static_cast<void*>(peer), mt->formattype.Data1,
+            static_cast<unsigned long>(mt->cbFormat));
   Hold hold(filter_->lock());
   if (peer_) return VFW_E_ALREADY_CONNECTED;
   if (filter_->state_ != State_Stopped) return VFW_E_NOT_STOPPED;
@@ -794,6 +818,7 @@ HRESULT InputPin::ReceiveConnection(IPin* peer, const AM_MEDIA_TYPE* mt) {
 }
 
 HRESULT InputPin::Disconnect() {
+  debug_log("input Disconnect");
   Hold hold(filter_->lock());
   if (!peer_) return S_FALSE;
   if (filter_->state_ != State_Stopped) return VFW_E_NOT_STOPPED;
@@ -804,8 +829,12 @@ HRESULT InputPin::Disconnect() {
 }
 
 HRESULT InputPin::ConnectedTo(IPin** peer) {
+  debug_log("input ConnectedTo");
   if (!peer) return E_POINTER;
   Hold hold(filter_->lock());
+  /* out parameters must be initialized even on failure: quartz reads the
+   * peer unconditionally after the call */
+  *peer = nullptr;
   if (!peer_) return VFW_E_NOT_CONNECTED;
   *peer = peer_;
   peer_->AddRef();
@@ -813,7 +842,9 @@ HRESULT InputPin::ConnectedTo(IPin** peer) {
 }
 
 HRESULT InputPin::ConnectionMediaType(AM_MEDIA_TYPE* mt) {
+  debug_log("input ConnectionMediaType");
   if (!mt) return E_POINTER;
+  ZeroMemory(mt, sizeof(*mt));
   Hold hold(filter_->lock());
   if (!peer_) return VFW_E_NOT_CONNECTED;
   AM_MEDIA_TYPE* copy = copy_media_type(&media_type_);
@@ -824,6 +855,7 @@ HRESULT InputPin::ConnectionMediaType(AM_MEDIA_TYPE* mt) {
 }
 
 HRESULT InputPin::QueryPinInfo(PIN_INFO* info) {
+  debug_log("input %p QueryPinInfo", static_cast<void*>(this));
   if (!info) return E_POINTER;
   info->pFilter = static_cast<IBaseFilter*>(filter_);
   filter_->AddRef();
@@ -833,6 +865,7 @@ HRESULT InputPin::QueryPinInfo(PIN_INFO* info) {
 }
 
 HRESULT InputPin::QueryId(LPWSTR* id) {
+  debug_log("input QueryId");
   if (!id) return E_POINTER;
   const size_t bytes = (wcslen(name_) + 1) * sizeof(wchar_t);
   LPWSTR copy = static_cast<LPWSTR>(CoTaskMemAlloc(bytes));
@@ -845,16 +878,26 @@ HRESULT InputPin::QueryId(LPWSTR* id) {
 HRESULT InputPin::QueryAccept(const AM_MEDIA_TYPE* mt) {
   if (!mt || mt->majortype != MEDIATYPE_Video ||
       (mt->subtype != kSubtypeAv1Upper && mt->subtype != kSubtypeAv1Lower)) {
+    debug_log("input QueryAccept: rejected (subtype %08lx-%04lx)",
+              mt ? mt->subtype.Data1 : 0, mt ? mt->subtype.Data2 : 0);
     return S_FALSE;
   }
-  if (!format_acceptable(mt->formattype)) return S_FALSE;
+  if (!format_acceptable(mt->formattype)) {
+    debug_log("input QueryAccept: rejected (format type)");
+    return S_FALSE;
+  }
   int width = 0, height = 0;
   unsigned long long frame_time = 0;
-  if (!input_dimensions(mt, &width, &height, &frame_time)) return S_FALSE;
+  if (!input_dimensions(mt, &width, &height, &frame_time)) {
+    debug_log("input QueryAccept: rejected (no dimensions)");
+    return S_FALSE;
+  }
+  debug_log("input QueryAccept: accepted %dx%d", width, height);
   return S_OK;
 }
 
 HRESULT InputPin::EnumMediaTypes(IEnumMediaTypes** out) {
+  debug_log("input EnumMediaTypes");
   if (!out) return E_POINTER;
   class Make {
    public:
@@ -876,6 +919,7 @@ HRESULT InputPin::EnumMediaTypes(IEnumMediaTypes** out) {
 HRESULT InputPin::EndOfStream() { return output_pin()->deliver_end_of_stream(); }
 
 HRESULT InputPin::BeginFlush() {
+  debug_log("BeginFlush");
   {
     Hold hold(filter_->lock());
     flushing_ = true;
@@ -885,6 +929,7 @@ HRESULT InputPin::BeginFlush() {
 }
 
 HRESULT InputPin::EndFlush() {
+  debug_log("EndFlush");
   IPin* peer = output_pin()->peer_handle();
   HRESULT hr = peer ? peer->EndFlush() : S_OK;
   {
@@ -916,6 +961,7 @@ HRESULT InputPin::Receive(IMediaSample* sample) {
     if (!peer_) return VFW_E_NOT_CONNECTED;
     if (filter_->state_ == State_Stopped) return VFW_E_NOT_RUNNING;
   }
+  debug_log("Receive: sample %ld bytes", sample->GetActualDataLength());
 
   std::string error;
   if (!filter_->ensure_core(&error)) {
@@ -959,13 +1005,31 @@ HRESULT InputPin::Receive(IMediaSample* sample) {
     return hr != E_POINTER;
   };
 
-  if (!core->push(data, static_cast<size_t>(size), pitch, sink, &error)) {
-    debug_log("decode failed: %s", error.c_str());
-    /* A broken frame must not stop the graph: keep going. A stream that never
-     * decodes anything reports through the absence of frames. */
+  if (true) { /* perf instrumentation: measure decode time per sample */
+    static LARGE_INTEGER freq = [] {
+      LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f;
+    }();
+    static double worst = 0.0, total = 0.0;
+    static long count = 0;
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    const bool ok = core->push(data, static_cast<size_t>(size), pitch, sink, &error);
+    QueryPerformanceCounter(&t1);
+    const double ms = double(t1.QuadPart - t0.QuadPart) / double(freq.QuadPart) * 1000.0;
+    ++count; total += ms;
+    if (ms > worst) worst = ms;
+    if (count % 50 == 0) {
+      debug_log("perf: last %.1f ms, avg %.1f ms, worst %.1f ms over %ld samples",
+                ms, total / count, worst, count);
+    }
+    if (!ok) {
+      debug_log("decode failed: %s", error.c_str());
+      /* A broken frame must not stop the graph: keep going. A stream that never
+       * decodes anything reports through the absence of frames. */
+      return S_OK;
+    }
     return S_OK;
   }
-  return S_OK;
 }
 
 /* ------------------------------------------------------------ output pin */
@@ -996,6 +1060,8 @@ HRESULT OutputPin::propose_type(int index, AM_MEDIA_TYPE** out) {
 
 HRESULT OutputPin::Connect(IPin* peer, const AM_MEDIA_TYPE* mt) {
   if (!peer) return E_POINTER;
+  debug_log("output Connect: peer=%p mt=%p", static_cast<void*>(peer),
+            static_cast<const void*>(mt));
   Hold hold(filter_->lock());
   if (peer_) return VFW_E_ALREADY_CONNECTED;
 
@@ -1140,6 +1206,7 @@ HRESULT OutputPin::Disconnect() {
 HRESULT OutputPin::ConnectedTo(IPin** peer) {
   if (!peer) return E_POINTER;
   Hold hold(filter_->lock());
+  *peer = nullptr;
   if (!peer_) return VFW_E_NOT_CONNECTED;
   *peer = peer_;
   peer_->AddRef();
@@ -1148,6 +1215,7 @@ HRESULT OutputPin::ConnectedTo(IPin** peer) {
 
 HRESULT OutputPin::ConnectionMediaType(AM_MEDIA_TYPE* mt) {
   if (!mt) return E_POINTER;
+  ZeroMemory(mt, sizeof(*mt));
   Hold hold(filter_->lock());
   if (!peer_) return VFW_E_NOT_CONNECTED;
   AM_MEDIA_TYPE* copy = copy_media_type(&media_type_);

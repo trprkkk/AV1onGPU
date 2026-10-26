@@ -7,6 +7,40 @@
  * RefPool updates that let the next frame resolve its references.
  */
 #include "decode_core.hpp"
+#include <chrono>
+#include <cstdio>
+#include <cstdarg>
+#define NOMINMAX
+#include <windows.h>
+
+void debug_log(const char* fmt, ...);
+void ds_debug_log(const char* fmt, ...) {
+  static const bool enabled = [] {
+    char flag[8] = {0};
+    const DWORD n = GetEnvironmentVariableA("AV1GPU_DS_DEBUG", flag, sizeof(flag));
+    return n > 0 && n < sizeof(flag) && flag[0] != '0';
+  }();
+  if (!enabled) return;
+  char line[512];
+  va_list args;
+  va_start(args, fmt);
+  _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, args);
+  va_end(args);
+  line[sizeof(line) - 1] = 0;
+  char path[MAX_PATH];
+  if (GetTempPathA(MAX_PATH, path)) {
+    strncat_s(path, "av1gpu_ds.log", _TRUNCATE);
+    if (FILE* f = std::fopen(path, "a")) {
+      SYSTEMTIME st;
+      GetLocalTime(&st);
+      std::fprintf(f, "%02u:%02u:%02u.%03u pid %lu thr %lu  %s\n", st.wHour,
+                   st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentProcessId(),
+                   GetCurrentThreadId(), line);
+      std::fclose(f);
+    }
+  }
+}
+
 
 #include <cstring>
 
@@ -179,11 +213,23 @@ bool StreamDecoder::emit(const Frame& picture, size_t pitch, const Sink& sink,
     return true;
   }
   std::vector<uint8_t> nv12;
+  const auto pc0 = std::chrono::steady_clock::now();
   if (!frame_to_nv12(picture, pitch, &nv12)) {
     *error = "NV12 pack failed (geometry " + std::to_string(picture.width) + "x" +
              std::to_string(picture.height) + ", pitch " + std::to_string(pitch) + ")";
     return false;
   }
+  const auto pc1 = std::chrono::steady_clock::now();
+  static struct {
+    double total = 0, worst = 0; long n = 0;
+    void add(double ms) {
+      total += ms; ++n; if (ms > worst) worst = ms;
+      if (n % 50 == 0)
+        ds_debug_log("perf stage nv12_pack: avg %.1f ms, worst %.1f ms over %ld",
+                  total / n, worst, n);
+    }
+  } st_nv12;
+  st_nv12.add(std::chrono::duration<double, std::milli>(pc1 - pc0).count());
   ++shown_;
   return sink(nv12, picture.width, picture.height, error);
 }
@@ -248,16 +294,44 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   }
 
   frontend::TileDecodeResult decoded;
+  /* stage timing (release instrumentation, av1gpu_ds.log "perf:") */
+  struct PerfClock {
+    LARGE_INTEGER freq;
+    PerfClock() { QueryPerformanceFrequency(&freq); }
+    double ms(LARGE_INTEGER a, LARGE_INTEGER b) const {
+      return double(b.QuadPart - a.QuadPart) / double(freq.QuadPart) * 1000.0;
+    }
+  };
+  static const PerfClock perf;
+  struct Stage {
+    const char* name; double total = 0.0; double worst = 0.0; long n = 0;
+    void add(double ms) {
+      total += ms; ++n; if (ms > worst) worst = ms;
+      if (n % 50 == 0)
+        ds_debug_log("perf stage %s: avg %.1f ms, worst %.1f ms over %ld",
+                  name, total / n, worst, n);
+    }
+  };
+  static Stage st_tiles{"tiles"}, st_deq{"dequantise"}, st_plan{"plan"},
+               st_gpu{"gpu_decode"}, st_nv12{"nv12_pack"};
+  LARGE_INTEGER pc0, pc1;
+
+  QueryPerformanceCounter(&pc0);
   const frontend::ParseStatus tile_status = frontend::decode_tiles(
       st->seq, frame, &st->refs, group.tiles.data(), group.tiles.size(), data, size,
       &decoded, error);
+  QueryPerformanceCounter(&pc1);
+  st_tiles.add(perf.ms(pc0, pc1));
   if (tile_status != frontend::ParseStatus::Ok) {
     if (error->empty()) *error = decoded.stop_reason;
     return false;
   }
 
   frontend::DequantisedTile quant;
+  QueryPerformanceCounter(&pc0);
   frontend::dequantise_tile(frame, st->seq.bit_depth, decoded, &quant);
+  QueryPerformanceCounter(&pc1);
+  st_deq.add(perf.ms(pc0, pc1));
 
   frontend::ReferenceInfo reference_info;
   for (int i = 0; i < 7; ++i) {
@@ -272,10 +346,13 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   }
 
   FrameSyntax syntax;
+  QueryPerformanceCounter(&pc0);
   if (!frontend::plan_from_tile(st->seq, frame, decoded, quant, &syntax, error,
                                 &reference_info)) {
     return false;
   }
+  QueryPerformanceCounter(&pc1);
+  st_plan.add(perf.ms(pc0, pc1));
 
   /* Free the slots this frame refreshes but does not predict from before it is
    * decoded; the frame is allowed to refresh a slot it reads, so those stay. */
@@ -296,8 +373,22 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   }
 
   Frame picture;
+  QueryPerformanceCounter(&pc0);
   const int slot = decoder_->decode_reference(syntax, &picture, error);
+  QueryPerformanceCounter(&pc1);
+  st_gpu.add(perf.ms(pc0, pc1));
   if (slot < 0) return false;
+  {
+    const DecodeStats& s = decoder_->stats();
+    static double acc[4] = {0, 0, 0, 0};
+    static long n = 0;
+    acc[0] += s.reconstruct_ms; acc[1] += s.filter_ms; acc[2] += s.readback_ms;
+    acc[3] += s.total_ms; ++n;
+    if (n % 50 == 0)
+      ds_debug_log("perf gpu split: reconstruct avg %.1f, filter avg %.1f, "
+                   "readback avg %.1f, total avg %.1f ms over %ld",
+                   acc[0] / n, acc[1] / n, acc[2] / n, acc[3] / n, n);
+  }
   ++decoded_;
 
   if (frame.show_frame) {
