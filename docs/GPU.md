@@ -355,7 +355,7 @@ driver version is not comparable.
 | a crash inside the loader, or `undefined symbol: clGetPlatformIDs` | a hand assembled ICD setup (a wheel's `libpocl.so` pointed at directly, or a renamed `libOpenCL.so.1`) | use the distribution's `ocl-icd-libopencl1` with `pocl-opencl-icd` instead of the pip wheel, and let the ICD file hold an absolute path |
 | `device workgroup limit too small` | the device query returned nothing usable | check the driver; the limit is logged by `av1gpu_info` |
 | `asked for opencl, got cpu` | the request was refused and fell back | run `av1gpu_bench --backend opencl --frames 1` for the driver's reason |
-| `kernel build failed` | NVRTC or the OpenCL compiler rejected the source | rerun with `-v` and keep the compiler log; the message names the `--gpu-architecture` that was tried |
+| `OpenCL kernel build failed:` / `NVRTC build failed (--gpu-architecture=compute_XX):` | the device compiler rejected `kernels/av1_opencl.cl` / `av1_cuda.cu`; the message carries the compiler log | keep the log and the driver version — this is a language or driver issue, not a wrong picture. `av1gpu_bench --backend opencl --frames 1` reproduces it in seconds |
 | `out of device memory` | an allocation in `prepare()` or `decode()` failed | the frame plus its reference pool does not fit; try a smaller `--width/--height` |
 | `CUDA kernel execution failed (cuCtxSynchronize = N)` | a kernel faulted or a copy targeted a stale buffer | the driver error number says which; this used to be silent and decoded into whatever the buffer held |
 | `gpu_verify: <backend> was requested but no such device is present` | `--backends` named a backend this machine cannot initialise | `av1gpu_info` lists what it has |
