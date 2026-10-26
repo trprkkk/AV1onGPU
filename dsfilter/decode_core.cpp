@@ -173,6 +173,10 @@ void StreamDecoder::queue_job(PipeJob job, std::string* error) {
    * demuxer instead of planning the whole file into memory */
   pipe_cv_.wait(lk, [&] { return jobs_.size() < kPipeDepth || pipe_failed_ || quitting_; });
   if (pipe_failed_ || quitting_) {
+    /* the job will never run: hand its reservation straight back */
+    const int slot = job.slot;
+    lk.unlock();
+    if (slot >= 0) decoder_->release_reference(slot);
     if (error && error->empty()) *error = notice_;
     return;
   }
@@ -559,6 +563,12 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   int reserved = -1;
   if (pipelined && kept) {
     reserved = decoder_->reserve_reference();
+    if (reserved < 0) {
+      /* every slot may be marked because queued frames still hold the ones
+       * the pool dropped; drain the queue and try again before giving up */
+      finish();
+      reserved = decoder_->reserve_reference();
+    }
     if (reserved < 0) {
       if (!fallback_used_) {
         /* first failure: drain what is queued and finish this frame on the

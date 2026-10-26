@@ -61,10 +61,13 @@ class EngineDecoder final : public av1gpu::Decoder {
   }
 
   bool decode(const FrameSyntax& syntax, Frame* out, std::string* error) override {
-    const int slot = decode_reference(syntax, out, error);
-    if (slot < 0) return false;
-    release_reference(slot);
-    return true;
+    /* A frame nobody keeps needs no pool slot at all: asking for a temporary
+     * one would starve a pipelined caller whose queued frames still hold the
+     * slots the pool just dropped. */
+    FramePlan plan;
+    if (!plan_for(syntax, &plan, error)) return false;
+    int slot = -1;
+    return backend_->decode(plan, false, out, &slot, &stats_, error);
   }
 
   int reserve_reference() override { return backend_->reserve_reference(); }
