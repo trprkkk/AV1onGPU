@@ -268,6 +268,11 @@ constexpr int8_t kFilterIntraToIntraDir[5] = {kModeDc, kModeVertical, kModeHoriz
  * Hash 0 (no neighbour at all) cannot occur either: the first sample of the map
  * is decoded uniformly. */
 constexpr int kPaletteColors = 8;
+/* A palette colour is a sample, so it is as wide as the sample: eight bits
+ * truncates every entry of a 10 or 12 bit palette (880 becomes 112) while the
+ * range decoder stays in step, which makes it look like a prediction bug rather
+ * than a container that is too narrow. 16 bits holds 12 bit samples. */
+using PaletteColor = uint16_t;
 /* The *cache* is the merged colour list of the palettes above and to the left,
  * and it is not capped at a palette: each neighbour contributes up to eight
  * distinct colours, so it holds sixteen (the specification's PaletteCache is
@@ -3519,13 +3524,13 @@ class TileParser {
    * top of a band starts from an empty cache. That is the specification's
    * `(MiRow * MI_SIZE) % 64` test, and it is why the encoder may not depend on
    * a palette coded more than 64 samples above. */
-  int palette_cache(int plane, int row, int col, uint8_t* cache) {
+  int palette_cache(int plane, int row, int col, PaletteColor* cache) {
     int n = 0;
     auto push = [&](int value) {
-      if (n == 0 || cache[n - 1] != value) cache[n++] = static_cast<uint8_t>(value);
+      if (n == 0 || cache[n - 1] != value) cache[n++] = static_cast<PaletteColor>(value);
     };
-    const uint8_t* above = pal_above_col_[plane][col].data();
-    const uint8_t* left = pal_left_col_[plane][row].data();
+    const PaletteColor* above = pal_above_col_[plane][col].data();
+    const PaletteColor* left = pal_left_col_[plane][row].data();
     int above_n = 0, left_n = 0;
     if (have_top(row) && (row & 15) != 0) above_n = pal_above_sz_[plane][col];
     if (have_left(col)) left_n = pal_left_sz_[plane][row];
@@ -3588,7 +3593,7 @@ class TileParser {
     const int max_value = (1 << bit_depth) - 1;
     /* 2 * 8: see kPaletteCache - the cache is the two neighbour palettes merged,
      * not a palette. */
-    uint8_t cache[kPaletteCache] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    PaletteColor cache[kPaletteCache] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     const int cache_n = palette_cache(plane, row, col, cache);
     if (trace_enabled())
       std::fprintf(stderr, "PALQ %d %d pl=%d ctx=%d rng=%u cdf0=%u cdf5=%u\n", col * 4, row * 4,
@@ -3596,7 +3601,7 @@ class TileParser {
                    cdf_.mode.pal_sz[plane][sz_ctx][5]);
     const int size =
         static_cast<int>(decoder_.read_symbol(cdf_.mode.pal_sz[plane][sz_ctx], 6)) + 2;
-    uint8_t colors[kPaletteColors] = {0, 0, 0, 0, 0, 0, 0, 0};
+    PaletteColor colors[kPaletteColors] = {0, 0, 0, 0, 0, 0, 0, 0};
     int idx = 0;
     for (int i = 0; i < cache_n && idx < size; ++i) {
       if (decoder_.read_bit()) colors[idx++] = cache[i];
@@ -3607,14 +3612,14 @@ class TileParser {
     }
     if (idx < size) {
       int value = static_cast<int>(decoder_.read_literal(bit_depth));
-      colors[idx++] = static_cast<uint8_t>(value);
+      colors[idx++] = static_cast<PaletteColor>(value);
       if (idx < size) {
         int bits = bit_depth - 3 + static_cast<int>(decoder_.read_literal(2));
         while (idx < size) {
           const int delta =
               static_cast<int>(decoder_.read_literal(bits)) + (plane == 0 ? 1 : 0);
           value = std::min(max_value, value + delta);
-          colors[idx++] = static_cast<uint8_t>(value);
+          colors[idx++] = static_cast<PaletteColor>(value);
           /* The next delta only has to reach the top of the range: for luma
            * the delta counts from one above the current colour, so one sample
            * less is left; for chroma, whose delta is not offset, the current
@@ -3633,7 +3638,7 @@ class TileParser {
        * positive, but an obvious loop is cheaper than teaching every build to
        * ignore it). */
       for (int i = 1; i < size; ++i) {
-        const uint8_t key = colors[i];
+        const PaletteColor key = colors[i];
         int j = i - 1;
         while (j >= 0 && colors[j] > key) {
           colors[j + 1] = colors[j];
@@ -3814,8 +3819,8 @@ class TileParser {
       pal_left_sz_[0][r] = static_cast<uint8_t>(block.palette_size[0]);
       pal_left_sz_[1][r] = static_cast<uint8_t>(block.palette_size[1]);
       for (int i = 0; i < kPaletteColors; ++i) {
-        pal_left_col_[0][r][i] = static_cast<uint8_t>(block.palette_color_y[i]);
-        pal_left_col_[1][r][i] = static_cast<uint8_t>(block.palette_color_u[i]);
+        pal_left_col_[0][r][i] = static_cast<PaletteColor>(block.palette_color_y[i]);
+        pal_left_col_[1][r][i] = static_cast<PaletteColor>(block.palette_color_u[i]);
       }
     }
     for (int x = 0; x < bw4; ++x) {
@@ -3824,8 +3829,8 @@ class TileParser {
       pal_above_sz_[0][c] = static_cast<uint8_t>(block.palette_size[0]);
       pal_above_sz_[1][c] = static_cast<uint8_t>(block.palette_size[1]);
       for (int i = 0; i < kPaletteColors; ++i) {
-        pal_above_col_[0][c][i] = static_cast<uint8_t>(block.palette_color_y[i]);
-        pal_above_col_[1][c][i] = static_cast<uint8_t>(block.palette_color_u[i]);
+        pal_above_col_[0][c][i] = static_cast<PaletteColor>(block.palette_color_y[i]);
+        pal_above_col_[1][c][i] = static_cast<PaletteColor>(block.palette_color_u[i]);
       }
     }
   }
@@ -4437,9 +4442,9 @@ class TileParser {
    * cache of a block reads the cell above and the cell to the left of its top
    * left corner, and nothing else. */
   std::vector<uint8_t> pal_above_sz_[2];
-  std::vector<std::array<uint8_t, kPaletteColors>> pal_above_col_[2];
+  std::vector<std::array<PaletteColor, kPaletteColors>> pal_above_col_[2];
   std::vector<uint8_t> pal_left_sz_[2];
-  std::vector<std::array<uint8_t, kPaletteColors>> pal_left_col_[2];
+  std::vector<std::array<PaletteColor, kPaletteColors>> pal_left_col_[2];
   std::vector<int8_t> above_tx_lw_;
   std::vector<int8_t> left_tx_lh_;
   /* luma transform type per 4x4 unit, as transform_type() writes it */
@@ -4458,7 +4463,7 @@ class TileParser {
     skip_mode_map_.assign(static_cast<size_t>(cols) * rows, 0);
     y_mode_map_.assign(static_cast<size_t>(cols) * rows, kModeDc);
     for (int plane = 0; plane < 2; ++plane) {
-      const std::array<uint8_t, kPaletteColors> no_colors = {0, 0, 0, 0, 0, 0, 0, 0};
+      const std::array<PaletteColor, kPaletteColors> no_colors = {0, 0, 0, 0, 0, 0, 0, 0};
       pal_above_sz_[plane].assign(static_cast<size_t>(cols), 0);
       pal_above_col_[plane].assign(static_cast<size_t>(cols), no_colors);
       pal_left_sz_[plane].assign(static_cast<size_t>(rows), 0);
@@ -4564,7 +4569,7 @@ class TileParser {
     std::fill(above_tx_lw_.begin(), above_tx_lw_.end(), 0);
     std::fill(left_tx_lh_.begin(), left_tx_lh_.end(), 0);
     for (int plane = 0; plane < 2; ++plane) {
-      const std::array<uint8_t, kPaletteColors> no_colors = {0, 0, 0, 0, 0, 0, 0, 0};
+      const std::array<PaletteColor, kPaletteColors> no_colors = {0, 0, 0, 0, 0, 0, 0, 0};
       std::fill(pal_above_sz_[plane].begin(), pal_above_sz_[plane].end(), 0);
       std::fill(pal_above_col_[plane].begin(), pal_above_col_[plane].end(), no_colors);
       std::fill(pal_left_sz_[plane].begin(), pal_left_sz_[plane].end(), 0);

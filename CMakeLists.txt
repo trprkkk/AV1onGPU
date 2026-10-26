@@ -181,13 +181,20 @@ if(AV1GPU_BUILD_TESTS)
   # and tiles / tiles_grid the only ones cut into more than one tile per frame
   # (2x2 on 256x160, and 4x2 on a 320x188 frame whose tile widths are 64 + 64 +
   # 64 + 128 and whose tile rows are 64 + 124 samples, so the last row ends at
-  # the coded extent, two samples past the picture).
-  # Every frame of all twenty two is bit exact.
+  # the coded extent, two samples past the picture), palette_10bit the only one
+  # that codes a palette in a picture deeper than eight bits (so a colour does
+  # not fit in a byte: the fixture was recorded because a uint8_t colour array
+  # turned 880 into 112 while the range decoder stayed in step), and
+  # error_resilient the only one that codes error_resilient_mode on inter frames
+  # (primary_ref_frame = PRIMARY_REF_NONE, frame ids with a delta per reference,
+  # and the seven reference names interleaved with them).
+  # Every frame of all twenty four is bit exact.
   if(TARGET av1gpu_decode)
     foreach(stream lw_t2 lw_t3 palette_sc intrabc inter_intra seg_altq superres grain
                  grain_inherit lr lr_10bit lr_12bit lr_444 lr_422 lossless
                  odd_size edge_grid tiles tiles_grid aom_10bit_320x240
-                 aom_444_10bit_320x240 aom_12bit_320x240)
+                 aom_444_10bit_320x240 aom_12bit_320x240 palette_10bit
+                 error_resilient)
       set(frames 30)
       # deeper than 8 bit: the hashes are over the samples themselves, so the
       # decoder has to write them at full precision
@@ -246,6 +253,14 @@ if(AV1GPU_BUILD_TESTS)
       elseif(stream MATCHES "^aom_")
         set(frames 12)
         set(stream_flags --yuv16)
+      elseif(stream STREQUAL "palette_10bit")
+        # 10 bit: the palette colours are samples, not bytes
+        set(frames 2)
+        set(stream_flags --yuv16)
+      elseif(stream STREQUAL "error_resilient")
+        # four frames, three of them error resilient inter frames whose
+        # references do not all name the same slot
+        set(frames 4)
       endif()
       add_test(NAME stream_${stream}
                COMMAND av1gpu_decode --backend cpu --frames ${frames} ${stream_flags}
@@ -355,6 +370,12 @@ if(AV1GPU_BUILD_TESTS)
     #                   tiles and whose CDEF and restoration tests follow them
     #   tiles_grid      the same with an unequal grid (4x2, 64/64/64/128 wide)
     #                   on a frame whose height is not a superblock multiple
+    #   palette_10bit   the only one that codes palette blocks in a picture
+    #                   deeper than eight bits, so the palette's colours are
+    #                   samples and the job's colours have to carry them whole
+    #   error_resilient the only one whose inter frames are error resilient, so
+    #                   the plans are built with every reference slot resolved
+    #                   from a header that names no primary reference
     #   svt_av1_320x240 a different encoder, so a different mix of tools
     # All of it on a machine with no GPU at all.
     if(TARGET av1gpu_decode)
@@ -362,7 +383,7 @@ if(AV1GPU_BUILD_TESTS)
                      superres lr lr_10bit lr_12bit lr_444 lr_422 lossless
                      odd_size edge_grid tiles tiles_grid grain grain_inherit
                      aom_10bit_320x240 aom_444_10bit_320x240 aom_12bit_320x240
-                     svt_av1_320x240)
+                     palette_10bit error_resilient svt_av1_320x240)
         set(frames 30)
         if(stream STREQUAL "palette_sc")
           set(frames 10)
@@ -381,6 +402,10 @@ if(AV1GPU_BUILD_TESTS)
         elseif(stream STREQUAL "tiles")
           set(frames 4)
         elseif(stream STREQUAL "tiles_grid")
+          set(frames 4)
+        elseif(stream STREQUAL "palette_10bit")
+          set(frames 2)
+        elseif(stream STREQUAL "error_resilient")
           set(frames 4)
         elseif(stream STREQUAL "grain_inherit")
           set(frames 10)

@@ -512,6 +512,51 @@ and ffmpeg agree with us on every sample.
 `tests/data/make_tile_grid_clip.py` writes the stream back byte for byte
 (`python3 tests/data/make_tile_grid_clip.py tests/data/tiles_grid.ivf`).
 
+`palette_10bit.ivf` is the deep colour palette fixture: 64x64, two frames, 10 bit
+4:2:0, 1.0 KB, encoded with libaom at `-cpu-used 5 -crf 32 -g 2`. The content is
+flat panels of one colour with single sample rows and columns of another, which
+is what makes libaom choose palette coding, and the palettes it codes reach 880
+in luma and 819 in chroma - above 255 in every plane.
+
+That is the whole point of the fixture. A palette colour is a *sample*, so
+5.11.5 reads it with `BitDepth` bits, and storing colours in a byte is invisible
+in an 8 bit stream: 880 arrives as 112 and the picture comes back with luma off
+by tens of levels while the chroma is exact (its colours happen to be below
+256). Nothing else in the set mixes palette coding with a depth above eight -
+`palette_sc` is 8 bit and the `aom_*` streams code no palette - so the two halves
+of the syntax were each verified on their own and never together.
+
+`palette_10bit.hash` holds the per frame hashes of the samples,
+`stream_palette_10bit` checks them and `opencl_palette_10bit` replays the same
+plans through the device kernels.
+
+`tests/data/make_palette_10bit_clip.py` writes the stream back byte for byte
+(`python3 tests/data/make_palette_10bit_clip.py tests/data/palette_10bit.ivf`).
+
+`error_resilient.ivf` is the only fixture whose *inter* frames are error
+resilient: 320x180, four frames, 5.0 KB, encoded with libaom at `-cpu-used 5
+-crf 32 -lag-in-frames 0 -g 4 -error-resilience 1`. It is the one stream here
+that makes the encoder set `frame_id_numbers_present_flag`, so every reference is
+named by a slot index *and* a `delta_frame_id`, and every frame restates the order
+hint of all eight slots.
+
+Its second inter frame predicts from two different slots with two different ids,
+which is what makes it a regression test rather than a formality: 5.9.2 reads the
+seven references one at a time - index, then that reference's id - and a decoder
+that reads the seven indices followed by the seven ids consumes exactly the same
+number of bits, so the rest of the header still parses and a stream whose
+references all point at the same slot still decodes. Read as two loops, this
+frame's pairs are built half from one reference and half from another, and the
+decoder then rejects its own (correct) stream on the conformance check for
+`RefFrameId`. Before the fix it decoded two of the four frames and stopped.
+
+`error_resilient.hash` holds the per frame hashes, `stream_error_resilient`
+checks them and `opencl_error_resilient` replays the same plans through the
+device kernels.
+
+`tests/data/make_error_resilient_clip.py` writes the stream back byte for byte
+(`python3 tests/data/make_error_resilient_clip.py tests/data/error_resilient.ivf`).
+
 The three `aom_*` fixtures are the ones that are not 8 bit 4:2:0: twelve frames
 of a 320x240 ramp each, encoded with libaom through ffmpeg's `libaom-av1` at
 `-crf 40 -cpu-used 8 -lag-in-frames 0`.

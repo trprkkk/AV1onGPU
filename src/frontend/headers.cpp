@@ -932,7 +932,8 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
       *out = h;
       return unsupported("inter frames need the reference frame pool", error);
     }
-    if (r.read_bit()) {
+    const bool short_signaling = r.read_bit() != 0;
+    if (short_signaling) {
       /* frame_refs_short_signaling: only the two slots the encoder committed to
        * are coded, the other five come from the order hints (set_frame_refs). */
       if (!seq.enable_order_hint) {
@@ -942,29 +943,29 @@ ParseStatus parse_frame_header(const SequenceHeader& seq, const uint8_t* data, s
       h.last_frame_idx = static_cast<int>(r.read(3));
       h.gold_frame_idx = static_cast<int>(r.read(3));
       set_frame_refs(seq, &h, *refs);
-    } else {
-      for (int i = 0; i < 7; ++i) h.ref_frame_idx[i] = static_cast<int>(r.read(3));
     }
-    /* With frame ids the header names, for each reference, how far back its id
-     * has to be: a decoder that cannot match the value knows the slot does not
-     * hold the frame the encoder meant and says so instead of predicting from
-     * the wrong picture. */
-    if (seq.frame_id_numbers_present) {
+    /* One reference per iteration, in the specification's order: the slot index
+     * and then, when the sequence numbers its frames, how far back that slot's
+     * id has to be. The two fields are interleaved - reading the seven indices
+     * and then the seven ids would pair the wrong halves of each pair, which
+     * only shows up on a frame whose references do not all look alike. */
+    for (int i = 0; i < 7; ++i) {
+      if (!short_signaling) h.ref_frame_idx[i] = static_cast<int>(r.read(3));
+      if (!seq.frame_id_numbers_present) continue;
       const int id_len = seq.frame_id_n_bits;
-      const int n = seq.delta_frame_id_n_bits;
-      for (int i = 0; i < 7; ++i) {
-        const int delta = static_cast<int>(r.read(n)) + 1;
-        const int expected = (h.frame_id + (1 << id_len) - delta) % (1 << id_len);
-        const int slot = h.ref_frame_idx[i];
-        if (slot < 0 || slot > 7) {
-          *out = h;
-          return invalid("a reference frame index is out of range", error);
-        }
-        if (refs->slots[slot].frame_id != expected) {
-          *out = h;
-          return invalid("a reference frame id does not match the frame its slot holds",
-                         error);
-        }
+      const int delta = static_cast<int>(r.read(seq.delta_frame_id_n_bits)) + 1;
+      const int expected = (h.frame_id + (1 << id_len) - delta) % (1 << id_len);
+      const int slot = h.ref_frame_idx[i];
+      if (slot < 0 || slot > 7) {
+        *out = h;
+        return invalid("a reference frame index is out of range", error);
+      }
+      /* A slot that does not hold the frame the encoder meant to name is not
+       * predicted from: the header's id arithmetic is how a decoder notices. */
+      if (refs->slots[slot].frame_id != expected) {
+        *out = h;
+        return invalid("a reference frame id does not match the frame its slot holds",
+                       error);
       }
     }
     /* 7.8 requires every reference this frame codes to name a frame the

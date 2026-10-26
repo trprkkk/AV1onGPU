@@ -690,14 +690,18 @@ std::vector<uint8_t> write_inter_frame_header_ids(const SequenceSpec& spec,
   if (in.short_signaling) {
     w.bits(static_cast<uint32_t>(in.last_frame_idx), 3);
     w.bits(static_cast<uint32_t>(in.gold_frame_idx), 3);
-  } else {
-    for (int i = 0; i < 7; ++i) w.bits(static_cast<uint32_t>(in.slots[i]), 3);
   }
-  if (spec.frame_ids) {
-    for (int i = 0; i < 7; ++i) {
-      /* the field is delta_frame_id_minus_1: one less than the distance */
+  /* One reference per iteration, in the specification's order: the slot index
+   * and then, when the sequence numbers its frames, that reference's id. The
+   * two fields are interleaved (5.9.2), and writing the seven indices and then
+   * the seven ids consumes the same number of bits - so a decoder that reads
+   * them in the wrong order still reaches the end of the header, and only the
+   * pairs it built are wrong. */
+  for (int i = 0; i < 7; ++i) {
+    if (!in.short_signaling) w.bits(static_cast<uint32_t>(in.slots[i]), 3);
+    /* the field is delta_frame_id_minus_1: one less than the distance */
+    if (spec.frame_ids)
       w.bits(static_cast<uint32_t>(in.deltas[i] - 1), spec.delta_frame_id_n_bits());
-    }
   }
   /* frame_size_with_refs() is reached with the override on and error resilient
    * off: one found_ref bit per reference, and the bits after the first one that

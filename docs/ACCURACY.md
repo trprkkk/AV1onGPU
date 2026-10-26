@@ -405,6 +405,8 @@ was built for.)
 | `lossless` | 4 | `all_lossless`: no filter parameters in the header, no filtering |
 | `odd_size` | 6 | a picture that is not a multiple of eight in either direction |
 | `edge_grid` | 4 | a picture whose planes end inside the loop filter's four sample grid |
+| `palette_10bit` | 2 | palette coded blocks at 10 bit, where a colour is not a byte |
+| `error_resilient` | 4 | error resilient inter frames, references named by frame id |
 
 The four local-warp streams are the ROTZOOM clip re-encoded with libaom at
 `--cpu-used=2` and `--cpu-used=3`, `--crf=30`, `--lag-in-frames=25`,
@@ -431,6 +433,19 @@ pictures and not this decoder's. Regenerate one with
 
 but only after checking the stream against dav1d, or the file would record our
 own mistakes.
+
+**A wider sweep** crosses settings rather than fixtures, because a fixture can
+only be the stream its encoder produced: 55 libaom encodes over 8x8, 16x160,
+64x64, 96x96, 128x96, 130x66, 176x144, 200x150, 320x180, 321x241, 512x288 and
+640x360; `-crf` 0 (lossless), 10, 18, 20, 32 and 45; `-cpu-used` 2, 5 and 8;
+`-g 1` and `-g 8`; `-lag-in-frames` 0, 8 and 25; `-aq-mode 3`; `-tiles 2x2` and
+`4x2`; `-error-resilience 1`, `-enable-reduced-reference-set 1`, and one tool at
+a time switched on or off (dual filter, flip identity transform, masked
+compound, wedge, intrabc, palette, 64 point transforms, one-sided compound, 1:4
+and rectangle partitions). 8 bit 4:2:0, 4:4:4 and 12 bit 4:2:0 each appear, and
+10 bit 4:2:0 and 4:4:4. All 55 are bit exact against dav1d, every sample of every
+frame (with `--yuv16` on our side for the deep ones). Two were not, and both are
+fixtures now: `palette_10bit` and `error_resilient`, above.
 
 ## Inter/intra compound
 
@@ -478,6 +493,21 @@ would take blocks away from the palette - and the intrabc fixture below is the
 one that codes it; the palette stream is the shortest thing that walks the whole
 palette syntax - `palette_mode_info`, `palette_tokens`, the colour map's three
 neighbour contexts, and the neighbour palette cache.
+
+`tests/data/palette_10bit.ivf` is the same syntax at 10 bit: 64x64, two frames,
+1.0 KB, flat panels with single sample rows of another colour, so libaom codes
+palettes whose colours are above 255 in every plane. A palette colour is a
+*sample* - 5.11.5 reads it with `BitDepth` bits, and the delta width narrows to
+the sample range - and the parser kept its colours in `uint8_t` arrays: an entry
+of 880 arrived as 112, and the block then predicted from a colour nothing in the
+stream mentioned. The range decoder stayed in step the whole time, because it
+reads the same `BitDepth` bits either way, so the failure looked like a
+prediction bug: the luma plane off by tens of levels, the chroma exact (its
+colours happened to be below 256), every palette size and colour map intact.
+Neither fixture could see it alone - `palette_sc` is 8 bit, and the deep
+fixtures code no palette - and no 8 bit stream can, because at 8 bit a byte *is*
+a sample. `PaletteColor` is `uint16_t` now, which also covers 12 bit, and the
+neighbour palette cache that feeds the merge carries the same type.
 
 `tests/data/intrabc.ivf` is the intra block copy fixture: 16 frames of 320x240,
 6 KB, all intra (`-g 1`) and encoded with libaom `tune-content=screen
@@ -622,10 +652,11 @@ misreading decoded them bit exactly and why this needed written headers.
 ## Reference frame ids and short signalling
 
 Two header features change which stored frame a reference *names*, and both were
-missing until now. Neither can be produced by the encoders available here, so
-they are pinned by written headers rather than by a stream - and, for the part
-that is a choice between equally valid-looking candidates, against the reference
-decoder's own algorithm.
+missing until now. Short signalling cannot be produced by the encoders available
+here, so it is pinned by written headers - and, for the part that is a choice
+between equally valid-looking candidates, against the reference decoder's own
+algorithm. Frame ids *can* be: `-error-resilience 1` makes libaom code
+`error_resilient_mode` on the inter frames, and with it the ids.
 
 **Short signalling** (`frame_refs_short_signaling`, 7.8) codes two slot indices -
 the frames the encoder committed to as LAST and GOLDEN - and derives the other
@@ -673,6 +704,22 @@ references match, a frame whose distance is wrong (rejected), a frame whose id
 has pushed the oldest slot out of the window (dropped, and the surviving slot
 still usable), a display of a stored frame with the right and the wrong id, and
 an error resilient frame that drops a slot whose re-stated hint disagrees.
+
+`tests/data/error_resilient.ivf` is the same thing as a real stream, and it paid
+for itself immediately. The seven references are read *one at a time* - the three
+bit slot index and then, when the sequence numbers its frames, that reference's
+`delta_frame_id`. The parser read the seven indices and then the seven ids. Both
+orders consume 21 + 7 * deltaFrameIdLen bits, so the rest of the header parses,
+the CDFs and the tiles are fine, and a stream whose references all point at the
+same slot decodes bit exactly - which is every frame of every other fixture.
+`error_resilient.ivf`'s second inter frame names two different slots with two
+different distances, the pairs the parser built were half of one reference and
+half of another, and the decoder rejected its own conformant stream on the
+`RefFrameId` check (two frames decoded, then
+`a reference frame id does not match the frame its slot holds`). The header
+writer in `test_frontend.cpp` had the same two loop shape, so the written test
+could not see it either; both are one loop now, and the fixture is what keeps it
+that way.
 
 ## Segmentation
 
@@ -1247,7 +1294,7 @@ export ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1
 ctest --test-dir build-san -j
 ```
 
-The normal and the sanitizer build are both expected to stay at 53/53 (`ctest -N`
+The normal and the sanitizer build are both expected to stay at 57/57 (`ctest -N`
 prints the list), and neither is allowed to print a `runtime error` line.
 The option compiles with `-fno-sanitize-recover=all` for exactly that reason:
 UBSan recovers by default, so without it a finding is a line on stderr and a
@@ -1326,7 +1373,8 @@ The sanitizer build also removed a compiler warning that had been noise for a
 while: `read_palette_plane` sorts its eight byte colour cache up to `size`, and
 gcc's inliner could not see the bound and warned about an out of bounds read in
 `std::sort`. It is an insertion sort now - linear on two ascending runs anyway,
-which is what the comment above it already claimed.
+which is what the comment above it already claimed - and the array it sorts holds
+`PaletteColor`, not a byte (see `palette_10bit.ivf` above).
 
 ## Precision and portability notes
 

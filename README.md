@@ -327,7 +327,9 @@ ctest --test-dir build -R opencl --output-on-failure
 ## What is not here
 
 Every inter and intra tool AV1 defines decodes bit exactly - including palette
-coded blocks (`tests/data/palette_sc.ivf`), inter/intra compound
+coded blocks (`tests/data/palette_sc.ivf`, and `palette_10bit.ivf` for the same
+syntax in a picture deeper than eight bits, where a colour is not a byte),
+inter/intra compound
 (`tests/data/inter_intra.ivf`), intra block copy (`tests/data/intrabc.ivf`) and
 skip mode, which the `lw_t2`/`lw_t3`/`inter_intra` fixtures code thousands of
 times, and segmentation (`tests/data/seg_altq.ivf`, a different quantiser per
@@ -340,7 +342,8 @@ and stripe blending follow 7.18.3 sample for sample (`tests/data/grain.ivf`), an
 decodes tile by tile into one picture (`tests/data/tiles.ivf`, 2x2, and
 `tiles_grid.ivf`, 4x2 with unequal tile widths on a frame whose height is not a
 superblock multiple - both checked against dav1d and through the OpenCL
-replay).
+replay), and error resilient inter frames, which name their references by frame
+id as well as by slot (`tests/data/error_resilient.ivf`).
 `av1gpu::synthetic_encode` is a small closed loop test encoder that produces
 valid syntax from a generated clip and does not need any of those.
 
