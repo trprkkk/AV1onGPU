@@ -341,19 +341,20 @@ class CudaBackend final : public Backend {
               !upload_h2d(palette_, plan.palette_map.data(),
                           plan.palette_map.size()))
             return fail(error, "palette map write failed");
-          CUdeviceptr job_mem = 0, unused = 0;
+          CUdeviceptr job_mem = 0, pref_mem = 0;
           int total = 0;
-          if (!upload_jobs(wave.intra, &job_mem, &unused, &total,
-                           [](const Av1gIntraJob&) { return 1; }))
+          if (!upload_jobs(wave.intra, &job_mem, &pref_mem, &total,
+                           [](const Av1gIntraJob& j) { return j.h; }))
             return fail(error, "intra job upload failed");
-          (void)total;
           Launcher a;
           add_mem(a, job_mem);
+          add_mem(a, pref_mem);
           add_int(a, n);
+          add_int(a, total);
           add_mem(a, frame_);
           add_mem(a, palette_);
           add_int(a, maxv);
-          if (!launch("av1g_k_intra", n, a)) return fail(error, "av1g_k_intra failed");
+          if (!launch("av1g_k_intra", total, a)) return fail(error, "av1g_k_intra failed");
           ++launches;
         }
         if (!wave.itx.empty()) {
@@ -462,8 +463,8 @@ class CudaBackend final : public Backend {
        * needs its own job/prefix slice of the arenas */
       CUdeviceptr inter_job = 0, inter_pref = 0;
       int inter_n = 0, inter_total = 0;
-      CUdeviceptr intra_job = 0;
-      int intra_n = 0;
+      CUdeviceptr intra_job = 0, intra_pref = 0;
+      int intra_n = 0, intra_total = 0;
       CUdeviceptr itx_job = 0, itx_row_pref = 0, itx_col_pref = 0;
       int itx_n = 0, itx_rows = 0, itx_cols = 0;
       CUdeviceptr res_job = 0, res_pref = 0;
@@ -476,7 +477,7 @@ class CudaBackend final : public Backend {
      * misaligned, and the kernels read the job structs with vector loads. */
     struct WaveOffsets {
       size_t inter_job = 0, intra_job = 0, itx_job = 0, res_job = 0;
-      size_t inter_pref = 0, itx_row = 0, itx_col = 0, res_pref = 0;
+      size_t inter_pref = 0, intra_pref = 0, itx_row = 0, itx_col = 0, res_pref = 0;
       size_t job_bytes = 0, pref_bytes = 0;
     };
     auto align64 = [](size_t x) { return (x + 63) & ~size_t(63); };
@@ -494,7 +495,9 @@ class CudaBackend final : public Backend {
       }
       if (!w.intra.empty()) {
         o.intra_job = align64(job);
+        o.intra_pref = align64(pref);
         job = o.intra_job + w.intra.size() * sizeof(Av1gIntraJob);
+        pref = o.intra_pref + (w.intra.size() + 2) * sizeof(int);
       }
       if (!w.itx.empty()) {
         o.itx_job = align64(job);
@@ -606,14 +609,26 @@ class CudaBackend final : public Backend {
           L.inter_total = sum;
         }
         if (!w.intra.empty()) {
+          std::vector<int> prefix(w.intra.size() + 2, 0);
+          int sum = 0;
+          for (size_t k = 0; k < w.intra.size(); ++k) {
+            prefix[k] = sum;
+            sum += w.intra[k].h;
+          }
+          prefix[w.intra.size()] = sum;
+          prefix[w.intra.size() + 1] = sum;
           if (!h2d(job_arena_ + o.intra_job, w.intra.data(),
-                   w.intra.size() * sizeof(Av1gIntraJob))) {
+                   w.intra.size() * sizeof(Av1gIntraJob)) ||
+              !h2d(pref_arena_ + o.intra_pref, prefix.data(),
+                   prefix.size() * sizeof(int))) {
             prep_ok = false;
             break;
           }
           L.intra = true;
           L.intra_job = job_arena_ + o.intra_job;
+          L.intra_pref = pref_arena_ + o.intra_pref;
           L.intra_n = static_cast<int>(w.intra.size());
+          L.intra_total = sum;
         }
         if (!w.itx.empty()) {
           std::vector<int> row_prefix(w.itx.size() + 2, 0);
@@ -729,11 +744,13 @@ class CudaBackend final : public Backend {
       if (L.intra && (kind_mask & 2u)) {
         Launcher a;
         add_mem(a, L.intra_job);
+        add_mem(a, L.intra_pref);
         add_int(a, L.intra_n);
+        add_int(a, L.intra_total);
         add_mem(a, frame_);
         add_mem(a, palette_);
         add_int(a, maxv);
-        if (!launch("av1g_k_intra", L.intra_n, a))
+        if (!launch("av1g_k_intra", L.intra_total, a))
           return fail(error, "av1g_k_intra failed");
         ++launches;
       }

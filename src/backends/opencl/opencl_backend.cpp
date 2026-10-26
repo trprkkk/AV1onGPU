@@ -279,20 +279,21 @@ class OpenCLBackend final : public Backend {
                                     plan.palette_map.size(), plan.palette_map.data(), 0,
                                     nullptr, nullptr) != opencl::CL_SUCCESS)
           return fail(error, "palette map write failed");
-        cl_mem job_mem = 0, unused = 0;
+        cl_mem job_mem = 0, pref_mem = 0;
         int total = 0;
-        if (!upload_jobs(wave.intra, &job_mem, &unused, &total,
-                         [](const Av1gIntraJob&) { return 1; }))
+        if (!upload_jobs(wave.intra, &job_mem, &pref_mem, &total,
+                         [](const Av1gIntraJob& j) { return j.h; }))
           return fail(error, "intra job upload failed");
-        (void)total;
-        /* one work item per block: intra prediction is a whole block operation */
+        /* one work item per row of a block */
         cl_kernel k = kernel("av1g_k_intra");
         set_mem(k, 0, job_mem);
-        set_int(k, 1, n);
-        set_mem(k, 2, frame_);
-        set_mem(k, 3, palette_);
-        set_int(k, 4, maxv);
-        if (!enqueue(k, n, 64)) return fail(error, "av1g_k_intra failed");
+        set_mem(k, 1, pref_mem);
+        set_int(k, 2, n);
+        set_int(k, 3, total);
+        set_mem(k, 4, frame_);
+        set_mem(k, 5, palette_);
+        set_int(k, 6, maxv);
+        if (!enqueue(k, total, 64)) return fail(error, "av1g_k_intra failed");
         ++launches;
       }
       if (!wave.itx.empty()) {

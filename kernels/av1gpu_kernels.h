@@ -1076,11 +1076,15 @@ AV1G_FN int av1g_edge_upsample_sel(int w, int h, int filter_type, int delta) {
 }
 
 /* The directional predictor: walks the edge at the prediction angle. */
-AV1G_FN void av1g_intra_directional(const Av1gIntraJob *job, int *above, int *left,
-                                    int pangle, int upsample_above, int upsample_left,
-                                    AV1G_GLOBAL av1g_px *dst, int maxv) {
-  const int w = job->w, h = job->h, stride = job->dst_stride;
-  int dx = 0, dy = 0, i, j;
+/* One row of the directional predictor. Rows are independent once the edge is
+ * filtered, so a GPU runs them in parallel; the whole block version below just
+ * walks the rows in order. */
+AV1G_FN void av1g_intra_directional_row(const Av1gIntraJob *job, const int *above,
+                                        const int *left, int pangle,
+                                        int upsample_above, int upsample_left,
+                                        AV1G_GLOBAL av1g_px *dst, int maxv, int i) {
+  const int w = job->w, stride = job->dst_stride;
+  int dx = 0, dy = 0, j;
   if (pangle < 90)
     dx = av1g_tbl_dr_deriv[pangle];
   else if (pangle > 90 && pangle < 180)
@@ -1091,66 +1095,66 @@ AV1G_FN void av1g_intra_directional(const Av1gIntraJob *job, int *above, int *le
     dy = av1g_tbl_dr_deriv[270 - pangle];
 
   if (pangle < 90) {
-    const int max_base = (w + h - 1) << upsample_above;
-    for (i = 0; i < h; ++i) {
-      const int idx = (i + 1) * dx;
-      for (j = 0; j < w; ++j) {
-        const int base = (idx >> (6 - upsample_above)) + (j << upsample_above);
-        const int shift = ((idx << upsample_above) >> 1) & 0x1F;
-        int v;
-        if (base < max_base)
-          v = av1g_round2(above[base] * (32 - shift) + above[base + 1] * shift, 5);
-        else
-          v = above[max_base];
-        dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(v, maxv);
-      }
+    const int max_base = (w + job->h - 1) << upsample_above;
+    const int idx = (i + 1) * dx;
+    for (j = 0; j < w; ++j) {
+      const int base = (idx >> (6 - upsample_above)) + (j << upsample_above);
+      const int shift = ((idx << upsample_above) >> 1) & 0x1F;
+      int v;
+      if (base < max_base)
+        v = av1g_round2(above[base] * (32 - shift) + above[base + 1] * shift, 5);
+      else
+        v = above[max_base];
+      dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(v, maxv);
     }
     return;
   }
   if (pangle > 90 && pangle < 180) {
-    for (i = 0; i < h; ++i) {
-      for (j = 0; j < w; ++j) {
-        int idx = (j << 6) - (i + 1) * dx;
-        int base = idx >> (6 - upsample_above);
-        int v;
-        if (base >= -(1 << upsample_above)) {
-          /* idx is signed and negative here, so the upsampling is a multiply:
-           * shifting a negative value left is undefined in C++17 (and would
-           * only ever be "multiply by 2^n" by accident) */
-          const int shift = ((idx * (1 << upsample_above)) >> 1) & 0x1F;
-          v = av1g_round2(above[base] * (32 - shift) + above[base + 1] * shift, 5);
-        } else {
-          idx = (i << 6) - (j + 1) * dy;
-          base = idx >> (6 - upsample_left);
-          {
-            const int shift = ((idx * (1 << upsample_left)) >> 1) & 0x1F;
-            v = av1g_round2(left[base] * (32 - shift) + left[base + 1] * shift, 5);
-          }
+    for (j = 0; j < w; ++j) {
+      int idx = (j << 6) - (i + 1) * dx;
+      int base = idx >> (6 - upsample_above);
+      int v;
+      if (base >= -(1 << upsample_above)) {
+        /* idx is signed and negative here, so the upsampling is a multiply:
+         * shifting a negative value left is undefined in C++17 (and would
+         * only ever be "multiply by 2^n" by accident) */
+        const int shift = ((idx * (1 << upsample_above)) >> 1) & 0x1F;
+        v = av1g_round2(above[base] * (32 - shift) + above[base + 1] * shift, 5);
+      } else {
+        idx = (i << 6) - (j + 1) * dy;
+        base = idx >> (6 - upsample_left);
+        {
+          const int shift = ((idx * (1 << upsample_left)) >> 1) & 0x1F;
+          v = av1g_round2(left[base] * (32 - shift) + left[base + 1] * shift, 5);
         }
-        dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(v, maxv);
       }
+      dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(v, maxv);
     }
     return;
   }
   if (pangle > 180) {
-    for (i = 0; i < h; ++i) {
-      for (j = 0; j < w; ++j) {
-        const int idx = (j + 1) * dy;
-        const int base = (idx >> (6 - upsample_left)) + (i << upsample_left);
-        const int shift = ((idx << upsample_left) >> 1) & 0x1F;
-        const int v = av1g_round2(left[base] * (32 - shift) + left[base + 1] * shift, 5);
-        dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(v, maxv);
-      }
+    for (j = 0; j < w; ++j) {
+      const int idx = (j + 1) * dy;
+      const int base = (idx >> (6 - upsample_left)) + (i << upsample_left);
+      const int shift = ((idx << upsample_left) >> 1) & 0x1F;
+      const int v = av1g_round2(left[base] * (32 - shift) + left[base + 1] * shift, 5);
+      dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(v, maxv);
     }
     return;
   }
   /* exactly horizontal or vertical */
-  for (i = 0; i < h; ++i) {
-    for (j = 0; j < w; ++j) {
-      const int v = pangle == 90 ? above[j] : left[i];
-      dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(v, maxv);
-    }
+  for (j = 0; j < w; ++j) {
+    const int v = pangle == 90 ? above[j] : left[i];
+    dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(v, maxv);
   }
+}
+
+AV1G_FN void av1g_intra_directional(const Av1gIntraJob *job, int *above, int *left,
+                                    int pangle, int upsample_above, int upsample_left,
+                                    AV1G_GLOBAL av1g_px *dst, int maxv) {
+  for (int i = 0; i < job->h; ++i)
+    av1g_intra_directional_row(job, above, left, pangle, upsample_above,
+                               upsample_left, dst, maxv, i);
 }
 
 /* The smooth predictors: a linear ramp between the two edges. */
@@ -1162,51 +1166,62 @@ AV1G_FN int av1g_sm_weight(int n, int i) {
   return av1g_tbl_sm_w64[i];
 }
 
-AV1G_FN void av1g_intra_smooth(const Av1gIntraJob *job, int *above, int *left, int mode,
-                               AV1G_GLOBAL av1g_px *dst, int maxv) {
-  const int w = job->w, h = job->h, stride = job->dst_stride;
-  int i, j;
-  for (i = 0; i < h; ++i) {
-    for (j = 0; j < w; ++j) {
-      int pred;
-      if (mode == AV1G_PRED_SMOOTH) {
-        const int wy = av1g_sm_weight(h, i), wx = av1g_sm_weight(w, j);
-        pred = wy * above[j] + (256 - wy) * left[h - 1] + wx * left[i] +
-               (256 - wx) * above[w - 1];
-        pred = av1g_round2(pred, 9);
-      } else if (mode == AV1G_PRED_SMOOTH_V) {
-        const int wy = av1g_sm_weight(h, i);
-        pred = av1g_round2(wy * above[j] + (256 - wy) * left[h - 1], 8);
-      } else {
-        const int wx = av1g_sm_weight(w, j);
-        pred = av1g_round2(wx * left[i] + (256 - wx) * above[w - 1], 8);
-      }
-      dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(pred, maxv);
+/* One row of the smooth predictors. */
+AV1G_FN void av1g_intra_smooth_row(const Av1gIntraJob *job, const int *above,
+                                   const int *left, int mode,
+                                   AV1G_GLOBAL av1g_px *dst, int maxv, int i) {
+  const int w = job->w, stride = job->dst_stride;
+  for (int j = 0; j < w; ++j) {
+    int pred;
+    if (mode == AV1G_PRED_SMOOTH) {
+      const int wy = av1g_sm_weight(job->h, i), wx = av1g_sm_weight(w, j);
+      pred = wy * above[j] + (256 - wy) * left[job->h - 1] + wx * left[i] +
+             (256 - wx) * above[w - 1];
+      pred = av1g_round2(pred, 9);
+    } else if (mode == AV1G_PRED_SMOOTH_V) {
+      const int wy = av1g_sm_weight(job->h, i);
+      pred = av1g_round2(wy * above[j] + (256 - wy) * left[job->h - 1], 8);
+    } else {
+      const int wx = av1g_sm_weight(w, j);
+      pred = av1g_round2(wx * left[i] + (256 - wx) * above[w - 1], 8);
     }
+    dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(pred, maxv);
   }
 }
 
-/* Paeth: pick the neighbour the plane through the corner predicts best. */
+/* The smooth predictors: a linear ramp between the two edges. */
+AV1G_FN void av1g_intra_smooth(const Av1gIntraJob *job, int *above, int *left, int mode,
+                               AV1G_GLOBAL av1g_px *dst, int maxv) {
+  for (int i = 0; i < job->h; ++i)
+    av1g_intra_smooth_row(job, above, left, mode, dst, maxv, i);
+}
+
+/* One row of Paeth: pick the neighbour the plane through the corner predicts
+ * best. */
+AV1G_FN void av1g_intra_paeth_row(const Av1gIntraJob *job, const int *above,
+                                  const int *left, AV1G_GLOBAL av1g_px *dst,
+                                  int maxv, int i) {
+  const int w = job->w, stride = job->dst_stride;
+  for (int j = 0; j < w; ++j) {
+    const int base = above[j] + left[i] - above[-1];
+    const int pl = av1g_abs(base - left[i]);
+    const int pt = av1g_abs(base - above[j]);
+    const int ptl = av1g_abs(base - above[-1]);
+    int v;
+    if (pl <= pt && pl <= ptl)
+      v = left[i];
+    else if (pt <= ptl)
+      v = above[j];
+    else
+      v = above[-1];
+    dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(v, maxv);
+  }
+}
+
 AV1G_FN void av1g_intra_paeth(const Av1gIntraJob *job, int *above, int *left,
                               AV1G_GLOBAL av1g_px *dst, int maxv) {
-  const int w = job->w, h = job->h, stride = job->dst_stride;
-  int i, j;
-  for (i = 0; i < h; ++i) {
-    for (j = 0; j < w; ++j) {
-      const int base = above[j] + left[i] - above[-1];
-      const int pl = av1g_abs(base - left[i]);
-      const int pt = av1g_abs(base - above[j]);
-      const int ptl = av1g_abs(base - above[-1]);
-      int v;
-      if (pl <= pt && pl <= ptl)
-        v = left[i];
-      else if (pt <= ptl)
-        v = above[j];
-      else
-        v = above[-1];
-      dst[job->dst_off + i * stride + j] = (av1g_px)av1g_clip_px(v, maxv);
-    }
-  }
+  for (int i = 0; i < job->h; ++i)
+    av1g_intra_paeth_row(job, above, left, dst, maxv, i);
 }
 
 /* The recursive (filter intra) predictor: a 4x2 block at a time, seven
@@ -1267,10 +1282,108 @@ AV1G_FN int av1g_intra_dc(const Av1gIntraJob *job, const int *above, const int *
   }
   return 1 << (job->bitdepth - 1);
 }
+/* The directional edge prep every predictor row shares: the corner fix, the
+ * edge filter and the upsampling decision. Callers must have gathered the
+ * edges first; the whole block version and the per row version below run the
+ * same code, so the two paths cannot drift apart. */
+AV1G_FN void av1g_intra_dir_prep(const Av1gIntraJob *job, int *above, int *left,
+                                 int *pangle, int *upsample_above,
+                                 int *upsample_left, int maxv) {
+  const int w = job->w, h = job->h;
+  *pangle = av1g_tbl_mode_to_angle[job->mode] + job->angle * 3;
+  *upsample_above = 0;
+  *upsample_left = 0;
+  if (job->filter_type < 0) return;
+  const int p = *pangle;
+  if (p == 90 || p == 180) return;
+  if (p > 90 && p < 180 && w + h >= 24) {
+    const int corner = av1g_round2(left[0] * 5 + above[-1] * 6 + above[0] * 5, 4);
+    above[-1] = corner;
+    left[-1] = corner;
+  }
+  if (job->have_above) {
+    const int strength = av1g_edge_strength(w, h, job->filter_type, p - 90);
+    const int num = av1g_min(w, job->max_x - job->x + 1) + (p < 90 ? h : 0) + 1;
+    av1g_edge_filter(above, num, strength);
+  }
+  if (job->have_left) {
+    const int strength = av1g_edge_strength(w, h, job->filter_type, p - 180);
+    const int num = av1g_min(h, job->max_y - job->y + 1) + (p > 180 ? w : 0) + 1;
+    av1g_edge_filter(left, num, strength);
+  }
+  *upsample_above = av1g_edge_upsample_sel(w, h, job->filter_type, p - 90);
+  if (*upsample_above) av1g_edge_upsample(above, w + (p < 90 ? h : 0), maxv);
+  *upsample_left = av1g_edge_upsample_sel(w, h, job->filter_type, p - 180);
+  if (*upsample_left) av1g_edge_upsample(left, h + (p > 180 ? w : 0), maxv);
+}
 
-/* The whole prediction of one transform block. Called once per block, not once
- * per sample: the edge filtering, the recursive predictor and the luma
- * projection of chroma from luma all look at more than one sample. */
+/* One row of intra prediction: predicts row r of the block from its edge.
+ * Every mode is row independent once the edge is filtered, so a GPU runs the
+ * rows of a block in parallel. The two exceptions stay whole block: the
+ * recursive filter intra predictor reads rows it has not written yet, and
+ * chroma from luma averages the whole block's luma projection - row 0 runs
+ * them there and the other rows of such a block have nothing to do. */
+/* forward declaration: the row dispatcher falls back to the whole block
+ * process for the two row dependent modes, which is defined below */
+AV1G_FN void av1g_intra_block(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plane,
+                              AV1G_GLOBAL const unsigned char *palette, int maxv);
+
+AV1G_FN void av1g_intra_row(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plane,
+                            AV1G_GLOBAL const unsigned char *palette, int maxv,
+                            int r) {
+  const int w = job->w;
+  if (job->palette) {
+    /* Palette prediction: a table lookup per sample, no edge at all. */
+    AV1G_GLOBAL const unsigned char *map = palette + job->palette_off;
+    AV1G_GLOBAL av1g_px *out = plane + job->dst_off;
+    for (int j = 0; j < w; ++j)
+      out[r * job->dst_stride + j] =
+          (av1g_px)job->palette_color[map[r * job->palette_stride + j]];
+    return;
+  }
+  if (job->mode == AV1G_PRED_CFL ||
+      (job->filter_intra && job->w >= 4 && job->h >= 2)) {
+    if (r != 0) return;
+    av1g_intra_block(job, plane, palette, maxv);
+    return;
+  }
+
+  int above_buf[AV1G_INTRA_EDGE];
+  int left_buf[AV1G_INTRA_EDGE];
+  int *above = above_buf + AV1G_INTRA_EDGE_OFF;
+  int *left = left_buf + AV1G_INTRA_EDGE_OFF;
+  av1g_intra_edges(job, plane, above, left);
+
+  if (av1g_is_directional(job->mode)) {
+    int pangle, upsample_above, upsample_left;
+    av1g_intra_dir_prep(job, above, left, &pangle, &upsample_above,
+                        &upsample_left, maxv);
+    av1g_intra_directional_row(job, above, left, pangle, upsample_above,
+                               upsample_left, plane, maxv, r);
+    return;
+  }
+  if (job->mode == AV1G_PRED_SMOOTH || job->mode == AV1G_PRED_SMOOTH_V ||
+      job->mode == AV1G_PRED_SMOOTH_H) {
+    av1g_intra_smooth_row(job, above, left, job->mode, plane, maxv, r);
+    return;
+  }
+  if (job->mode == AV1G_PRED_PAETH) {
+    av1g_intra_paeth_row(job, above, left, plane, maxv, r);
+    return;
+  }
+  /* DC: the same flat predictor, recomputed per row (the value is the same). */
+  {
+    const int dc = av1g_intra_dc(job, above, left);
+    AV1G_GLOBAL av1g_px *out = plane + job->dst_off;
+    for (int j = 0; j < w; ++j)
+      out[r * job->dst_stride + j] = (av1g_px)av1g_clip_px(dc, maxv);
+  }
+}
+
+/* The whole prediction of one transform block. Called once per block on the
+ * CPU and OpenCL paths; the CUDA kernel calls av1g_intra_row once per row
+ * instead. The edge filtering, the recursive predictor and the luma projection
+ * of chroma from luma all look at more than one sample. */
 AV1G_FN void av1g_intra_block(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plane,
                               AV1G_GLOBAL const unsigned char *palette, int maxv) {
   int above_buf[AV1G_INTRA_EDGE];
@@ -1347,33 +1460,11 @@ AV1G_FN void av1g_intra_block(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plan
   }
 
   if (av1g_is_directional(job->mode)) {
-    const int pangle = av1g_tbl_mode_to_angle[job->mode] + job->angle * 3;
-    int upsample_above = 0, upsample_left = 0;
-    if (job->filter_type >= 0) {
-      if (pangle != 90 && pangle != 180) {
-        if (pangle > 90 && pangle < 180 && w + h >= 24) {
-          const int corner = av1g_round2(left[0] * 5 + above[-1] * 6 + above[0] * 5, 4);
-          above[-1] = corner;
-          left[-1] = corner;
-        }
-        if (job->have_above) {
-          const int strength = av1g_edge_strength(w, h, job->filter_type, pangle - 90);
-          const int num = av1g_min(w, job->max_x - job->x + 1) + (pangle < 90 ? h : 0) + 1;
-          av1g_edge_filter(above, num, strength);
-        }
-        if (job->have_left) {
-          const int strength = av1g_edge_strength(w, h, job->filter_type, pangle - 180);
-          const int num = av1g_min(h, job->max_y - job->y + 1) + (pangle > 180 ? w : 0) + 1;
-          av1g_edge_filter(left, num, strength);
-        }
-        upsample_above = av1g_edge_upsample_sel(w, h, job->filter_type, pangle - 90);
-        if (upsample_above) av1g_edge_upsample(above, w + (pangle < 90 ? h : 0), maxv);
-        upsample_left = av1g_edge_upsample_sel(w, h, job->filter_type, pangle - 180);
-        if (upsample_left) av1g_edge_upsample(left, h + (pangle > 180 ? w : 0), maxv);
-      }
-    }
-    av1g_intra_directional(job, above, left, pangle, upsample_above, upsample_left, plane,
-                           maxv);
+    int pangle, upsample_above, upsample_left;
+    av1g_intra_dir_prep(job, above, left, &pangle, &upsample_above,
+                        &upsample_left, maxv);
+    av1g_intra_directional(job, above, left, pangle, upsample_above,
+                           upsample_left, plane, maxv);
     return;
   }
 
@@ -1393,7 +1484,6 @@ AV1G_FN void av1g_intra_block(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plan
       for (j = 0; j < w; ++j) out[i * stride + j] = (av1g_px)av1g_clip_px(dc, maxv);
   }
 }
-
 /* inter prediction                                                   */
 /* ------------------------------------------------------------------ */
 

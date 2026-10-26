@@ -51,16 +51,16 @@ __kernel void av1g_k_itx_cols(__global const Av1gItxJob *jobs,
 }
 
 /* --------------------------------------------------------------- prediction */
-/* One work item per block: intra prediction is a whole-block operation,
- * because the edge filtering and the recursive predictor look at more than one
- * sample around the position being predicted. */
-__kernel void av1g_k_intra(__global const Av1gIntraJob *jobs, int njobs,
+/* One work item per row of a block: intra prediction of a row only reads the
+ * block's edge, so the rows of a block run in parallel. The element count per
+ * job is job.h. */
+__kernel void av1g_k_intra(__global const Av1gIntraJob *jobs,
+                           __global const int *joff, int njobs, int total,
                            __global av1g_px *plane,
                            __global const unsigned char *palette, int maxv) {
-  const int j = (int)get_global_id(0);
-  if (j >= njobs) return;
-  Av1gIntraJob job = jobs[j];
-  av1g_intra_block(&job, plane, palette, maxv);
+  AV1G_JOB_LOOKUP(job_idx, row);
+  Av1gIntraJob job = jobs[job_idx];
+  av1g_intra_row(&job, plane, palette, maxv, row);
 }
 
 __kernel void av1g_k_inter(__global const Av1gInterJob *jobs,
