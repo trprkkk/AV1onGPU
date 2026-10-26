@@ -63,10 +63,13 @@ def run(cmd, verbose=False):
 
 def find_tools(build):
     tools = {}
-    for name in ("av1gpu_info", "av1gpu_bench", "av1gpu_decode"):
+    for name in ("av1gpu_info", "av1gpu_bench", "av1gpu_decode", "av1gpu_probe"):
         for candidate in (os.path.join(build, "bin", name),
                           os.path.join(build, name),
-                          os.path.join(ROOT, "build", "bin", name)):
+                          os.path.join(ROOT, "build", "bin", name),
+                          os.path.join(build, "bin", name + ".exe"),
+                          os.path.join(build, name + ".exe"),
+                          os.path.join(ROOT, "build", "bin", name + ".exe")):
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 tools[name] = candidate
                 break
@@ -189,6 +192,26 @@ def collect_streams(fixtures_dirs):
     return streams
 
 
+def stream_needs_yuv16(probe_path, ivf):
+    """True when the stream's samples are deeper than 8 bit.
+
+    The .hash references of those fixtures are over the samples themselves
+    (little endian 16 bit), so the decoder has to write them with --yuv16;
+    CMakeLists.txt carries the same per fixture flags for the ctest run. The
+    bit depth comes from av1gpu_probe's sequence header report, with the
+    fixture names as a fallback for a tool that cannot report it.
+    """
+    fallback = {"aom_10bit_320x240", "aom_444_10bit_320x240", "aom_12bit_320x240",
+                "lr_10bit", "lr_12bit", "palette_10bit"}
+    if not probe_path:
+        return os.path.basename(ivf)[:-4] in fallback
+    code, out, err = run([probe_path, ivf])
+    match = re.search(r"(\d+) bit", out or "")
+    if code != 0 or not match:
+        return os.path.basename(ivf)[:-4] in fallback
+    return int(match.group(1)) > 8
+
+
 def main():
     parser = argparse.ArgumentParser(description="verify the GPU backends on a real device")
     parser.add_argument("--build", default=os.path.join(ROOT, "build"),
@@ -303,8 +326,10 @@ def main():
         print("   %-14s %-8s %-30s %10s %8s  %s"
               % ("stream", "backend", "device", "frames", "ms/frame", "status"))
         for name, ivf, reference, ref_kind in streams:
+            deep_flags = ["--yuv16"] if stream_needs_yuv16(tools.get("av1gpu_probe"), ivf) else []
             for kind in ("cpu",) + tuple(wanted):
                 cmd = [tools["av1gpu_decode"], "--backend", kind, "--device", str(args.device)]
+                cmd += deep_flags
                 if args.stream_frames > 0:
                     cmd += ["--frames", str(args.stream_frames)]
                 cmd.append(ivf)

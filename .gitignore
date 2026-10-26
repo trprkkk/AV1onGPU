@@ -13,3 +13,6 @@ compile_commands.json
 # python
 __pycache__/
 *.pyc
+
+# local verification logs
+gpu_verify_*.log

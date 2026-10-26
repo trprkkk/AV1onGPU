@@ -16,7 +16,12 @@
 #include <string>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/resource.h>
 #endif
 
@@ -32,7 +37,18 @@ double cpu_seconds() {
   return usage.ru_utime.tv_sec + usage.ru_utime.tv_usec * 1e-6 +
          usage.ru_stime.tv_sec + usage.ru_stime.tv_usec * 1e-6;
 #else
-  return 0.0;
+  FILETIME create_time, exit_time, kernel_time, user_time;
+  if (!GetProcessTimes(GetCurrentProcess(), &create_time, &exit_time, &kernel_time,
+                       &user_time)) {
+    return 0.0;
+  }
+  auto as_seconds = [](const FILETIME& ft) {
+    ULARGE_INTEGER value;
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return static_cast<double>(value.QuadPart) * 1e-7; /* 100 ns units */
+  };
+  return as_seconds(user_time) + as_seconds(kernel_time);
 #endif
 }
 

@@ -21,12 +21,14 @@
 #include <string>
 #include <vector>
 
-#include "av1gpu/av1gpu.hpp"
-#include "av1gpu/synthetic.hpp"
-
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <unistd.h>
 #endif
+
+#include "av1gpu/av1gpu.hpp"
+#include "av1gpu/synthetic.hpp"
 
 namespace {
 

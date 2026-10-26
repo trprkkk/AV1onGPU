@@ -15,6 +15,11 @@
 #include "core/backend.hpp"
 #include "test_common.hpp"
 
+/* MSVC does not define M_PI in <cmath> without _USE_MATH_DEFINES */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 using namespace av1gpu;
 using namespace av1gpu::internal;
 

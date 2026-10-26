@@ -13,8 +13,23 @@
 #include <cstdint>
 #include <string>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace av1gpu {
 namespace cuda {
+
+#if defined(_WIN32)
+/* the loader code reads the same on every OS: what dlsym is on POSIX is
+ * GetProcAddress on Windows (dlopen is LoadLibraryA at the call sites) */
+inline void* dlsym(void* handle, const char* name) {
+  return reinterpret_cast<void*>(::GetProcAddress(static_cast<::HMODULE>(handle), name));
+}
+#endif
 
 using CUresult = int;
 using CUdevice = int;

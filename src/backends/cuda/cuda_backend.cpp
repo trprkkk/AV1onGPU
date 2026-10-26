@@ -19,6 +19,9 @@
 #include <vector>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <dlfcn.h>
@@ -1045,7 +1048,10 @@ bool load_driver(Driver* driver, void** library, std::string* error) {
 bool load_nvrtc(Nvrtc* nvrtc, void** library, std::string* error) {
   const char* names[] = {
 #if defined(_WIN32)
-      "nvrtc64_120_0.dll", "nvrtc64_110_0.dll", "nvrtc64_102_0.dll",
+      /* CUDA 12.x keeps the 120_0 DLL name across all minors, 13.x is 130_0
+       * and 11.x bumps per minor (11.2/11.8 = 112_0) */
+      "nvrtc64_130_0.dll", "nvrtc64_120_0.dll", "nvrtc64_112_0.dll",
+      "nvrtc64_111_0.dll", "nvrtc64_110_0.dll", "nvrtc64_102_0.dll",
 #else
       "libnvrtc.so.12", "libnvrtc.so.11.2", "libnvrtc.so.11.1", "libnvrtc.so.11.0",
       "libnvrtc.so.10.2", "libnvrtc.so",
