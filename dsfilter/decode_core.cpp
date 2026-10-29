@@ -531,8 +531,20 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   /* Free the slots this frame refreshes but does not predict from before it is
    * decoded; the frame is allowed to refresh a slot it reads, so those stay.
    * On the pipelined path the release is deferred to this frame's job, because
-   * a queued earlier job may still be about to write into the slot. */
+   * a queued earlier job may still be about to write into the slot.
+   *
+   * A backend slot may be named by several AV1 slots (one picture refreshing
+   * many), so a freed slot is only handed back when this frame was its last
+   * namer - the slot that still names it releases it in its own turn. */
   std::vector<int> deferred_release;
+  auto defer_release = [&](int slot) {
+    if (slot < 0) return;
+    for (int k = 0; k < 8; ++k)
+      if (st->pool_slot[k] == slot) return; /* still named: its owner releases it */
+    for (int held : deferred_release)
+      if (held == slot) return; /* already queued for release */
+    deferred_release.push_back(slot);
+  };
   for (int i = 0; i < 8; ++i) {
     if (!(frame.refresh_frame_flags & (1 << i))) continue;
     bool referenced = false;
@@ -546,7 +558,7 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
     const int freed = st->pool_slot[i];
     st->pool_slot[i] = -1;
     if (pipelined_) {
-      if (freed >= 0) deferred_release.push_back(freed);
+      defer_release(freed);
     } else {
       release_slot(st, decoder_.get(), freed);
     }
@@ -594,7 +606,7 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
       if (!(frame.refresh_frame_flags & (1 << i))) continue;
       const int previous = st->pool_slot[i];
       st->pool_slot[i] = reserved;
-      if (previous >= 0) deferred_release.push_back(previous);
+      if (previous != reserved) defer_release(previous);
     }
 
     PipeJob job;
