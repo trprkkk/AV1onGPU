@@ -12,9 +12,13 @@
  * step size rather than to the index, which is why the three planes can share
  * an index and still have different step sizes.
  *
- * Quantiser matrices (using_qmatrix) are not supported: they scale every
- * coefficient by a value from a table the frame references, and no stream seen
- * so far uses them.
+ * A stream may also request a quantiser matrix (using_qmatrix): every
+ * coefficient is then scaled by a per-position factor from a table the frame
+ * header picks (qm_y for luma, qm_u/qm_v for chroma). The factor is a Q5.5
+ * number, applied as (step * factor + 16) >> 5, so a flat 32 is a no-op.
+ * Matrices only apply to the two-dimensional transform types; identity and
+ * the purely horizontal/vertical ones ignore them. A level of 15 means the
+ * plane uses no matrix at all.
  *
  * The shift is the one part that is easy to get wrong: transforms larger than
  * 32x32 in either direction are coded with a scaled down set of coefficients,
@@ -39,6 +43,7 @@
 #include "frontend/coef_model.hpp"
 #include "frontend/headers.hpp"
 #include "frontend/quant_tables.hpp"
+#include "frontend/qm_tables.hpp"
 #include "frontend/tile_decoder.hpp"
 #include "frontend/tx_size.hpp"
 
@@ -117,6 +122,39 @@ inline PlaneQuant plane_quant(const FrameHeader& frame, int plane, int block_qin
   return quant;
 }
 
+/* The quantiser matrix of a plane at one transform size, or nullptr when the
+ * frame uses none for this plane. `tx` is the adjusted size, so it is at most
+ * 32x32 - larger transforms share the 32x32 matrix (or its transpose-class
+ * rectangle relatives). The level comes from the frame header, 15 meaning
+ * "no matrix". Returns the row-major matrix: entry `r * width + c` scales the
+ * coefficient at row r, column c. */
+inline const uint8_t* qm_matrix(const FrameHeader& frame, int plane, TxSize tx) {
+  static const bool qm_disabled = std::getenv("AV1GPU_NO_QM") != nullptr;
+  if (!frame.using_qmatrix || qm_disabled) return nullptr;
+  const int level = plane == 0 ? frame.qm_y : (plane == 1 ? frame.qm_u : frame.qm_v);
+  if (level >= 15) return nullptr;
+  const int cls = plane == 0 ? 0 : 1;
+  const int lw = tx.lw, lh = tx.lh;
+  if (lw == lh) {
+    switch (lw) {
+      case 0: return tables::kQm4x4[level][cls];
+      case 1: return tables::kQm8x8[level][cls];
+      case 2: return tables::kQm16x16[level][cls];
+      default: return tables::kQm32x32[level][cls];
+    }
+  }
+  if (lw == 3 && lh == 2) return tables::kQm32x16[level][cls];
+  if (lw == 2 && lh == 3) return tables::kQm16x32[level][cls];
+  if (lw == 3 && lh == 1) return tables::kQm32x8[level][cls];
+  if (lw == 1 && lh == 3) return tables::kQm8x32[level][cls];
+  if (lw == 2 && lh == 0) return tables::kQm16x4[level][cls];
+  if (lw == 0 && lh == 2) return tables::kQm4x16[level][cls];
+  if (lw == 2 && lh == 1) return tables::kQm16x8[level][cls];
+  if (lw == 1 && lh == 2) return tables::kQm8x16[level][cls];
+  if (lw == 1 && lh == 0) return tables::kQm8x4[level][cls];
+  return tables::kQm4x8[level][cls]; /* lw == 0 && lh == 1 */
+}
+
 /* A frame's coefficients, dequantised and in raster order.
  *
  * `coefficients` is one pool for the whole frame; each transform block owns
@@ -170,7 +208,24 @@ inline void dequantise_tile(const FrameHeader& frame, int bit_depth, const TileD
       if (transform.eob > 0) {
         const PlaneQuant quant = plane_quant(frame, transform.plane, transform.qindex,
                                              transform.size, bit_depth);
+        /* AV1GPU_DQDBG=x,y: print the steps of the transform at that position */
+        if (std::getenv("AV1GPU_DQDBG") && transform.plane == 0) {
+          int qx = -1, qy = -1;
+          if (std::sscanf(std::getenv("AV1GPU_DQDBG"), "%d,%d", &qx, &qy) == 2 &&
+              transform.x <= qx && qx < transform.x + (4 << adjusted.lw) &&
+              transform.y <= qy && qy < transform.y + (4 << adjusted.lh))
+            std::fprintf(stderr, "DQDBG x=%d y=%d w=%d h=%d qindex=%d dc=%d ac=%d den=%d "
+                                 "eob=%d tx_type=%d off=%zu\n",
+                         transform.x, transform.y, 4 << adjusted.lw, 4 << adjusted.lh,
+                         transform.qindex, quant.dc_step, quant.ac_step, quant.denominator,
+                         transform.eob, transform.tx_type, offset);
+        }
         const ScanOrder scan = coef_scan(adjusted, transform.tx_type);
+        /* The matrix applies only to the 2-D transform types, and never to
+         * the identity (kIdtx and the 1-D types come after it). */
+        const uint8_t* qm = transform.tx_type < coef_tables::kIdtx
+                                ? qm_matrix(frame, transform.plane, adjusted)
+                                : nullptr;
         int32_t* raster = out->coefficients.data() + offset;
         const int count = transform.eob < scan.count ? transform.eob : scan.count;
         for (int i = 0; i < count; ++i) {
@@ -178,7 +233,8 @@ inline void dequantise_tile(const FrameHeader& frame, int bit_depth, const TileD
           if (pos < 0 || pos >= area) continue;
           const int level = tile.levels[transform.level_offset + static_cast<size_t>(i)];
           if (level == 0) continue;
-          const int step = pos == 0 ? quant.dc_step : quant.ac_step;
+          int step = pos == 0 ? quant.dc_step : quant.ac_step;
+          if (qm) step = (step * qm[pos] + 16) >> 5;
           raster[pos] = dequantise_level(level, step, quant.denominator, out->bit_depth);
         }
       }
