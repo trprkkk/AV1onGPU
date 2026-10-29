@@ -38,14 +38,14 @@ filter -> browse to the DLL -> set to *Prefer*.
 ### Registered system-wide (optional)
 
 ```
-regsvr32 /n /i:user av1gpu_dshow.dll     registers, per user (no admin needed)
-regsvr32 av1gpu_dshow.dll                registers for the whole machine (admin)
-regsvr32 /u /n /i:user av1gpu_dshow.dll  unregisters
+regsvr32 av1gpu_dshow.dll                registers (no admin needed; see below)
+regsvr32 /u av1gpu_dshow.dll             unregisters
 ```
 
 `DllRegisterServer` writes the COM class and a FilterMapper2 entry under
 `HKCR`; when that is access denied (no admin) it falls back to
-`HKCU\Software\Classes`, so a per-user registration works without elevation.
+`HKCU\Software\Classes`, so the plain command above registers per user
+without elevation - there is no separate per-user mode.
 After registration the filter shows up by name in every player's filter list
 and in GraphStudioNext / GraphEdit (`DirectShow Filters -> AV1onGPU AV1
 Decoder`, CLSID `{B7E0E1C2-5A3D-4F6B-9C48-2A1D7E5F3B60}`).
