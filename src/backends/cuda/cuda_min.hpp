@@ -86,6 +86,10 @@ struct Nvrtc {
   int (*GetProgramLog)(void*, char*);
   int (*GetPTXSize)(void*, size_t*);
   int (*GetPTX)(void*, char*);
+  /* CUDA 11 and up can hand out the assembled cubin directly, which spares the
+   * driver's PTX JIT - several seconds on a large kernel set. Optional. */
+  int (*GetCUBINSize)(void*, size_t*);
+  int (*GetCUBIN)(void*, char*);
   int (*DestroyProgram)(void**);
 };
 

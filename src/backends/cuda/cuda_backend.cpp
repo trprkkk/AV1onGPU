@@ -1,4 +1,4 @@
-/*
+﻿/*
  * AV1onGPU - CUDA backend
  *
  * Same job arrays as the OpenCL backend, compiled with NVRTC at run time and
@@ -47,6 +47,58 @@ double now_ms() {
 }
 
 inline size_t round_up(size_t v, size_t m) { return ((v + m - 1) / m) * m; }
+
+/* Where compiled kernels are cached. It is data a user can delete at any time,
+ * so a missing or unwritable directory only costs the next build its compile. */
+std::string kernel_cache_dir() {
+#if defined(_WIN32)
+  char path[MAX_PATH] = {0};
+  const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return std::string();
+  const std::string dir = std::string(path) + "\\av1gpu";
+  CreateDirectoryA(dir.c_str(), nullptr);
+  return dir;
+#else
+  const char* home = std::getenv("XDG_CACHE_HOME");
+  std::string dir = home && *home ? std::string(home) : std::string();
+  if (dir.empty()) {
+    const char* h = std::getenv("HOME");
+    if (!h || !*h) return std::string();
+    dir = std::string(h) + "/.cache";
+  }
+  dir += "/av1gpu";
+  mkdir(dir.c_str(), 0700);
+  return dir;
+#endif
+}
+
+bool read_binary(const std::string& path, std::vector<char>* out) {
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return false;
+  std::fseek(f, 0, SEEK_END);
+  const long size = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  if (size <= 0) {
+    std::fclose(f);
+    return false;
+  }
+  out->resize(static_cast<size_t>(size));
+  const size_t got = std::fread(out->data(), 1, out->size(), f);
+  std::fclose(f);
+  if (got != out->size()) {
+    out->clear();
+    return false;
+  }
+  return true;
+}
+
+bool write_binary(const std::string& path, const std::vector<char>& bytes) {
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) return false;
+  const size_t wrote = std::fwrite(bytes.data(), 1, bytes.size(), f);
+  std::fclose(f);
+  return wrote == bytes.size();
+}
 
 using cuda::CUdeviceptr;
 
@@ -1324,12 +1376,45 @@ class CudaBackend final : public Backend {
 
   bool build_module(std::string* error) {
     const std::string& source = kernel_source::cuda();
-    void* program = nullptr;
-    if (nvrtc_.CreateProgram(&program, source.c_str(), "av1gpu.cu", 0, nullptr, nullptr) !=
-        0) {
-      *error = "nvrtcCreateProgram failed";
-      return false;
+    /* NVRTC compiles this kernel set in seconds and the driver's PTX JIT adds
+     * several more, on every launch. The result is a pure function of the
+     * source, the architecture and the toolkit, so cache it next to the user's
+     * other data and load the cached binary when it is there. */
+    const std::string cache_dir = kernel_cache_dir();
+    std::string key;
+    {
+      uint64_t h = 1469598103934665603ull;
+      const auto mix = [&](const char* p, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+          h ^= static_cast<unsigned char>(p[i]);
+          h *= 1099511628211ull;
+        }
+      };
+      mix(source.data(), source.size());
+      char arch_key[64];
+      std::snprintf(arch_key, sizeof(arch_key), "sm %d.%d", compute_major_, compute_minor_);
+      mix(arch_key, std::strlen(arch_key));
+      mix("v2", 2); /* bump when the cache format changes */
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+      key = buf;
     }
+    const std::string cubin_path = cache_dir + "/av1gpu_" + key + ".cubin";
+    const std::string ptx_path = cache_dir + "/av1gpu_" + key + ".ptx";
+
+    /* a cached binary, if one is usable */
+    for (const std::string* path : {&cubin_path, &ptx_path}) {
+      std::vector<char> blob;
+      if (!read_binary(*path, &blob) || blob.empty()) continue;
+      if (driver_.ModuleLoadDataEx(&module_, blob.data(), 0, nullptr, nullptr) ==
+          cuda::CUDA_SUCCESS) {
+        if (options_.verbose) error->append("loaded cached kernels from " + *path + "\n");
+        return true;
+      }
+      /* stale (a driver update can invalidate it): drop it and rebuild */
+      std::remove(path->c_str());
+    }
+
     /* NVRTC spells the minor version as one digit from 5 upwards (8.6 becomes
      * compute_86) and ignores it below that (6.0 becomes compute_60), so the
      * minor is only added when it is at least five - and "compute_100" for a
@@ -1337,7 +1422,6 @@ class CudaBackend final : public Backend {
      * characters. */
     if (compute_major_ <= 0) {
       *error = "the driver reported no compute capability (cuDeviceGetAttribute failed)";
-      nvrtc_.DestroyProgram(&program);
       return false;
     }
     char arch[48];
@@ -1346,40 +1430,80 @@ class CudaBackend final : public Backend {
                     compute_minor_);
     else
       std::snprintf(arch, sizeof(arch), "--gpu-architecture=compute_%d0", compute_major_);
-    /* -default-device: the kernels are a library, not a translation unit with a
-     * main function. */
-    const char* options[] = {arch, "-default-device"};
-    const int rc = nvrtc_.CompileProgram(program, 2, options);
-    size_t log_size = 0;
-    nvrtc_.GetProgramLogSize(program, &log_size);
-    std::string log(log_size + 1, '\0');
-    if (log_size) nvrtc_.GetProgramLog(program, &log[0]);
-    if (rc != 0) {
-      *error = std::string("NVRTC build failed (") + arch + "):\n" + log;
-      nvrtc_.DestroyProgram(&program);
-      return false;
-    }
-    if (options_.verbose) error->append(log);
 
-    size_t ptx_size = 0;
-    if (nvrtc_.GetPTXSize(program, &ptx_size) != 0 || ptx_size == 0) {
-      *error = "NVRTC produced no PTX";
-      nvrtc_.DestroyProgram(&program);
-      return false;
+    void* program = nullptr;
+    std::vector<char> binary;
+    bool is_cubin = false;
+    /* Prefer NVRTC's assembled cubin: the driver loads machine code as it is,
+     * while a PTX module costs its JIT on every launch - the several seconds
+     * the cache exists to avoid. A cubin targets sm_XX, so it needs its own
+     * NVRTC run; the PTX build is only done when there is no cubin to be had. */
+    if (nvrtc_.GetCUBINSize && nvrtc_.GetCUBIN) {
+      if (nvrtc_.CreateProgram(&program, source.c_str(), "av1gpu.cu", 0, nullptr, nullptr) == 0) {
+        char sm_arch[48];
+        if (compute_minor_ >= 5)
+          std::snprintf(sm_arch, sizeof(sm_arch), "--gpu-architecture=sm_%d%d", compute_major_,
+                        compute_minor_);
+        else
+          std::snprintf(sm_arch, sizeof(sm_arch), "--gpu-architecture=sm_%d0", compute_major_);
+        const char* sm_options[] = {sm_arch, "-default-device"};
+        if (nvrtc_.CompileProgram(program, 2, sm_options) == 0) {
+          size_t cubin_size = 0;
+          if (nvrtc_.GetCUBINSize(program, &cubin_size) == 0 && cubin_size > 0) {
+            binary.assign(cubin_size, 0);
+            if (nvrtc_.GetCUBIN(program, binary.data()) == 0) is_cubin = true;
+          }
+        }
+        nvrtc_.DestroyProgram(&program);
+        program = nullptr;
+      }
     }
-    std::vector<char> ptx(ptx_size + 1, 0);
-    if (nvrtc_.GetPTX(program, ptx.data()) != 0) {
-      *error = "NVRTC GetPTX failed";
-      nvrtc_.DestroyProgram(&program);
-      return false;
-    }
-    nvrtc_.DestroyProgram(&program);
 
-    const cuda::CUresult load = driver_.ModuleLoadDataEx(&module_, ptx.data(), 0, nullptr, nullptr);
+    if (!is_cubin) {
+      /* no cubin support (or the sm_ build failed): compile the portable
+       * compute_XX program and take its PTX, which the driver JITs on load */
+      binary.clear();
+      if (nvrtc_.CreateProgram(&program, source.c_str(), "av1gpu.cu", 0, nullptr, nullptr) != 0) {
+        *error = "nvrtcCreateProgram failed";
+        return false;
+      }
+      const char* options[] = {arch, "-default-device"};
+      const int rc = nvrtc_.CompileProgram(program, 2, options);
+      size_t log_size = 0;
+      nvrtc_.GetProgramLogSize(program, &log_size);
+      std::string log(log_size + 1, '\0');
+      if (log_size) nvrtc_.GetProgramLog(program, &log[0]);
+      if (rc != 0) {
+        *error = std::string("NVRTC build failed (") + arch + "):\n" + log;
+        nvrtc_.DestroyProgram(&program);
+        return false;
+      }
+      if (options_.verbose) error->append(log);
+      size_t ptx_size = 0;
+      if (nvrtc_.GetPTXSize(program, &ptx_size) != 0 || ptx_size == 0) {
+        nvrtc_.DestroyProgram(&program);
+        *error = "NVRTC produced no PTX";
+        return false;
+      }
+      binary.assign(ptx_size + 1, 0);
+      if (nvrtc_.GetPTX(program, binary.data()) != 0) {
+        nvrtc_.DestroyProgram(&program);
+        *error = "NVRTC GetPTX failed";
+        return false;
+      }
+      binary.resize(ptx_size);
+      nvrtc_.DestroyProgram(&program);
+      program = nullptr;
+    }
+
+    const cuda::CUresult load =
+        driver_.ModuleLoadDataEx(&module_, binary.data(), 0, nullptr, nullptr);
     if (load != cuda::CUDA_SUCCESS) {
       *error = "cuModuleLoadDataEx failed (" + std::to_string(load) + ") for " + arch;
       return false;
     }
+    /* write it for the next launch (a failure to write is not fatal) */
+    if (!cache_dir.empty()) write_binary(is_cubin ? cubin_path : ptx_path, binary);
     return true;
   }
 
@@ -1650,6 +1774,9 @@ bool load_nvrtc(Nvrtc* nvrtc, void** library, std::string* error) {
   AV1GPU_NV(GetProgramLog, "nvrtcGetProgramLog");
   AV1GPU_NV(GetPTXSize, "nvrtcGetPTXSize");
   AV1GPU_NV(GetPTX, "nvrtcGetPTX");
+  /* optional: the fast path when the installed NVRTC can assemble cubins */
+  *(void**)(&nvrtc->GetCUBINSize) = dlsym(*library, "nvrtcGetCUBINSize");
+  *(void**)(&nvrtc->GetCUBIN) = dlsym(*library, "nvrtcGetCUBIN");
   AV1GPU_NV(DestroyProgram, "nvrtcDestroyProgram");
 #undef AV1GPU_NV
   if (!missing.empty()) {
