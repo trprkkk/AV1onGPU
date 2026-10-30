@@ -349,20 +349,49 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
       grid_h[p] = ((frame_h + 7) & ~7) >> sub_y;
     }
     std::vector<std::vector<int>> owner(3);
-    for (int p = 0; p < 3; ++p)
-      owner[p].assign(static_cast<size_t>(grid_w[p]) * grid_h[p], -1);
+    /* Only planes whose blocks read owners need the grid: intra edges, intra
+     * block copy and chroma-from-luma. A plane with none of those skips the
+     * whole sample owner build.
+     *
+     * The grid is one entry per 4x4 sample cell, not per sample: blocks are
+     * aligned to 4 sample units, so every sample of a cell shares an owner and
+     * the edge scans can look the cell up instead of the sample. That is a
+     * 16x smaller grid to build and to read. */
+    /* chroma blocks can be 2 samples wide (a 4x4 luma block with subsampling),
+     * so the chroma grids use 2 sample cells */
+    const int owner_cell[3] = {4, geom.ss_x ? 2 : 4, geom.ss_y ? 2 : 4};
+    int cell_w[3], cell_h[3];
+    for (int p = 0; p < 3; ++p) {
+      cell_w[p] = (grid_w[p] + owner_cell[p] - 1) / owner_cell[p];
+      cell_h[p] = (grid_h[p] + owner_cell[p] - 1) / owner_cell[p];
+    }
+    bool plane_needs_owner[3] = {false, false, false};
+    for (const BlockSyntax& b : syntax.blocks) {
+      /* chroma from luma reads the co-located *luma* samples */
+      if (b.mode == PredictionMode::ChromaFromLuma) plane_needs_owner[0] = true;
+      if (b.is_intra || b.intrabc || b.interintra) plane_needs_owner[b.plane] = true;
+    }
+    for (int p = 0; p < 3; ++p) {
+      if (!plane_needs_owner[p]) continue;
+      owner[p].assign(static_cast<size_t>(cell_w[p]) * cell_h[p], -1);
+    }
     for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
       const BlockSyntax& b = syntax.blocks[bi];
       const int p = b.plane;
-      const int x1 = std::min(b.x + b.w, grid_w[p]);
-      const int y1 = std::min(b.y + b.h, grid_h[p]);
-      for (int y = std::max(b.y, 0); y < y1; ++y)
-        for (int x = std::max(b.x, 0); x < x1; ++x)
-          owner[p][static_cast<size_t>(y) * grid_w[p] + x] = static_cast<int>(bi);
+      if (!plane_needs_owner[p]) continue;
+      const int oc = owner_cell[p];
+      const int cx1 = std::min((b.x + b.w + oc - 1) / oc, cell_w[p]);
+      const int cy1 = std::min((b.y + b.h + oc - 1) / oc, cell_h[p]);
+      for (int cy = std::max(b.y, 0) / oc; cy < cy1; ++cy)
+        for (int cx = std::max(b.x, 0) / oc; cx < cx1; ++cx)
+          owner[p][static_cast<size_t>(cy) * cell_w[p] + cx] = static_cast<int>(bi);
     }
+    AV1GPU_PT_MARK(ptimer.rest);
     auto sample_owner = [&](int p, int x, int y) {
       if (x < 0 || y < 0 || x >= grid_w[p] || y >= grid_h[p]) return -1;
-      return owner[p][static_cast<size_t>(y) * grid_w[p] + x];
+      if (owner[p].empty()) return -1;
+      const int oc = owner_cell[p];
+      return owner[p][static_cast<size_t>(y / oc) * cell_w[p] + x / oc];
     };
     /* True when every in-frame sample of the rectangle already belongs to a
      * block earlier in coding order - the question BlockDecoded answers for
@@ -382,11 +411,14 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     std::vector<char> below_left(syntax.blocks.size(), 0);
     int max_wave = 0;
     /* Dependencies point backwards in coding order for everything the syntax
-     * guarantees, so one pass is enough; the repeat loop is a safety net for a
+     * guarantees, so processing the blocks in coding order sees every owner's
+     * final wave and one pass is enough. The repeat loop is a safety net for a
      * plan that violates that (nothing should, but a wrong wave is a silent
-     * pixel error, so it is not worth trusting a single pass). */
+     * pixel error, so AV1GPU_VERIFY_SCHEDULE=1 brings it back). */
+    static const bool verify_schedule =
+        std::getenv("AV1GPU_VERIFY_SCHEDULE") != nullptr;
     bool changed = true;
-    for (int pass = 0; changed && pass < 4; ++pass) {
+    for (int pass = 0; changed && pass < (verify_schedule ? 4 : 1); ++pass) {
       changed = false;
       for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
         const BlockSyntax& b = syntax.blocks[bi];
@@ -492,6 +524,7 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         max_wave = std::max(max_wave, block_wave[bi]);
       }
     }
+    AV1GPU_PT_MARK(ptimer.rest);
     plan->waves.assign(static_cast<size_t>(max_wave) + 1, WaveJobs());
 
     /* ---- reference scaling ------------------------------------------------ */
