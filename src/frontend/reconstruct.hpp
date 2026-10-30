@@ -332,7 +332,7 @@ inline CompoundType to_compound_type(int compound) {
  * dequantiser produced. Returns false with a message when the tile contains
  * syntax this stage cannot express. */
 inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
-                           const TileDecodeResult& tile, const DequantisedTile& quant,
+                           const TileDecodeResult& tile, DequantisedTile&& quant,
                            FrameSyntax* out, std::string* error,
                            const ReferenceInfo* refs = nullptr) {
   std::string local;
@@ -433,7 +433,9 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
     return n;
   };
 
-  out->coefficients.assign(quant.coefficients.begin(), quant.coefficients.end());
+  /* The dequantised pool becomes the syntax's coefficient pool outright: it is
+   * a per-frame temporary, so moving it saves a full pool copy per frame. */
+  out->coefficients = std::move(quant.coefficients);
   out->blocks.reserve(tile.blocks.size());
 
   const bool lossless = frame.coded_lossless;

@@ -521,7 +521,7 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
 
   FrameSyntax syntax;
   QueryPerformanceCounter(&pc0);
-  if (!frontend::plan_from_tile(st->seq, frame, decoded, quant, &syntax, error,
+  if (!frontend::plan_from_tile(st->seq, frame, decoded, std::move(quant), &syntax, error,
                                 &reference_info)) {
     return false;
   }

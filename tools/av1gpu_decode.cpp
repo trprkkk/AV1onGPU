@@ -34,6 +34,14 @@
 #include <memory>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+LARGE_INTEGER g_main_start;
 
 #include "av1gpu/av1gpu.hpp"
 #include "core/backend.hpp"
@@ -191,6 +199,7 @@ void report_difference(const Frame& ours, const Frame& ref, const char* label) {
 } /* namespace */
 
 int main(int argc, char** argv) {
+  QueryPerformanceCounter(&g_main_start);
   Options opt;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -282,6 +291,14 @@ int main(int argc, char** argv) {
   backend_options.device_index = opt.device;
   backend_options.allow_cpu_fallback = !opt.require_device;
   std::unique_ptr<Decoder> decoder = Decoder::create(backend_options, &error);
+  {
+    LARGE_INTEGER tc, fq;
+    QueryPerformanceFrequency(&fq);
+    QueryPerformanceCounter(&tc);
+    if (std::getenv("AV1GPU_TIMING"))
+      std::fprintf(stderr, "[timing] backend create: %.2f s\n",
+                   (tc.QuadPart - g_main_start.QuadPart) / double(fq.QuadPart));
+  }
   if (!decoder) {
     std::fprintf(stderr, "av1gpu_decode: no backend: %s\n", error.c_str());
     return 1;
@@ -372,6 +389,13 @@ int main(int argc, char** argv) {
   size_t reference_offset = 0;
   int comparisons = 0, exact = 0;
   size_t hashes_written = 0, hashes_checked = 0, hash_mismatches = 0;
+  double acc_tiles_ms = 0, acc_deq_ms = 0, acc_plan_ms = 0, acc_backend_ms = 0;
+  double acc_emit_ms = 0, acc_rec_ms = 0, acc_filt_ms = 0, acc_rb_ms = 0;
+  double acc_parse_ms = 0, acc_loop_ms = 0;
+  size_t acc_frames = 0;
+  const bool timing = std::getenv("AV1GPU_TIMING") != nullptr;
+  LARGE_INTEGER tf0, tf1, tf0_loop, freq;
+  QueryPerformanceFrequency(&freq);
 
   /* The decoder's own reference pool. AV1 has eight reference slots; each holds
    * a backend pool slot, and - because a show_existing_frame has to output a
@@ -452,6 +476,10 @@ int main(int argc, char** argv) {
   };
 
   for (size_t index = 0; index < units.size(); ++index) {
+    if (timing) {
+      QueryPerformanceCounter(&tf0);
+      tf0_loop = tf0;
+    }
     std::vector<Obu> obus;
     if (!split_obus(units[index].payload.data(), units[index].payload.size(), &obus, &error)) {
       std::fprintf(stderr, "av1gpu_decode: temporal unit %zu: %s\n", index, error.c_str());
@@ -529,9 +557,19 @@ int main(int argc, char** argv) {
       }
 
       TileDecodeResult decoded;
+      if (timing) {
+        QueryPerformanceCounter(&tf1);
+        acc_parse_ms += (tf1.QuadPart - tf0.QuadPart) * 1000.0 / freq.QuadPart;
+        QueryPerformanceCounter(&tf0);
+      }
       const ParseStatus tile_status =
           decode_tiles(seq, frame, &refs, group.tiles.data(), group.tiles.size(), obu.data,
                        obu.size, &decoded, &tile_error);
+      if (timing) {
+        QueryPerformanceCounter(&tf1);
+        acc_tiles_ms += (tf1.QuadPart - tf0.QuadPart) * 1000.0 / freq.QuadPart;
+        QueryPerformanceCounter(&tf0);
+      }
       if (tile_status != ParseStatus::Ok) {
         std::printf("frame %zu: tile: %s\n", index,
                     decoded.stop_reason.empty() ? tile_error.c_str()
@@ -542,6 +580,11 @@ int main(int argc, char** argv) {
 
       DequantisedTile quant;
       dequantise_tile(frame, seq.bit_depth, decoded, &quant);
+      if (timing) {
+        QueryPerformanceCounter(&tf1);
+        acc_deq_ms += (tf1.QuadPart - tf0.QuadPart) * 1000.0 / freq.QuadPart;
+        QueryPerformanceCounter(&tf0);
+      }
 
       /* Which backend slot each of the seven reference types names. The frame
        * header resolves the type to one of the eight AV1 slots (`ref_frame_idx`)
@@ -559,10 +602,14 @@ int main(int argc, char** argv) {
       }
 
       FrameSyntax syntax;
-      if (!plan_from_tile(seq, frame, decoded, quant, &syntax, &error, &reference_info)) {
+      if (!plan_from_tile(seq, frame, decoded, std::move(quant), &syntax, &error, &reference_info)) {
         std::printf("frame %zu: %s\n", index, error.c_str());
         status = 1;
         break;
+      }
+      if (timing) {
+        QueryPerformanceCounter(&tf1);
+        acc_plan_ms += (tf1.QuadPart - tf0.QuadPart) * 1000.0 / freq.QuadPart;
       }
 
       if (const char* dump = std::getenv("AV1GPU_DUMP_BLOCKS")) {
@@ -656,11 +703,16 @@ int main(int argc, char** argv) {
       }
 
       Frame picture;
+      if (timing) QueryPerformanceCounter(&tf0);
       const int slot = decoder->decode_reference(syntax, &picture, &error);
-      if (slot < 0) {
-        std::printf("frame %zu: %s\n", index, error.c_str());
-        status = 1;
-        break;
+      if (timing) {
+        QueryPerformanceCounter(&tf1);
+        acc_backend_ms += (tf1.QuadPart - tf0.QuadPart) * 1000.0 / freq.QuadPart;
+        const DecodeStats& ds = decoder->stats();
+        acc_rec_ms += ds.reconstruct_ms;
+        acc_filt_ms += ds.filter_ms;
+        acc_rb_ms += ds.readback_ms;
+        QueryPerformanceCounter(&tf0);
       }
 
       if (plan_backend) {
@@ -691,13 +743,27 @@ int main(int argc, char** argv) {
                   index, geometry.c_str(), syntax.blocks.size(),
                   decoded.transform_blocks, decoder->stats().waves,
                   decoder->stats().total_ms, frame.show_frame ? "" : " (not shown)");
+      if (timing) {
+        QueryPerformanceCounter(&tf1);
+        acc_loop_ms += (tf1.QuadPart - tf0_loop.QuadPart) * 1000.0 / freq.QuadPart;
+        QueryPerformanceCounter(&tf0_loop);
+      }
       ++decoded_frames;
 
       /* A frame that is not shown is still a reference for the frames that name
        * it; it just never reaches the output. Its picture is displayed later
        * through a show_existing_frame, which is what keeps the output in display
        * order while the decoder runs in coding order. */
-      if (frame.show_frame) emit_picture(picture, syntax.ss_x, syntax.ss_y);
+      if (frame.show_frame) {
+        if (timing) QueryPerformanceCounter(&tf0);
+        emit_picture(picture, syntax.ss_x, syntax.ss_y);
+        if (timing) {
+          QueryPerformanceCounter(&tf1);
+          acc_emit_ms += (tf1.QuadPart - tf0.QuadPart) * 1000.0 / freq.QuadPart;
+          tf0_loop = tf1;
+        }
+      }
+      if (timing) ++acc_frames;
 
       /* Hand the picture to the AV1 slots this frame refreshes. */
       bool kept = false;
@@ -748,5 +814,19 @@ int main(int argc, char** argv) {
     if (hash_mismatches != 0 || hashes_checked != expected_hashes.size()) status = 1;
   }
   std::printf("%zu frame(s) decoded\n", decoded_frames);
+  {
+    LARGE_INTEGER tc;
+    QueryPerformanceCounter(&tc);
+    if (std::getenv("AV1GPU_TIMING"))
+      std::printf("[timing] total wall %.1f s\n",
+                  (tc.QuadPart - g_main_start.QuadPart) / double(freq.QuadPart));
+  }
+  if (acc_frames != 0)
+    std::printf("[timing] parse %.1f  loop %.1f | tiles %.1f ms  dequant %.1f ms  plan %.1f ms  decode_call %.1f ms "
+                "emit %.1f ms | backend: rec %.1f filt %.1f rb %.1f | per frame over %zu frame(s)\n",
+                acc_parse_ms / acc_frames, acc_loop_ms / acc_frames, acc_tiles_ms / acc_frames, acc_deq_ms / acc_frames,
+                acc_plan_ms / acc_frames, acc_backend_ms / acc_frames,
+                acc_emit_ms / acc_frames, acc_rec_ms / acc_frames,
+                acc_filt_ms / acc_frames, acc_rb_ms / acc_frames, acc_frames);
   return status;
 }
