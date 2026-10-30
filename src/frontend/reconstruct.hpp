@@ -330,11 +330,16 @@ inline CompoundType to_compound_type(int compound) {
 
 /* Builds the FrameSyntax of one intra frame from what the tile decoder and the
  * dequantiser produced. Returns false with a message when the tile contains
- * syntax this stage cannot express. */
-inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
-                           const TileDecodeResult& tile, DequantisedTile&& quant,
-                           FrameSyntax* out, std::string* error,
-                           const ReferenceInfo* refs = nullptr) {
+ * syntax this stage cannot express.
+ *
+ * `quant` is taken by rvalue reference: the dequantised pool becomes the
+ * syntax's coefficient pool outright, saving a full pool copy per frame. A
+ * caller that still needs the pool (a test that plans the same tile twice)
+ * gets the copying overload instead. */
+inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& frame,
+                                const TileDecodeResult& tile, DequantisedTile& quant,
+                                FrameSyntax* out, std::string* error,
+                                const ReferenceInfo* refs) {
   std::string local;
   if (!error) error = &local;
   error->clear();
@@ -945,6 +950,26 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
   if (!plan_restoration(seq, frame, tile, out, error)) return false;
 
   return true;
+}
+
+/* Moves the pool: the normal path (the caller is done with it). */
+inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
+                           const TileDecodeResult& tile, DequantisedTile&& quant,
+                           FrameSyntax* out, std::string* error,
+                           const ReferenceInfo* refs = nullptr) {
+  return plan_from_tile_impl(seq, frame, tile, quant, out, error, refs);
+}
+
+/* Keeps the caller's pool: copies it in first. */
+inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
+                           const TileDecodeResult& tile, const DequantisedTile& quant,
+                           FrameSyntax* out, std::string* error,
+                           const ReferenceInfo* refs = nullptr) {
+  DequantisedTile copy;
+  copy.bit_depth = quant.bit_depth;
+  copy.coefficients = quant.coefficients;
+  copy.offsets = quant.offsets;
+  return plan_from_tile_impl(seq, frame, tile, copy, out, error, refs);
 }
 
 } /* namespace frontend */

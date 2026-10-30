@@ -175,6 +175,7 @@ void StreamDecoder::queue_job(PipeJob job, std::string* error) {
   if (pipe_failed_ || quitting_) {
     /* the job will never run: hand its reservation straight back */
     const int slot = job.slot;
+    decoder_->discard_frame_plan(job.frame_plan);
     lk.unlock();
     if (slot >= 0) decoder_->release_reference(slot);
     if (error && error->empty()) *error = notice_;
@@ -223,7 +224,23 @@ void StreamDecoder::run_job(PipeJob* job) {
 
   Frame picture;
   std::string err;
-  if (job->slot >= 0) {
+  if (job->frame_plan && job->slot < 0) {
+    /* a frame nobody keeps has no reserved slot to decode into: drop the plan
+     * and take the ordinary synchronous path */
+    decoder_->discard_frame_plan(job->frame_plan);
+    job->frame_plan = nullptr;
+  }
+  if (job->frame_plan) {
+    /* pre-planned on the demuxer's thread: submit it and read the picture
+     * back here, on the worker */
+    const int slot =
+        decoder_->decode_reference_planned(job->frame_plan, job->slot, &picture, &err);
+    job->frame_plan = nullptr; /* consumed either way */
+    if (slot < 0) {
+      pipe_fail(err.empty() ? "queued frame decode failed" : err);
+      return;
+    }
+  } else if (job->slot >= 0) {
     const int slot = decoder_->decode_reference_reserved(job->syntax, job->slot, &picture, &err);
     if (slot < 0) {
       pipe_fail(err.empty() ? "queued frame decode failed" : err);
@@ -272,8 +289,11 @@ void StreamDecoder::abort_pipe() {
   std::vector<int> orphan_slots;
   {
     std::unique_lock<std::mutex> lk(pipe_mutex_);
-    for (auto& job : jobs_)
+    for (auto& job : jobs_) {
       if (job.slot >= 0) orphan_slots.push_back(job.slot);
+      decoder_->discard_frame_plan(job.frame_plan);
+      job.frame_plan = nullptr;
+    }
     jobs_.clear();
     pipe_cv_.wait(lk, [&] { return !busy_; });
     for (int i = 0; i < 8; ++i) pipe_valid_[i] = false;
@@ -300,6 +320,7 @@ bool StreamDecoder::init(std::string* error) {
     pipelined_ = true;
     decoder_->release_reference(probe);
   }
+  preplan_ = pipelined_ && decoder_->supports_preplanning();
   return true;
 }
 
@@ -609,7 +630,13 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
       if (previous != reserved) defer_release(previous);
     }
 
+    /* Build the frame plan *here*, on the demuxer's thread, so it overlaps the
+     * kernels of the job still running on the worker. The worker then only has
+     * to submit the plan. */
     PipeJob job;
+    if (preplan_) {
+      if (!decoder_->plan_frame(syntax, &job.frame_plan, error)) return false;
+    }
     job.syntax = std::move(syntax);
     job.slot = reserved;
     job.refresh_flags = frame.refresh_frame_flags;

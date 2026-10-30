@@ -631,6 +631,40 @@ class Decoder {
    * backend cannot reserve (the caller then decodes synchronously). */
   virtual int reserve_reference() { return -1; }
 
+  /* The frame planner (the wavefront scheduler and the job arrays) is the
+   * CPU-heavy half of a decode, and it does not touch the backend. A pipelined
+   * caller builds the plan on its own thread - `plan` is an opaque handle owned
+   * by the decoder until it is handed to decode_reference_planned or dropped
+   * with discard_frame_plan - and decodes it on another, so the plan of frame
+   * N+1 overlaps the kernels of frame N. Returns false and fills `error` on
+   * failure; backends that do not support it leave the default, which fails. */
+  virtual bool plan_frame(const FrameSyntax& syntax, void** plan,
+                          std::string* error = nullptr) {
+    (void)syntax;
+    (void)plan;
+    if (error) *error = "pre-planning is not supported";
+    return false;
+  }
+
+  /* Decodes a plan built by plan_frame into `slot` (a reserved reference, or a
+   * negative slot to decode and drop). The plan is consumed either way. */
+  virtual int decode_reference_planned(void* plan, int slot, Frame* out,
+                                       std::string* error = nullptr) {
+    (void)plan;
+    (void)slot;
+    (void)out;
+    if (error) *error = "pre-planned decode is not supported";
+    return -1;
+  }
+
+  /* Drops a plan that will never be decoded. Null is ignored. */
+  virtual void discard_frame_plan(void* plan) { (void)plan; }
+
+  /* True when plan_frame/decode_reference_planned are implemented (the engine
+   * is; a backend wrapper that decodes directly is not). A pipeline only
+   * pre-plans against a decoder that says yes. */
+  virtual bool supports_preplanning() const { return false; }
+
   /* Convenience wrapper: decode and drop the device copy. */
   virtual bool decode(const FrameSyntax& syntax, Frame* out,
                       std::string* error = nullptr);

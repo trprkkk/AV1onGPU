@@ -48,7 +48,10 @@ using Sink = std::function<bool(const std::vector<uint8_t>& nv12, int width,
  * reference bookkeeping, planning - and then hands the finished plan over, so
  * the GPU work of frame N overlaps the CPU prep of frame N+1. */
 struct PipeJob {
-  FrameSyntax syntax;      /* the finished plan */
+  FrameSyntax syntax;      /* the frame syntax the plan was built from */
+  /* Opaque pre-built frame plan (the CPU-heavy scheduler), when the caller
+   * planned on its own thread so it overlaps the previous job's kernels. */
+  void* frame_plan = nullptr;
   int slot = -1;           /* reserved reference slot, or -1 to drop the copy */
   int refresh_flags = 0;   /* AV1 slots this frame hands its picture to */
   bool show_frame = false; /* push the picture through the sink */
@@ -129,6 +132,7 @@ class StreamDecoder {
   std::deque<PipeJob> jobs_;
   static constexpr size_t kPipeDepth = 3;
   bool pipelined_ = false;   /* frames go through the queue */
+  bool preplan_ = false;     /* the decoder can pre-build frame plans */
   bool fallback_used_ = false; /* a failed reservation switched us to sync */
   bool quitting_ = false;    /* worker must exit */
   bool busy_ = false;        /* the worker is inside a job */

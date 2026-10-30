@@ -1,4 +1,4 @@
-﻿/*
+/*
  * AV1onGPU - frame planner and public Decoder
  *
  * Turning a FrameSyntax into GPU work happens here. The interesting part is the
@@ -123,6 +123,48 @@ class EngineDecoder final : public av1gpu::Decoder {
     if (got >= 0) held_slots_.push_back(got);
     return got;
   }
+
+  /* Pipelining: the plan is built here, on the caller's thread, and decoded on
+   * another one. `plan` is a FramePlan the decoder owns until it is consumed
+   * by decode_reference_planned or dropped by discard_frame_plan. */
+  bool plan_frame(const FrameSyntax& syntax, void** plan, std::string* error) override {
+    if (!plan) {
+      if (error) *error = "plan_frame: no output handle";
+      return false;
+    }
+    FramePlan* built = new FramePlan();
+    if (!plan_for(syntax, built, error)) {
+      delete built;
+      return false;
+    }
+    *plan = built;
+    return true;
+  }
+
+  int decode_reference_planned(void* plan, int slot, Frame* out,
+                               std::string* error) override {
+    FramePlan* built = static_cast<FramePlan*>(plan);
+    if (!built) {
+      if (error) *error = "decode_reference_planned: no plan";
+      return -1;
+    }
+    int got = -1;
+    if (slot < 0) {
+      /* no reserved slot: decode it and drop the device copy */
+      const bool ok = backend_->decode(*built, false, out, &got, &stats_, error);
+      delete built;
+      return ok && got >= 0 ? got : -1;
+    }
+    const bool ok = backend_->decode_reserved(*built, slot, out, &got, &stats_, error);
+    delete built;
+    if (!ok) return -1;
+    if (got >= 0) held_slots_.push_back(got);
+    return got;
+  }
+
+  void discard_frame_plan(void* plan) override { delete static_cast<FramePlan*>(plan); }
+
+  bool supports_preplanning() const override { return true; }
 
  private:
   bool plan_for(const FrameSyntax& syntax, FramePlan* plan, std::string* error) {
