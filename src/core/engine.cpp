@@ -1,4 +1,4 @@
-/*
+﻿/*
  * AV1onGPU - frame planner and public Decoder
  *
  * Turning a FrameSyntax into GPU work happens here. The interesting part is the
@@ -25,6 +25,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include "core/backend.hpp"
 
@@ -73,12 +79,32 @@ class EngineDecoder final : public av1gpu::Decoder {
   int reserve_reference() override { return backend_->reserve_reference(); }
 
   int decode_reference(const FrameSyntax& syntax, Frame* out, std::string* error) override {
+    static const bool t_on = std::getenv("AV1GPU_ENGINE_TIME") != nullptr;
+    LARGE_INTEGER e0{}, e1{}, e2{}, ef;
+    if (t_on) {
+      QueryPerformanceFrequency(&ef);
+      QueryPerformanceCounter(&e0);
+    }
     FramePlan plan;
     if (!plan_for(syntax, &plan, error)) return -1;
+    if (t_on) QueryPerformanceCounter(&e1);
 
     int slot = -1;
     if (!backend_->decode(plan, true, out, &slot, &stats_, error)) return -1;
     if (slot >= 0) held_slots_.push_back(slot);
+    if (t_on) {
+      QueryPerformanceCounter(&e2);
+      static double acc_plan = 0, acc_dec = 0;
+      static long n = 0;
+      acc_plan += double(e1.QuadPart - e0.QuadPart) * 1000.0 / double(ef.QuadPart);
+      acc_dec += double(e2.QuadPart - e1.QuadPart) * 1000.0 / double(ef.QuadPart);
+      if (++n % 100 == 0) {
+        std::fprintf(stderr, "[engine-time] plan_for %.1f  backend decode %.1f ms over %ld\n",
+                     acc_plan / n, acc_dec / n, n);
+        acc_plan = acc_dec = 0;
+        n = 0;
+      }
+    }
     return slot;
   }
 
@@ -116,8 +142,30 @@ class EngineDecoder final : public av1gpu::Decoder {
     }
 
     const int coded_width = syntax.coded_width > 0 ? syntax.coded_width : syntax.width;
-    return build_frame_plan(syntax, backend_->prepare(geom, coded_width), options_,
-                            backend_->reference_capacity(), plan, error);
+    static const bool t_on2 = std::getenv("AV1GPU_ENGINE_TIME") != nullptr;
+    LARGE_INTEGER p0{}, p1{}, p2{}, pf2;
+    if (t_on2) {
+      QueryPerformanceFrequency(&pf2);
+      QueryPerformanceCounter(&p0);
+    }
+    const PlanLayout layout = backend_->prepare(geom, coded_width);
+    if (t_on2) QueryPerformanceCounter(&p1);
+    const bool ok = build_frame_plan(syntax, layout, options_,
+                                     backend_->reference_capacity(), plan, error);
+    if (t_on2) {
+      QueryPerformanceCounter(&p2);
+      static double acc_prep = 0, acc_build = 0;
+      static long n2 = 0;
+      acc_prep += double(p1.QuadPart - p0.QuadPart) * 1000.0 / double(pf2.QuadPart);
+      acc_build += double(p2.QuadPart - p1.QuadPart) * 1000.0 / double(pf2.QuadPart);
+      if (++n2 % 100 == 0) {
+        std::fprintf(stderr, "[plan-for] prepare %.1f  build %.1f ms over %ld\n",
+                     acc_prep / n2, acc_build / n2, n2);
+        acc_prep = acc_build = 0;
+        n2 = 0;
+      }
+    }
+    return ok;
   }
 
  public:
@@ -165,6 +213,50 @@ static int resolve_slot(const FrameSyntax& syntax, int ref_id) {
 bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
                       const BackendOptions& options, int reference_capacity,
                       FramePlan* plan, std::string* error) {
+    /* AV1GPU_PLAN_TIME=1: accumulate the section costs into this static table
+     * and print it when the counter is re-set to 0 (the tool prints per run). */
+    struct PlanTimer {
+      double waves = 0, jobs = 0, deblock = 0, cdef = 0, rest = 0;
+      double total = 0;
+      long n = 0, calls = 0;
+      LARGE_INTEGER freq;
+      PlanTimer() { QueryPerformanceFrequency(&freq); }
+      double ms(LARGE_INTEGER a, LARGE_INTEGER b) const {
+        return double(b.QuadPart - a.QuadPart) * 1000.0 / double(freq.QuadPart);
+      }
+      void report(long frame_n) {
+        if (frame_n <= 0) return;
+        std::fprintf(stderr,
+                     "[plan-time] waves %.1f  jobs %.1f  deblock %.1f  cdef %.1f  "
+                     "rest %.1f ms over %ld frame(s)\n",
+                     waves / frame_n, jobs / frame_n, deblock / frame_n,
+                     cdef / frame_n, rest / frame_n, frame_n);
+        waves = jobs = deblock = cdef = rest = 0;
+        n = 0;
+      }
+      void tick() {
+        if (++n % 100 == 0) report(100);
+      }
+    };
+    static PlanTimer ptimer;
+    static const bool want_ptime = std::getenv("AV1GPU_PLAN_TIME") != nullptr;
+    LARGE_INTEGER pt0{};
+    if (want_ptime) QueryPerformanceCounter(&pt0);
+    const LARGE_INTEGER pt_entry = pt0;
+#define AV1GPU_PT_MARK(acc)                                                    \
+    do {                                                                       \
+      if (want_ptime) {                                                        \
+        LARGE_INTEGER pt1_;                                                    \
+        QueryPerformanceCounter(&pt1_);                                        \
+        const double ptspan = ptimer.ms(pt0, pt1_);                            \
+        (acc) += ptspan;                                                       \
+        if (ptimer.calls == 50)                                                \
+          std::fprintf(stderr, "[span] +%.3f ms at line %d\n", ptspan,         \
+                       __LINE__);                                              \
+        pt0.QuadPart = pt1_.QuadPart;                                          \
+        ptimer.tick();                                                         \
+      }                                                                        \
+    } while (0)
     FrameGeometry geom;
     geom.width = syntax.width;
     geom.height = syntax.height;
@@ -202,16 +294,13 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
           coef_size = std::max(coef_size, end);
       }
     }
-    plan->coefficients.assign(coef_size + 64, 0);
-    if (!syntax.coefficients.empty())
-      std::memcpy(plan->coefficients.data(), syntax.coefficients.data(),
-                  std::min(plan->coefficients.size(), syntax.coefficients.size()) *
-                      sizeof(int32_t));
-    plan->residual.assign(residual_size + 64, 0);
-    if (!syntax.residual.empty())
-      std::memcpy(plan->residual.data(), syntax.residual.data(),
-                  std::min(plan->residual.size(), syntax.residual.size()) *
-                      sizeof(int32_t));
+    /* The syntax's pools become the plan's pools. They are per-frame data the
+     * caller does not need again, but the interface takes the syntax by
+     * const reference, so this is one copy, not a zero fill plus a copy. */
+    plan->coefficients = syntax.coefficients;
+    plan->coefficients.resize(coef_size + 64, 0);
+    plan->residual = syntax.residual;
+    plan->residual.resize(residual_size + 64, 0);
     /* The palette maps are one byte per sample and indexed by the block that
      * codes them, so the pool is copied as it is. The trailing slack keeps a
      * backend's buffer allocation non-zero for a frame without a palette. */
@@ -219,6 +308,7 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     plan->palette_map.resize(plan->palette_map.size() + 8, 0);
 
     /* ---- reference slots -------------------------------------------------- */
+    AV1GPU_PT_MARK(ptimer.waves);
     for (int i = 0; i < 2; ++i) {
       plan->ref_slot[i] = -1;
       if (i < static_cast<int>(syntax.reference_slots.size())) {
@@ -228,6 +318,7 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     }
 
     /* ---- wavefront schedule ---------------------------------------------- */
+    AV1GPU_PT_MARK(ptimer.rest);
     /* Every block has to run after the blocks that own the samples it reads.
      * That is a property of the *reconstruction*, not of the syntax: a block
      * may read samples of a block that comes later in coding order (the
@@ -425,6 +516,7 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     }
 
     /* ---- jobs ------------------------------------------------------------- */
+    AV1GPU_PT_MARK(ptimer.waves);
     /* The transform scratch is handed out in job order, one w * h block per
      * job. Two jobs never share a region, so the passes of a wave stay
      * independent even when the coefficient areas are smaller. */
@@ -671,6 +763,7 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     }
 
     /* ---- deblock ---------------------------------------------------------- */
+    AV1GPU_PT_MARK(ptimer.jobs);
     for (const DeblockEdge& e : syntax.deblock) {
       Av1gDeblockJob job;
       std::memset(&job, 0, sizeof(job));
@@ -691,6 +784,7 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     }
 
     /* ---- CDEF -------------------------------------------------------------- */
+    AV1GPU_PT_MARK(ptimer.deblock);
     for (const CdefBlock& c : syntax.cdef) {
       Av1gCdefJob job;
       std::memset(&job, 0, sizeof(job));
@@ -858,6 +952,17 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     }
 
     plan->blocks = static_cast<int>(syntax.blocks.size());
+    AV1GPU_PT_MARK(ptimer.cdef);
+    if (want_ptime) {
+      LARGE_INTEGER ptend;
+      QueryPerformanceCounter(&ptend);
+      ptimer.total += ptimer.ms(pt_entry, ptend);
+      if (++ptimer.calls % 100 == 0) {
+        std::fprintf(stderr, "[build-total] %.1f ms over 100\n", ptimer.total / 100.0);
+        ptimer.total = 0;
+        ptimer.calls = 0;
+      }
+    }
     return true;
 }
 
