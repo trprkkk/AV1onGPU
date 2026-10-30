@@ -3242,10 +3242,41 @@ AV1G_HOST_FN void av1g_nv12_block(const Av1gNv12Job *job, const av1g_px *y_plane
                                   const av1g_px *u_plane, const av1g_px *v_plane,
                                   unsigned char *dst) {
   const int ch = (job->h + (1 << job->ss_y) - 1) >> job->ss_y;
+  const int cw = (job->w + (1 << job->ss_x) - 1) >> job->ss_x;
+  const int shift = job->bitdepth - 8;
   int row, x;
-  for (row = 0; row < job->h + ch; ++row)
-    for (x = 0; x < job->pitch; ++x)
-      dst[row * job->pitch + x] = av1g_nv12_px(job, y_plane, u_plane, v_plane, x, row);
+  /* The host pack is on the playback path (every shown frame is packed into
+   * NV12), so it walks the rows directly instead of evaluating av1g_nv12_px()
+   * - with its per sample clamp and interleave branches - for each of
+   * `pitch * (h + ch)` bytes. Padding is zero, the same bytes the per sample
+   * kernel produces. */
+  for (row = 0; row < job->h; ++row) {
+    const av1g_px *src = y_plane + job->y_off + row * job->y_stride;
+    unsigned char *d = dst + row * job->pitch;
+    if (shift == 0) {
+      for (x = 0; x < job->w; ++x) d[x] = (unsigned char)src[x];
+    } else {
+      for (x = 0; x < job->w; ++x) d[x] = (unsigned char)(src[x] >> shift);
+    }
+    for (x = job->w; x < job->pitch; ++x) d[x] = 0;
+  }
+  for (row = 0; row < ch; ++row) {
+    const av1g_px *u = u_plane + job->u_off + row * job->c_stride;
+    const av1g_px *v = v_plane + job->v_off + row * job->c_stride;
+    unsigned char *d = dst + (job->h + row) * job->pitch;
+    if (shift == 0) {
+      for (x = 0; x < cw; ++x) {
+        d[2 * x] = (unsigned char)u[x];
+        d[2 * x + 1] = (unsigned char)v[x];
+      }
+    } else {
+      for (x = 0; x < cw; ++x) {
+        d[2 * x] = (unsigned char)(u[x] >> shift);
+        d[2 * x + 1] = (unsigned char)(v[x] >> shift);
+      }
+    }
+    for (x = 2 * cw; x < job->pitch; ++x) d[x] = 0;
+  }
 }
 
 #endif

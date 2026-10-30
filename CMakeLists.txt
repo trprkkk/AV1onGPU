@@ -165,9 +165,17 @@ if(AV1GPU_BUILD_TOOLS)
     set_target_properties(${tool} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
   endforeach()
   # the quartz graph-build reproduction harness touches real DirectShow
+  # the daily car chase clips montage: real coupling here, but the batch spirit
   if(TARGET av1gpu_quartz)
     target_link_libraries(av1gpu_quartz PRIVATE ole32 strmiids uuid)
   endif()
+
+  # the filter's pipeline through the real decode core (no DirectShow)
+  add_executable(av1gpu_pipebench tools/av1gpu_pipebench.cpp dsfilter/decode_core.cpp)
+  target_link_libraries(av1gpu_pipebench PRIVATE av1gpu)
+  target_include_directories(av1gpu_pipebench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  set_target_properties(av1gpu_pipebench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
 
 if(AV1GPU_BUILD_TESTS)
