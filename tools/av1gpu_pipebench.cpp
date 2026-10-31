@@ -56,6 +56,7 @@ int main(int argc, char** argv) {
   size_t pitch = 4096;
   std::string backend = "auto";
   int device = 0;
+  bool copy_sink = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const auto next = [&](const char* fallback) -> const char* {
@@ -69,6 +70,8 @@ int main(int argc, char** argv) {
       device = std::atoi(next("0"));
     } else if (arg == "--pitch") {
       pitch = static_cast<size_t>(std::atoi(next("4096")));
+    } else if (arg == "--copy-sink") {
+      copy_sink = true;
     } else if (arg.size() && arg[0] == '-') {
       std::fprintf(stderr, "av1gpu_pipebench: unknown option %s\n", arg.c_str());
       return 2;
@@ -78,7 +81,7 @@ int main(int argc, char** argv) {
   }
   if (path.empty()) {
     std::fprintf(stderr, "usage: av1gpu_pipebench CLIP.ivf [--frames N] "
-                         "[--backend B] [--device N] [--pitch N]\n");
+                         "[--backend B] [--device N] [--pitch N] [--copy-sink]\n");
     return 2;
   }
 
@@ -126,12 +129,19 @@ int main(int argc, char** argv) {
               decoder.device().name.c_str());
 
   size_t shown = 0;
+  /* A renderer does not just count frames: it copies the NV12 into its own
+   * allocator buffer. --copy-sink adds that copy, so the number is closer to
+   * what a player sees. */
+  std::vector<uint8_t> renderer;
   av1gpu::dsfilter::StreamDecoder::Sink sink =
       [&](const std::vector<uint8_t>& nv12, int w, int h, std::string* sink_error) -> bool {
-    (void)nv12;
     (void)w;
     (void)h;
     (void)sink_error;
+    if (copy_sink) {
+      renderer.resize(nv12.size());
+      std::memcpy(renderer.data(), nv12.data(), nv12.size());
+    }
     ++shown;
     return true;
   };
