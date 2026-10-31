@@ -216,8 +216,20 @@ class CudaBackend final : public Backend {
   }
 
   PlanLayout prepare(const FrameGeometry& geometry, int coded_width) override {
+    /* A pipelined caller plans on its own thread while the worker is inside
+     * the driver. Touching the context from here - CtxSetCurrent, let alone
+     * an allocation - serialises the two threads on the driver, which is what
+     * made the pipeline cost the sum of its halves instead of the larger one.
+     * The layout is pure arithmetic and the buffers are sized for the first
+     * frame, so the steady state takes no driver call at all. */
+    const PlanLayout cached =
+        make_plan_layout(geometry, coded_width, 64);
+    if (ready_ && cached.buffer_size == layout_.buffer_size &&
+        cached.stride[0] == layout_.stride[0] && cached.stride[1] == layout_.stride[1] &&
+        cached.stride[2] == layout_.stride[2])
+      return layout_;
     ensure_context(nullptr); /* prepare cannot report an error; decode will */
-    const PlanLayout g = make_plan_layout(geometry, coded_width, 64);
+    const PlanLayout g = cached;
     const size_t size = g.buffer_size;
     layout_ = g;
     /* prepare() has no way to report an error, so record the failure and let
@@ -238,6 +250,7 @@ class CudaBackend final : public Backend {
       upload_tables();
       tables_uploaded_ = true;
     }
+    ready_ = !alloc_failed_;
     return g;
   }
 
@@ -1678,6 +1691,8 @@ class CudaBackend final : public Backend {
   size_t job_cap_ = 0, pref_cap_ = 0, pref_b_cap_ = 0;
   size_t lr_curr_cap_ = 0, lr_cdef_cap_ = 0, lr_prev_up_cap_ = 0;
   bool alloc_failed_ = false;
+  /* set once the first prepare() has sized the buffers for this geometry */
+  bool ready_ = false;
   std::vector<uint16_t> staging_;
   bool slots_[kReferenceSlots] = {};
   int last_slot_ = -1;

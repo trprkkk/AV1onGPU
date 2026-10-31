@@ -366,7 +366,13 @@ bool StreamDecoder::init(std::string* error) {
     pipelined_ = true;
     decoder_->release_reference(probe);
   }
-  preplan_ = pipelined_ && decoder_->supports_preplanning();
+  /* Building the plan on the demuxer's thread sounds like free parallelism,
+   * but in the filter that thread is the one parsing and planning the frame,
+   * and moving the scheduler there made it the bottleneck: 25.7 fps with
+   * pre-planning against 28.0 without. The worker is the thread with slack,
+   * so the planner stays with it unless asked otherwise. */
+  preplan_ = pipelined_ && decoder_->supports_preplanning() &&
+             std::getenv("AV1GPU_DS_PREPLAN") != nullptr;
   return true;
 }
 
@@ -553,7 +559,8 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
     }
   };
   static Stage st_tiles{"tiles"}, st_deq{"dequantise"}, st_plan{"plan"},
-               st_gpu{"gpu_decode"}, st_nv12{"nv12_pack"};
+               st_gpu{"gpu_decode"}, st_nv12{"nv12_pack"}, st_preplan{"preplan"},
+               st_queue{"queue_wait"}, st_refresh{"refpool"};
   LARGE_INTEGER pc0, pc1;
 
   QueryPerformanceCounter(&pc0);
@@ -590,8 +597,11 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
    * run. It must come after the loop above, because a frame is allowed to
    * reference a slot it also refreshes, and the refresh would then overwrite
    * the data the loop still needs. */
+  QueryPerformanceCounter(&pc0);
   frontend::refresh_ref_pool(frame, &st->refs, decoded.ref_mvs, decoded.cdf,
                              decoded.seg_map);
+  QueryPerformanceCounter(&pc1);
+  st_refresh.add(perf.ms(pc0, pc1));
 
   FrameSyntax syntax;
   QueryPerformanceCounter(&pc0);
@@ -688,7 +698,11 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
      * to submit the plan. */
     PipeJob job;
     if (preplan_) {
-      if (!decoder_->plan_frame(syntax, &job.frame_plan, error)) return false;
+      QueryPerformanceCounter(&pc0);
+      const bool planned = decoder_->plan_frame(syntax, &job.frame_plan, error);
+      QueryPerformanceCounter(&pc1);
+      st_preplan.add(perf.ms(pc0, pc1));
+      if (!planned) return false;
     }
     job.syntax = std::move(syntax);
     job.slot = reserved;
@@ -697,7 +711,10 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
     job.pitch = pitch;
     job.sink = sink;
     job.release_slots = std::move(deferred_release);
+    QueryPerformanceCounter(&pc0);
     queue_job(std::move(job), error);
+    QueryPerformanceCounter(&pc1);
+    st_queue.add(perf.ms(pc0, pc1));
     return true;
   }
 

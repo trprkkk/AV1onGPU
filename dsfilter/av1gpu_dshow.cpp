@@ -1235,6 +1235,8 @@ HRESULT OutputPin::decide_allocator(IPin* peer) {
   }
   allocator_ = allocator;
   sink_ = sink;
+  debug_log("output allocator: %ld buffer(s) of %ld bytes, align %ld, prefix %ld",
+            actual.cBuffers, actual.cbBuffer, actual.cbAlign, actual.cbPrefix);
   return S_OK;
 }
 
