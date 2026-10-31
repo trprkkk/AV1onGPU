@@ -153,6 +153,7 @@ if(AV1GPU_BUILD_DSFILTER)
   target_compile_definitions(av1gpu_dshow PRIVATE _CRT_SECURE_NO_WARNINGS)
   set_target_properties(av1gpu_dshow PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+  target_link_options(av1gpu_dshow PRIVATE "/MAP:${CMAKE_BINARY_DIR}/av1gpu_dshow.map")
 endif()
 
 # ---------------------------------------------------------------------------
