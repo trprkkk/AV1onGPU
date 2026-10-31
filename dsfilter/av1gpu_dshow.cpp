@@ -1309,29 +1309,54 @@ HRESULT OutputPin::EnumMediaTypes(IEnumMediaTypes** out) {
 HRESULT OutputPin::deliver(const std::vector<uint8_t>& nv12, int width, int height,
                            REFERENCE_TIME start, REFERENCE_TIME stop,
                            bool discontinuity) {
-  if (!connected()) return VFW_E_NOT_CONNECTED;
-  const size_t want = nv12_frame_bytes(stride_, height_);
-  if (nv12.size() < want || width != width_ || height != height_) {
+  /* The pipeline's worker delivers from its own thread. The allocator and the
+   * sink belong to the connection, which Disconnect tears down - possibly
+   * while this frame is in flight, when the graph is going away. Grab the
+   * objects under the filter lock and keep them referenced for the duration,
+   * so a concurrent Disconnect can never free what we are about to use (that
+   * was the heap corruption MPC-HC reported on exit). */
+  IMemAllocator* allocator = nullptr;
+  IMemInputPin* sink = nullptr;
+  int w = 0, h = 0, s = 0;
+  {
+    Hold hold(filter_->lock());
+    if (!connected()) return VFW_E_NOT_CONNECTED;
+    allocator = allocator_;
+    sink = sink_;
+    allocator->AddRef();
+    sink->AddRef();
+    w = width_;
+    h = height_;
+    s = stride_;
+  } /* the renderer's Receive may block for a frame time; do not hold the lock */
+
+  const size_t want = nv12_frame_bytes(s, h);
+  if (nv12.size() < want || width != w || height != h) {
     debug_log("frame geometry %dx%d does not match the output type %dx%d; dropped",
-              width, height, width_, height_);
+              width, height, w, h);
+    allocator->Release();
+    sink->Release();
     return S_FALSE; /* skip the frame, keep playing */
   }
   IMediaSample* sample = nullptr;
-  HRESULT hr = allocator_->GetBuffer(&sample, nullptr, nullptr, 0);
-  if (FAILED(hr)) return hr;
-  BYTE* buffer = nullptr;
-  hr = sample->GetPointer(&buffer);
+  HRESULT hr = allocator->GetBuffer(&sample, nullptr, nullptr, 0);
   if (SUCCEEDED(hr)) {
-    CopyMemory(buffer, nv12.data(), want);
-    sample->SetActualDataLength(static_cast<long>(want));
-    sample->SetTime(&start, &stop);
-    sample->SetMediaTime(nullptr, nullptr);
-    sample->SetSyncPoint(TRUE);
-    sample->SetDiscontinuity(discontinuity ? TRUE : FALSE);
-    sample->SetPreroll(FALSE);
-    hr = sink_->Receive(sample);
+    BYTE* buffer = nullptr;
+    hr = sample->GetPointer(&buffer);
+    if (SUCCEEDED(hr)) {
+      CopyMemory(buffer, nv12.data(), want);
+      sample->SetActualDataLength(static_cast<long>(want));
+      sample->SetTime(&start, &stop);
+      sample->SetMediaTime(nullptr, nullptr);
+      sample->SetSyncPoint(TRUE);
+      sample->SetDiscontinuity(discontinuity ? TRUE : FALSE);
+      sample->SetPreroll(FALSE);
+      hr = sink->Receive(sample);
+    }
+    sample->Release();
   }
-  sample->Release();
+  allocator->Release();
+  sink->Release();
   return hr;
 }
 
