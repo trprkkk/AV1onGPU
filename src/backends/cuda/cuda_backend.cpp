@@ -848,17 +848,23 @@ class CudaBackend final : public Backend {
     /* DEBUG: prep vs launch vs gpu wait split */
     {
       static double acc_prep = 0, acc_launch = 0, acc_sync = 0, acc_gpu = 0;
+      static double worst_prep = 0, worst_launch = 0, worst_sync = 0;
       static long n2 = 0;
-      acc_prep += t_prep - t0; acc_launch += t_launch_end - t_prep;
-      acc_sync += t_sync_end - t_launch_end; acc_gpu += gpu_ms > 0 ? gpu_ms : 0;
+      const double d_prep = t_prep - t0, d_launch = t_launch_end - t_prep,
+                   d_sync = t_sync_end - t_launch_end;
+      acc_prep += d_prep; acc_launch += d_launch;
+      acc_sync += d_sync; acc_gpu += gpu_ms > 0 ? gpu_ms : 0;
+      if (d_prep > worst_prep) worst_prep = d_prep;
+      if (d_launch > worst_launch) worst_launch = d_launch;
+      if (d_sync > worst_sync) worst_sync = d_sync;
       ++n2;
       if (n2 % 50 == 0) {
-        char msg[160];
+        char msg[200];
         std::snprintf(msg, sizeof(msg),
-                      "perf wave prep %.1f, launch %.1f, gpuwait %.1f, "
-                      "gpu kernel %.1f ms over %ld",
-                      acc_prep / n2, acc_launch / n2, acc_sync / n2,
-                      acc_gpu / n2, n2);
+                      "perf wave prep %.1f (w %.1f), launch %.1f (w %.1f), gpuwait %.1f "
+                      "(w %.1f), gpu kernel %.1f ms over %ld",
+                      acc_prep / n2, worst_prep, acc_launch / n2, worst_launch,
+                      acc_sync / n2, worst_sync, acc_gpu / n2, n2);
         char path[MAX_PATH];
         if (GetTempPathA(MAX_PATH, path)) {
           strncat_s(path, "av1gpu_ds.log", _TRUNCATE);
@@ -870,6 +876,9 @@ class CudaBackend final : public Backend {
             std::fclose(f);
           }
         }
+        acc_prep = acc_launch = acc_sync = acc_gpu = 0;
+        worst_prep = worst_launch = worst_sync = 0;
+        n2 = 0;
       }
     }
     } /* legacy/parallel wave path */

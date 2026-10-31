@@ -14,6 +14,13 @@
 #include <windows.h>
 
 void debug_log(const char* fmt, ...);
+
+inline bool ds_debug_enabled() {
+  char flag[8] = {0};
+  const DWORD n = GetEnvironmentVariableA("AV1GPU_DS_DEBUG", flag, sizeof(flag));
+  return n > 0 && n < sizeof(flag) && flag[0] != '0';
+}
+
 void ds_debug_log(const char* fmt, ...) {
   static const bool enabled = [] {
     char flag[8] = {0};
@@ -202,6 +209,15 @@ void StreamDecoder::worker_loop() {
 }
 
 void StreamDecoder::run_job(PipeJob* job) {
+  /* AV1GPU_DS_DEBUG=1 also reports how long each queued job took on the
+   * worker: a hitch in playback shows up here as a spike long before the
+   * average moves. */
+  LARGE_INTEGER j0{}, j1{}, jf{};
+  const bool jtimed = ds_debug_enabled();
+  if (jtimed) {
+    QueryPerformanceFrequency(&jf);
+    QueryPerformanceCounter(&j0);
+  }
   if (job->show_existing) {
     Frame picture;
     bool valid = false;
@@ -224,6 +240,8 @@ void StreamDecoder::run_job(PipeJob* job) {
 
   Frame picture;
   std::string err;
+  LARGE_INTEGER b0{}, b1{};
+  if (jtimed) QueryPerformanceCounter(&b0);
   if (job->frame_plan && job->slot < 0) {
     /* a frame nobody keeps has no reserved slot to decode into: drop the plan
      * and take the ordinary synchronous path */
@@ -254,6 +272,21 @@ void StreamDecoder::run_job(PipeJob* job) {
   }
   decoded_.fetch_add(1, std::memory_order_relaxed);
 
+  if (jtimed) {
+    QueryPerformanceCounter(&b1);
+    static double acc_b = 0, worst_b = 0;
+    static long nb = 0;
+    const double ms = double(b1.QuadPart - b0.QuadPart) * 1000.0 / double(jf.QuadPart);
+    acc_b += ms;
+    if (ms > worst_b) worst_b = ms;
+    if (++nb % 50 == 0) {
+      ds_debug_log("perf worker decode: avg %.1f, worst %.1f ms over %ld",
+                   acc_b / nb, worst_b, nb);
+      acc_b = worst_b = 0;
+      nb = 0;
+    }
+  }
+
   if (job->show_frame && !emit(picture, job->pitch, job->sink, &err)) {
     pipe_fail(err);
     return;
@@ -271,6 +304,19 @@ void StreamDecoder::run_job(PipeJob* job) {
   /* every job queued before this one has finished, so slots dropped at plan
    * time are safe to hand back now */
   for (int slot : job->release_slots) decoder_->release_reference(slot);
+  if (jtimed) {
+    QueryPerformanceCounter(&j1);
+    static double acc = 0, worst = 0;
+    static long n = 0;
+    const double ms = double(j1.QuadPart - j0.QuadPart) * 1000.0 / double(jf.QuadPart);
+    acc += ms;
+    if (ms > worst) worst = ms;
+    if (++n % 50 == 0) {
+      ds_debug_log("perf worker job: avg %.1f, worst %.1f ms over %ld", acc / n, worst, n);
+      acc = worst = 0;
+      n = 0;
+    }
+  }
 }
 
 void StreamDecoder::finish() {

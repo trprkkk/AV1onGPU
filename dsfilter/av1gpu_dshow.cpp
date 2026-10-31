@@ -35,6 +35,7 @@
 #include <dvdmedia.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -635,18 +636,27 @@ class Av1GpuFilter : public IBaseFilter {
   HRESULT __stdcall Stop() override {
     Hold hold(lock_);
     state_ = State_Stopped;
+    /* The pipeline's worker delivers on its own thread. Nothing may reach the
+     * renderer after this point: the graph is about to decommit the allocator
+     * and tear the peer down, and a queued job would deliver into a filter
+     * that is already going away (that was the exit crash). Disable delivery,
+     * wait for the worker to finish whatever it holds, then decommit. */
+    deliver_enabled_.store(false);
+    if (core_) core_->finish();
     output_.on_deactivate();
     return S_OK;
   }
   HRESULT __stdcall Pause() override {
     Hold hold(lock_);
     if (state_ == State_Stopped) state_ = State_Paused;
+    deliver_enabled_.store(true);
     output_.on_activate();
     return S_OK;
   }
   HRESULT __stdcall Run(REFERENCE_TIME) override {
     Hold hold(lock_);
     if (state_ != State_Stopped) state_ = State_Running;
+    deliver_enabled_.store(true);
     return S_OK;
   }
   HRESULT __stdcall GetState(DWORD ms_timeout, FILTER_STATE* state) override {
@@ -738,6 +748,9 @@ class Av1GpuFilter : public IBaseFilter {
    * connect call would slow every graph build down and break the ones that
    * never run. */
   bool ensure_core(std::string* error);
+  /* true while frames may be delivered: false from Stop until the next
+   * Pause/Run, so a job the worker still holds cannot touch a dying graph */
+  bool delivering() const { return deliver_enabled_.load(); }
   StreamDecoder* core() {
     Hold hold(lock_);
     return core_.get();
@@ -750,6 +763,9 @@ class Av1GpuFilter : public IBaseFilter {
   IReferenceClock* clock_ = nullptr;
   IFilterGraph* graph_ = nullptr;
   wchar_t name_[128] = {0};
+  /* false while stopped: a job the worker still holds must not deliver into a
+   * graph that is going down */
+  std::atomic<bool> deliver_enabled_{false};
 
   InputPin input_;
   OutputPin output_;
@@ -995,7 +1011,10 @@ HRESULT InputPin::Receive(IMediaSample* sample) {
 
   StreamDecoder* core = filter_->core();
   /* The pipeline's worker delivers frames after Receive returned, so the
-   * timing state must outlive this call: shared, value captured. */
+   * timing state must outlive this call: shared, value captured. The pin (and
+   * with it the filter) is kept alive by the job too - a stopped graph may be
+   * released while a job is still queued, and the sink would otherwise touch
+   * freed memory. */
   struct Timing {
     REFERENCE_TIME dur = 333667;
     REFERENCE_TIME start = 0;
@@ -1005,9 +1024,25 @@ HRESULT InputPin::Receive(IMediaSample* sample) {
   timing->dur = frame_dur > 0 ? frame_dur : 333667;
   timing->start = frame_start;
   timing->discontinuity = discontinuity;
-  StreamDecoder::Sink sink = [out, timing](const std::vector<uint8_t>& nv12, int w, int h,
-                                           std::string* sink_error) -> bool {
+  /* pins delegate their refcount to the filter, so this keeps the whole
+   * decoder alive until the job that captured it is gone */
+  struct PinKeep {
+    OutputPin* pin;
+    explicit PinKeep(OutputPin* p) : pin(p) { if (pin) pin->AddRef(); }
+    ~PinKeep() { if (pin) pin->Release(); }
+  };
+  auto keep = std::make_shared<PinKeep>(out);
+  Av1GpuFilter* filter = filter_;
+  StreamDecoder::Sink sink = [out, timing, keep, filter](const std::vector<uint8_t>& nv12,
+                                                         int w, int h,
+                                                         std::string* sink_error) -> bool {
     (void)sink_error;
+    (void)keep;
+    if (!filter->delivering()) {
+      /* stopped (or a seek tore the graph down): drop it rather than deliver
+       * into a renderer that is not there any more */
+      return true;
+    }
     const HRESULT hr = out->deliver(nv12, w, h, timing->start,
                                     timing->start + timing->dur,
                                     timing->discontinuity);

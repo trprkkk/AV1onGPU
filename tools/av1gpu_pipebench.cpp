@@ -9,6 +9,7 @@
  *
  *   av1gpu_pipebench clip.ivf [--frames N] [--backend cuda]
  */
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -57,6 +58,7 @@ int main(int argc, char** argv) {
   std::string backend = "auto";
   int device = 0;
   bool copy_sink = false;
+  bool cadence = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const auto next = [&](const char* fallback) -> const char* {
@@ -72,6 +74,8 @@ int main(int argc, char** argv) {
       pitch = static_cast<size_t>(std::atoi(next("4096")));
     } else if (arg == "--copy-sink") {
       copy_sink = true;
+    } else if (arg == "--cadence") {
+      cadence = true;
     } else if (arg.size() && arg[0] == '-') {
       std::fprintf(stderr, "av1gpu_pipebench: unknown option %s\n", arg.c_str());
       return 2;
@@ -133,6 +137,12 @@ int main(int argc, char** argv) {
    * allocator buffer. --copy-sink adds that copy, so the number is closer to
    * what a player sees. */
   std::vector<uint8_t> renderer;
+  /* --cadence: the interval between deliveries is what a player presents; a
+   * spike over the frame time is a visible hitch even when the average is
+   * fine, so the tail of that distribution is worth a number of its own. */
+  std::vector<double> intervals;
+  bool have_prev = false;
+  std::chrono::steady_clock::time_point prev{};
   av1gpu::dsfilter::StreamDecoder::Sink sink =
       [&](const std::vector<uint8_t>& nv12, int w, int h, std::string* sink_error) -> bool {
     (void)w;
@@ -141,6 +151,13 @@ int main(int argc, char** argv) {
     if (copy_sink) {
       renderer.resize(nv12.size());
       std::memcpy(renderer.data(), nv12.data(), nv12.size());
+    }
+    if (cadence) {
+      const auto now = std::chrono::steady_clock::now();
+      if (have_prev)
+        intervals.push_back(std::chrono::duration<double, std::milli>(now - prev).count());
+      prev = now;
+      have_prev = true;
     }
     ++shown;
     return true;
@@ -163,5 +180,21 @@ int main(int argc, char** argv) {
               units.size(), shown, decoded, elapsed,
               decoded > 0 ? static_cast<double>(decoded) / elapsed : 0.0,
               decoded > 0 ? elapsed * 1000.0 / static_cast<double>(decoded) : 0.0);
+  if (cadence && !intervals.empty()) {
+    std::vector<double> sorted = intervals;
+    std::sort(sorted.begin(), sorted.end());
+    const auto pct = [&](double p) {
+      return sorted[static_cast<size_t>(p * (sorted.size() - 1))];
+    };
+    double sum = 0;
+    for (double v : intervals) sum += v;
+    size_t over = 0;
+    for (double v : intervals)
+      if (v > 41.7) ++over; /* 23.976 fps budget */
+    std::printf("cadence: avg %.2f ms, p50 %.2f, p90 %.2f, p99 %.2f, max %.2f, "
+                "over 41.7 ms: %zu/%zu\n",
+                sum / static_cast<double>(intervals.size()), pct(0.50), pct(0.90),
+                pct(0.99), sorted.back(), over, intervals.size());
+  }
   return 0;
 }
