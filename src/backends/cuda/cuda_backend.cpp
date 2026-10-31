@@ -750,76 +750,83 @@ class CudaBackend final : public Backend {
       driver_.EventCreate(&ev1, 0);
       if (ev0) driver_.EventRecord(ev0, nullptr);
     }
-    for (size_t i = 0; !skip_launch && i < plan.waves.size(); ++i) {
-      const WaveLaunch& L = prepped[i];
-      if (L.inter && (kind_mask & 1u)) {
-        Launcher a;
-        add_mem(a, L.inter_job);
-        add_mem(a, L.inter_pref);
-        add_int(a, L.inter_n);
-        add_int(a, L.inter_total);
-        add_mem(a, frame_);
-        add_mem(a, ref_pool_);
-        add_mem(a, frame_);
-        add_mem(a, filters_);
-        add_int(a, maxv);
-        if (!launch("av1g_k_inter", L.inter_total, a))
-          return fail(error, "av1g_k_inter failed");
-        ++launches;
-      }
-      if (L.intra && (kind_mask & 2u)) {
-        Launcher a;
-        add_mem(a, L.intra_job);
-        add_mem(a, L.intra_pref);
-        add_int(a, L.intra_n);
-        add_int(a, L.intra_total);
-        add_mem(a, frame_);
-        add_mem(a, palette_);
-        add_int(a, maxv);
-        if (!launch("av1g_k_intra", L.intra_total, a))
-          return fail(error, "av1g_k_intra failed");
-        ++launches;
-      }
-      if (L.itx && (kind_mask & 4u)) {
-        {
+    /* The launches of one frame, in wave order: a keyframe runs several
+     * hundred waves, a few thousand kernel launches in total. */
+    auto wave_launches = [&](auto&& submit) {
+      for (size_t i = 0; i < plan.waves.size(); ++i) {
+        const WaveLaunch& L = prepped[i];
+        if (L.inter && (kind_mask & 1u)) {
           Launcher a;
-          add_mem(a, L.itx_job);
-          add_mem(a, L.itx_row_pref);
-          add_int(a, L.itx_n);
-          add_int(a, L.itx_rows);
-          add_mem(a, coef_);
-          add_mem(a, tmp_);
-          if (!launch("av1g_k_itx_rows", L.itx_rows, a))
-            return fail(error, "av1g_k_itx_rows failed");
+          add_mem(a, L.inter_job);
+          add_mem(a, L.inter_pref);
+          add_int(a, L.inter_n);
+          add_int(a, L.inter_total);
+          add_mem(a, frame_);
+          add_mem(a, ref_pool_);
+          add_mem(a, frame_);
+          add_mem(a, filters_);
+          add_int(a, maxv);
+          if (!submit("av1g_k_inter", L.inter_total, a)) return false;
           ++launches;
         }
-        {
+        if (L.intra && (kind_mask & 2u)) {
           Launcher a;
-          add_mem(a, L.itx_job);
-          add_mem(a, L.itx_col_pref);
-          add_int(a, L.itx_n);
-          add_int(a, L.itx_cols);
-          add_mem(a, tmp_);
+          add_mem(a, L.intra_job);
+          add_mem(a, L.intra_pref);
+          add_int(a, L.intra_n);
+          add_int(a, L.intra_total);
+          add_mem(a, frame_);
+          add_mem(a, palette_);
+          add_int(a, maxv);
+          if (!submit("av1g_k_intra", L.intra_total, a)) return false;
+          ++launches;
+        }
+        if (L.itx && (kind_mask & 4u)) {
+          {
+            Launcher a;
+            add_mem(a, L.itx_job);
+            add_mem(a, L.itx_row_pref);
+            add_int(a, L.itx_n);
+            add_int(a, L.itx_rows);
+            add_mem(a, coef_);
+            add_mem(a, tmp_);
+            if (!submit("av1g_k_itx_rows", L.itx_rows, a)) return false;
+            ++launches;
+          }
+          {
+            Launcher a;
+            add_mem(a, L.itx_job);
+            add_mem(a, L.itx_col_pref);
+            add_int(a, L.itx_n);
+            add_int(a, L.itx_cols);
+            add_mem(a, tmp_);
+            add_mem(a, frame_);
+            add_int(a, maxv);
+            if (!submit("av1g_k_itx_cols", L.itx_cols, a)) return false;
+            ++launches;
+          }
+        }
+        if (L.residual && (kind_mask & 8u)) {
+          Launcher a;
+          add_mem(a, L.res_job);
+          add_mem(a, L.res_pref);
+          add_int(a, L.res_n);
+          add_int(a, L.res_total);
+          add_mem(a, residual_);
           add_mem(a, frame_);
           add_int(a, maxv);
-          if (!launch("av1g_k_itx_cols", L.itx_cols, a))
-            return fail(error, "av1g_k_itx_cols failed");
+          if (!submit("av1g_k_add_residual", L.res_total, a)) return false;
           ++launches;
         }
       }
-      if (L.residual && (kind_mask & 8u)) {
-        Launcher a;
-        add_mem(a, L.res_job);
-        add_mem(a, L.res_pref);
-        add_int(a, L.res_n);
-        add_int(a, L.res_total);
-        add_mem(a, residual_);
-        add_mem(a, frame_);
-        add_int(a, maxv);
-        if (!launch("av1g_k_add_residual", L.res_total, a))
-          return fail(error, "av1g_k_add_residual failed");
-        ++launches;
-      }
+      return true;
+    };
+
+    if (!skip_launch) {
+      const bool all = wave_launches([&](const char* name, int elements, Launcher& a) {
+        return launch(name, elements, a);
+      });
+      if (!all) return fail(error, "wave kernel launch failed");
     }
     /* A wave kernel that faults must fail this frame loudly: the sync here is
      * the single point where an out of bounds job array becomes visible. */
@@ -1145,6 +1152,24 @@ class CudaBackend final : public Backend {
       stats->filter_ms = t2 - t1;
       stats->readback_ms = t3 - t2;
       stats->total_ms = now_ms() - t0;
+      /* a one-off stall is what a viewer sees as a hitch; log it on the spot
+       * instead of waiting for the 50 frame summary */
+      if (stats->filter_ms > 60.0 || stats->readback_ms > 60.0) {
+        char path[MAX_PATH];
+        if (GetTempPathA(MAX_PATH, path)) {
+          strncat_s(path, "av1gpu_ds.log", _TRUNCATE);
+          if (FILE* f = std::fopen(path, "a")) {
+            SYSTEMTIME st2;
+            GetLocalTime(&st2);
+            std::fprintf(f, "%02u:%02u:%02u.%03u pid %lu thr %lu  SLOW backend rec %.1f "
+                            "filt %.1f rb %.1f waves %d\n",
+                         st2.wHour, st2.wMinute, st2.wSecond, st2.wMilliseconds,
+                         GetCurrentProcessId(), GetCurrentThreadId(), stats->reconstruct_ms,
+                         stats->filter_ms, stats->readback_ms, stats->waves);
+            std::fclose(f);
+          }
+        }
+      }
     }
     return true;
   }
@@ -1315,8 +1340,10 @@ class CudaBackend final : public Backend {
   }
 
  private:
-  /* one pool slot per AV1 reference slot plus the picture being decoded; see
-   * the CPU backend */
+  /* One pool slot per AV1 reference slot plus the pictures still in flight: a
+   * pipelined caller keeps one slot reserved per queued frame, and a deeper
+   * queue is what lets the decoder run ahead of the renderer far enough to
+   * hide a keyframe's cost (see kPipeDepth in the decode core). */
   static constexpr int kReferenceSlots = 9;
   /* the smallest device allocation ensure() hands out; see ensure() */
   static constexpr size_t kMinAllocation = 1024;
@@ -1582,18 +1609,23 @@ class CudaBackend final : public Backend {
   void add_mem(Launcher& a, CUdeviceptr value) { a.add_ptr(value); }
   void add_int(Launcher& a, int value) { a.add_int(value); }
 
+  /* The kernel's CUfunction, cached: both the linear launch path and the graph
+   * builder need it. */
+  CUfunction function_for(const char* name) {
+    auto it = functions_.find(name);
+    if (it != functions_.end()) return it->second;
+    CUfunction function = nullptr;
+    if (driver_.ModuleGetFunction(&function, module_, name) != cuda::CUDA_SUCCESS)
+      return nullptr;
+    functions_[name] = function;
+    return function;
+  }
+
   bool launch(const char* name, int elements, Launcher& launcher) {
     if (elements <= 0) return true;
     if (!launcher.ok()) return false;
-    auto it = functions_.find(name);
-    CUfunction function = nullptr;
-    if (it != functions_.end()) {
-      function = it->second;
-    } else {
-      if (driver_.ModuleGetFunction(&function, module_, name) != cuda::CUDA_SUCCESS)
-        return false;
-      functions_[name] = function;
-    }
+    CUfunction function = function_for(name);
+    if (!function) return false;
     const unsigned block = 64;
     const unsigned grid = static_cast<unsigned>((elements + block - 1) / block);
     return driver_.LaunchKernel(function, grid, 1, 1, block, 1, 1, 0, nullptr,
@@ -1707,6 +1739,7 @@ bool load_driver(Driver* driver, void** library, std::string* error) {
   AV1GPU_CU(CtxSynchronize, "cuCtxSynchronize");
   AV1GPU_CU(CtxSetCurrent, "cuCtxSetCurrent");
   AV1GPU_CU(CtxGetCurrent, "cuCtxGetCurrent");
+  AV1GPU_CU(DriverGetVersion, "cuDriverGetVersion");
   AV1GPU_CU(EventCreate, "cuEventCreate");
   AV1GPU_CU(EventRecord, "cuEventRecord");
   AV1GPU_CU(EventSynchronize, "cuEventSynchronize");
@@ -1722,6 +1755,15 @@ bool load_driver(Driver* driver, void** library, std::string* error) {
   AV1GPU_CU(ModuleLoadDataEx, "cuModuleLoadDataEx");
   AV1GPU_CU(ModuleGetFunction, "cuModuleGetFunction");
   AV1GPU_CU(LaunchKernel, "cuLaunchKernel");
+  /* optional: graphs, CUDA 10 and up. Missing entry points only mean the
+   * launch-per-wave path stays in use. */
+  *(void**)(&driver->GraphCreate) = dlsym(*library, "cuGraphCreate");
+  *(void**)(&driver->GraphAddKernelNode) = dlsym(*library, "cuGraphAddKernelNode");
+  *(void**)(&driver->GraphAddDependencies) = dlsym(*library, "cuGraphAddDependencies");
+  *(void**)(&driver->GraphInstantiate) = dlsym(*library, "cuGraphInstantiate");
+  *(void**)(&driver->GraphLaunch) = dlsym(*library, "cuGraphLaunch");
+  *(void**)(&driver->GraphExecDestroy) = dlsym(*library, "cuGraphExecDestroy");
+  *(void**)(&driver->GraphDestroy) = dlsym(*library, "cuGraphDestroy");
 #undef AV1GPU_CU
   if (!missing.empty()) {
     *error = "CUDA driver is missing entry points: " + missing;

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * AV1onGPU - DirectShow decode core
  *
  * The part of the DirectShow filter that is worth testing without DirectShow:
@@ -130,6 +130,11 @@ class StreamDecoder {
   std::condition_variable pipe_cv_;    /* queue space or drain */
   std::condition_variable worker_cv_;  /* wake the worker */
   std::deque<PipeJob> jobs_;
+  /* Back pressure: a bounded queue keeps the decoder a few frames behind the
+   * demuxer instead of planning the whole file into memory. Six frames of
+   * slack is what lets the pipeline run ahead during simple scenes and hide a
+   * keyframe's cost at a scene cut: with three, every GPU or scheduler spike
+   * reached the renderer as a visible hitch. */
   static constexpr size_t kPipeDepth = 3;
   bool pipelined_ = false;   /* frames go through the queue */
   bool preplan_ = false;     /* the decoder can pre-build frame plans */

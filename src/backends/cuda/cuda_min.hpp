@@ -38,6 +38,26 @@ using CUmodule = void*;
 using CUfunction = void*;
 using CUstream = void*;
 using CUdeviceptr = unsigned long long;
+using CUgraph = void*;
+using CUgraphNode = void*;
+using CUgraphExec = void*;
+
+/* CUDA 12 changed cuGraphAddKernelNode to take this struct instead of the
+ * (function, parameter array) pair of CUDA 10/11; the layout below is the one
+ * the CUDA 12 and 13 headers define. */
+struct CUDA_KERNEL_NODE_PARAMS {
+  CUfunction func;
+  unsigned int gridDimX;
+  unsigned int gridDimY;
+  unsigned int gridDimZ;
+  unsigned int blockDimX;
+  unsigned int blockDimY;
+  unsigned int blockDimZ;
+  unsigned int sharedMemBytes;
+  CUstream hStream;
+  void** kernelParams;
+  void** extra;
+};
 
 constexpr CUresult CUDA_SUCCESS = 0;
 
@@ -59,6 +79,7 @@ struct Driver {
   CUresult (*CtxSynchronize)(void);
   CUresult (*CtxSetCurrent)(CUcontext); /* workers must adopt the context */
   CUresult (*CtxGetCurrent)(CUcontext*);
+  CUresult (*DriverGetVersion)(int*);
   /* events, for GPU side timing */
   CUresult (*EventCreate)(void**, unsigned);
   CUresult (*EventRecord)(void*, CUstream);
@@ -76,6 +97,17 @@ struct Driver {
   CUresult (*ModuleGetFunction)(CUfunction*, CUmodule, const char*);
   CUresult (*LaunchKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned,
                            unsigned, unsigned, CUstream, void**, void**);
+  /* graphs: one submission for the whole frame instead of a kernel launch per
+   * wave, which is what a keyframe's several hundred waves cost on WDDM */
+  CUresult (*GraphCreate)(CUgraph*, unsigned);
+  /* CUDA 12 and up: the parameters ride in a struct */
+  CUresult (*GraphAddKernelNode)(CUgraphNode*, CUgraph, const CUgraphNode*, size_t,
+                                 const CUDA_KERNEL_NODE_PARAMS*);
+  CUresult (*GraphAddDependencies)(CUgraph, const CUgraphNode*, const CUgraphNode*, size_t);
+  CUresult (*GraphInstantiate)(CUgraphExec*, CUgraph, unsigned long long);
+  CUresult (*GraphLaunch)(CUgraphExec, CUstream);
+  CUresult (*GraphExecDestroy)(CUgraphExec);
+  CUresult (*GraphDestroy)(CUgraph);
 };
 
 struct Nvrtc {

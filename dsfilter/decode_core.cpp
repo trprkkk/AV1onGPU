@@ -540,6 +540,13 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
     const char* name; double total = 0.0; double worst = 0.0; long n = 0;
     void add(double ms) {
       total += ms; ++n; if (ms > worst) worst = ms;
+      /* a one-off stall is what a viewer sees as a hitch; log it on the spot
+       * instead of waiting for the 50 frame summary */
+      if (ms > 60.0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "SLOW stage %s: %.1f ms", name, ms);
+        ds_debug_log("%s", msg);
+      }
       if (n % 50 == 0)
         ds_debug_log("perf stage %s: avg %.1f ms, worst %.1f ms over %ld",
                   name, total / n, worst, n);

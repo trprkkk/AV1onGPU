@@ -1210,7 +1210,7 @@ HRESULT OutputPin::decide_allocator(IPin* peer) {
 
   const size_t frame_bytes = nv12_frame_bytes(stride_, height_);
   ALLOCATOR_PROPERTIES want{};
-  want.cBuffers = 3;
+  want.cBuffers = 6;
   want.cbBuffer = static_cast<long>(frame_bytes);
   want.cbAlign = 1;
   want.cbPrefix = 0;

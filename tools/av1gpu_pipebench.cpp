@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -141,8 +142,15 @@ int main(int argc, char** argv) {
    * spike over the frame time is a visible hitch even when the average is
    * fine, so the tail of that distribution is worth a number of its own. */
   std::vector<double> intervals;
+  std::ofstream gap_log;
+  if (cadence) gap_log.open("av1gpu_gaps.txt");
   bool have_prev = false;
   std::chrono::steady_clock::time_point prev{};
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto since0 = [&] {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+        .count();
+  };
   av1gpu::dsfilter::StreamDecoder::Sink sink =
       [&](const std::vector<uint8_t>& nv12, int w, int h, std::string* sink_error) -> bool {
     (void)w;
@@ -154,8 +162,13 @@ int main(int argc, char** argv) {
     }
     if (cadence) {
       const auto now = std::chrono::steady_clock::now();
-      if (have_prev)
-        intervals.push_back(std::chrono::duration<double, std::milli>(now - prev).count());
+      if (have_prev) {
+        const double gap = std::chrono::duration<double, std::milli>(now - prev).count();
+        intervals.push_back(gap);
+        if (gap > 100.0 && gap_log.is_open())
+          gap_log << "gap " << gap << " ms before frame " << shown << " decoded "
+                  << decoder.decoded_frames() << " t " << since0() << "\n";
+      }
       prev = now;
       have_prev = true;
     }
@@ -163,11 +176,28 @@ int main(int argc, char** argv) {
     return true;
   };
 
-  const auto t0 = std::chrono::steady_clock::now();
+  std::ofstream push_log;
+  if (cadence) push_log.open("av1gpu_pushes.txt");
   for (size_t i = 0; i < units.size(); ++i) {
     if (!decoder.push(units[i], sizes[i], pitch, sink, &error)) {
       std::fprintf(stderr, "av1gpu_pipebench: unit %zu: %s\n", i, error.c_str());
       return 1;
+    }
+    if (push_log.is_open()) push_log << "push " << i << " t " << since0() << "\n";
+    if (cadence) {
+      LARGE_INTEGER q1, qf;
+      QueryPerformanceCounter(&q1);
+      static LARGE_INTEGER q0{}; /* previous push end */
+      static bool have_q0 = false;
+      QueryPerformanceFrequency(&qf);
+      if (have_q0) {
+        const double d =
+            double(q1.QuadPart - q0.QuadPart) * 1000.0 / double(qf.QuadPart);
+        if (d > 60.0 && push_log.is_open())
+          push_log << "SLOW push " << i << " took " << d << " ms\n";
+      }
+      q0 = q1;
+      have_q0 = true;
     }
   }
   decoder.finish();
