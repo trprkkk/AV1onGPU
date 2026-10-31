@@ -586,43 +586,31 @@ class CudaBackend final : public Backend {
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
     const unsigned k_workers =
         plan.waves.size() >= 8 ? std::min<unsigned>(6, std::max(1u, hw - 1)) : 1;
-    std::atomic<bool> prep_ok{true};
 
-    /* one worker's slice: [id, id + K, ...) of the waves */
+    /* ---- build the arena on the host, then upload it once ----------------
+     * The job arrays and their prefix sums go into one host buffer per arena
+     * and travel to the device in a single copy each. The previous shape did a
+     * pinned allocation and a cuMemcpyHtoD per wave *and* per kind - hundreds
+     * of small transfers per frame - and needed the CUDA context on every
+     * worker thread. Now the workers only touch plain memory (no CUDA call at
+     * all), and the uploads happen on this thread afterwards. */
+    if (host_job_.size() < arena_job) host_job_.resize(arena_job);
+    if (host_pref_.size() < arena_pref) host_pref_.resize(arena_pref);
+    char* const hjobs = host_job_.data();
+    char* const hpref = host_pref_.data();
+
     auto prep_waves = [&](unsigned id) {
-      if (k_workers > 1) {
-        if (driver_.CtxSetCurrent(context_) != cuda::CUDA_SUCCESS) {
-          prep_ok = false;
-          return;
-        }
-      }
-      void* pinned = nullptr; /* per worker staging for its uploads */
-      size_t pinned_cap = 0;
-      auto h2d = [&](CUdeviceptr dst, const void* src, size_t bytes) {
-        if (bytes == 0) return true;
-        if (!driver_.MemAllocHost || !driver_.MemFreeHost)
-          return driver_.MemcpyHtoD(dst, src, bytes) == cuda::CUDA_SUCCESS;
-        if (pinned_cap < bytes) {
-          if (pinned) driver_.MemFreeHost(pinned);
-          pinned = nullptr;
-          size_t want = bytes + bytes / 2;
-          if (driver_.MemAllocHost(&pinned, want) != cuda::CUDA_SUCCESS || !pinned) {
-            pinned = nullptr;
-            pinned_cap = 0;
-            return driver_.MemcpyHtoD(dst, src, bytes) == cuda::CUDA_SUCCESS;
-          }
-          pinned_cap = want;
-        }
-        std::memcpy(pinned, src, bytes);
-        return driver_.MemcpyHtoD(dst, pinned, bytes) == cuda::CUDA_SUCCESS;
-      };
-      for (size_t i = id; i < plan.waves.size() && prep_ok; i += k_workers) {
+      for (size_t i = id; i < plan.waves.size(); i += k_workers) {
         const WaveJobs& w = plan.waves[i];
         WaveLaunch& L = prepped[i];
         const WaveOffsets& o = offs[i];
         if (!w.inter.empty()) {
-          std::vector<Av1gInterJob> jobs = w.inter;
-          for (Av1gInterJob& job : jobs) {
+          Av1gInterJob* dst = reinterpret_cast<Av1gInterJob*>(hjobs + o.inter_job);
+          std::memcpy(dst, w.inter.data(), w.inter.size() * sizeof(Av1gInterJob));
+          int* prefix = reinterpret_cast<int*>(hpref + o.inter_pref);
+          int sum = 0;
+          for (size_t k = 0; k < w.inter.size(); ++k) {
+            Av1gInterJob& job = dst[k];
             if (job.ref0_slot >= 0)
               job.ref0_off += job.ref0_slot * static_cast<int>(g.buffer_size);
             if (job.ref1_slot >= 0)
@@ -635,33 +623,22 @@ class CudaBackend final : public Backend {
               if (job.ref1_slot >= 0)
                 job.luma_ref1_off += job.ref1_slot * static_cast<int>(g.buffer_size);
             }
-            for (int k = 0; k < job.obmc_count; ++k)
-              if (job.obmc[k].ref_slot >= 0)
-                job.obmc[k].ref_off += job.obmc[k].ref_slot * static_cast<int>(g.buffer_size);
-          }
-          std::vector<int> prefix(jobs.size() + 2, 0);
-          int sum = 0;
-          for (size_t k = 0; k < jobs.size(); ++k) {
+            for (int b = 0; b < job.obmc_count; ++b)
+              if (job.obmc[b].ref_slot >= 0)
+                job.obmc[b].ref_off += job.obmc[b].ref_slot * static_cast<int>(g.buffer_size);
             prefix[k] = sum;
-            sum += jobs[k].w * jobs[k].h;
+            sum += job.w * job.h;
           }
-          prefix[jobs.size()] = sum;
-          prefix[jobs.size() + 1] = sum;
-          if (!h2d(job_arena_ + o.inter_job, jobs.data(),
-                   jobs.size() * sizeof(Av1gInterJob)) ||
-              !h2d(pref_arena_ + o.inter_pref, prefix.data(),
-                   prefix.size() * sizeof(int))) {
-            prep_ok = false;
-            break;
-          }
+          prefix[w.inter.size()] = sum;
+          prefix[w.inter.size() + 1] = sum;
           L.inter = true;
-          L.inter_job = job_arena_ + o.inter_job;
-          L.inter_pref = pref_arena_ + o.inter_pref;
-          L.inter_n = static_cast<int>(jobs.size());
+          L.inter_n = static_cast<int>(w.inter.size());
           L.inter_total = sum;
         }
         if (!w.intra.empty()) {
-          std::vector<int> prefix(w.intra.size() + 2, 0);
+          std::memcpy(hjobs + o.intra_job, w.intra.data(),
+                      w.intra.size() * sizeof(Av1gIntraJob));
+          int* prefix = reinterpret_cast<int*>(hpref + o.intra_pref);
           int sum = 0;
           for (size_t k = 0; k < w.intra.size(); ++k) {
             prefix[k] = sum;
@@ -669,22 +646,14 @@ class CudaBackend final : public Backend {
           }
           prefix[w.intra.size()] = sum;
           prefix[w.intra.size() + 1] = sum;
-          if (!h2d(job_arena_ + o.intra_job, w.intra.data(),
-                   w.intra.size() * sizeof(Av1gIntraJob)) ||
-              !h2d(pref_arena_ + o.intra_pref, prefix.data(),
-                   prefix.size() * sizeof(int))) {
-            prep_ok = false;
-            break;
-          }
           L.intra = true;
-          L.intra_job = job_arena_ + o.intra_job;
-          L.intra_pref = pref_arena_ + o.intra_pref;
           L.intra_n = static_cast<int>(w.intra.size());
           L.intra_total = sum;
         }
         if (!w.itx.empty()) {
-          std::vector<int> row_prefix(w.itx.size() + 2, 0);
-          std::vector<int> col_prefix(w.itx.size() + 2, 0);
+          std::memcpy(hjobs + o.itx_job, w.itx.data(), w.itx.size() * sizeof(Av1gItxJob));
+          int* row_prefix = reinterpret_cast<int*>(hpref + o.itx_row);
+          int* col_prefix = reinterpret_cast<int*>(hpref + o.itx_col);
           int rows_sum = 0, cols_sum = 0;
           for (size_t k = 0; k < w.itx.size(); ++k) {
             row_prefix[k] = rows_sum;
@@ -696,25 +665,15 @@ class CudaBackend final : public Backend {
           row_prefix[w.itx.size() + 1] = rows_sum;
           col_prefix[w.itx.size()] = cols_sum;
           col_prefix[w.itx.size() + 1] = cols_sum;
-          if (!h2d(job_arena_ + o.itx_job, w.itx.data(),
-                   w.itx.size() * sizeof(Av1gItxJob)) ||
-              !h2d(pref_arena_ + o.itx_row, row_prefix.data(),
-                   row_prefix.size() * sizeof(int)) ||
-              !h2d(pref_arena_ + o.itx_col, col_prefix.data(),
-                   col_prefix.size() * sizeof(int))) {
-            prep_ok = false;
-            break;
-          }
           L.itx = true;
-          L.itx_job = job_arena_ + o.itx_job;
-          L.itx_row_pref = pref_arena_ + o.itx_row;
-          L.itx_col_pref = pref_arena_ + o.itx_col;
           L.itx_n = static_cast<int>(w.itx.size());
           L.itx_rows = rows_sum;
           L.itx_cols = cols_sum;
         }
         if (!w.residual.empty()) {
-          std::vector<int> prefix(w.residual.size() + 2, 0);
+          std::memcpy(hjobs + o.res_job, w.residual.data(),
+                      w.residual.size() * sizeof(Av1gItxJob));
+          int* prefix = reinterpret_cast<int*>(hpref + o.res_pref);
           int sum = 0;
           for (size_t k = 0; k < w.residual.size(); ++k) {
             prefix[k] = sum;
@@ -722,22 +681,11 @@ class CudaBackend final : public Backend {
           }
           prefix[w.residual.size()] = sum;
           prefix[w.residual.size() + 1] = sum;
-          if (!h2d(job_arena_ + o.res_job, w.residual.data(),
-                   w.residual.size() * sizeof(Av1gItxJob)) ||
-              !h2d(pref_arena_ + o.res_pref, prefix.data(),
-                   prefix.size() * sizeof(int))) {
-            prep_ok = false;
-            break;
-          }
           L.residual = true;
-          L.res_job = job_arena_ + o.res_job;
-          L.res_pref = pref_arena_ + o.res_pref;
           L.res_n = static_cast<int>(w.residual.size());
           L.res_total = sum;
         }
       }
-      if (pinned && driver_.MemFreeHost) driver_.MemFreeHost(pinned);
-      if (k_workers > 1) driver_.CtxSetCurrent(nullptr);
     };
 
     if (k_workers <= 1) {
@@ -745,11 +693,37 @@ class CudaBackend final : public Backend {
     } else {
       std::vector<std::thread> pool;
       pool.reserve(k_workers);
-      for (unsigned id = 0; id < k_workers; ++id)
-        pool.emplace_back(prep_waves, id);
+      for (unsigned id = 0; id < k_workers; ++id) pool.emplace_back(prep_waves, id);
       for (std::thread& t : pool) t.join();
     }
-    if (!prep_ok) return fail(error, "wave job upload failed");
+
+    /* the device addresses, once the host copy is complete */
+    for (size_t i = 0; i < plan.waves.size(); ++i) {
+      WaveLaunch& L = prepped[i];
+      const WaveOffsets& o = offs[i];
+      if (L.inter) {
+        L.inter_job = job_arena_ + o.inter_job;
+        L.inter_pref = pref_arena_ + o.inter_pref;
+      }
+      if (L.intra) {
+        L.intra_job = job_arena_ + o.intra_job;
+        L.intra_pref = pref_arena_ + o.intra_pref;
+      }
+      if (L.itx) {
+        L.itx_job = job_arena_ + o.itx_job;
+        L.itx_row_pref = pref_arena_ + o.itx_row;
+        L.itx_col_pref = pref_arena_ + o.itx_col;
+      }
+      if (L.residual) {
+        L.res_job = job_arena_ + o.res_job;
+        L.res_pref = pref_arena_ + o.res_pref;
+      }
+    }
+    if (arena_job && !upload_h2d(job_arena_, hjobs, arena_job))
+      return fail(error, "wave job upload failed");
+    if (arena_pref && !upload_h2d(pref_arena_, hpref, arena_pref))
+      return fail(error, "wave prefix upload failed");
+
     const double t_prep = now_ms(); /* DEBUG */
     driver_.CtxSynchronize(); /* DEBUG: drain any queued prep work */
 
@@ -1394,7 +1368,7 @@ class CudaBackend final : public Backend {
       char arch_key[64];
       std::snprintf(arch_key, sizeof(arch_key), "sm %d.%d", compute_major_, compute_minor_);
       mix(arch_key, std::strlen(arch_key));
-      mix("v2", 2); /* bump when the cache format changes */
+      mix("v5", 2); /* bump when the cache format changes */
       char buf[32];
       std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
       key = buf;
@@ -1636,6 +1610,9 @@ class CudaBackend final : public Backend {
   /* per frame arenas the parallel wave prep fills at fixed offsets */
   CUdeviceptr job_arena_ = 0;
   size_t job_arena_cap_ = 0;
+  /* host side of the two arenas: built per frame, uploaded in one copy each */
+  std::vector<char> host_job_;
+  std::vector<char> host_pref_;
   CUdeviceptr pref_arena_ = 0;
   size_t pref_arena_cap_ = 0;
   cuda::Driver driver_{};
