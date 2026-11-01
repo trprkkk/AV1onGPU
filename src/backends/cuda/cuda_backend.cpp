@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -259,7 +260,12 @@ class CudaBackend final : public Backend {
       if (error) *error = "upload_reference before prepare";
       return -1;
     }
-    const int slot = allocate_slot();
+    int slot;
+    {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      slot = allocate_slot();
+      if (slot >= 0) slots_[slot] = true;
+    }
     if (slot < 0) {
       if (error) *error = "CUDA reference pool exhausted";
       return -1;
@@ -278,20 +284,23 @@ class CudaBackend final : public Backend {
     const CUdeviceptr target =
         ref_pool_ + static_cast<size_t>(slot) * size * sizeof(uint16_t);
     if (!upload_h2d(target, packed.data(), size * sizeof(uint16_t))) {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      slots_[slot] = false;
       if (error) *error = "cuMemcpyHtoD failed";
       return -1;
     }
-    slots_[slot] = true;
     return slot;
   }
 
   void release_reference(int slot) override {
+    std::lock_guard<std::mutex> lk(slot_mutex_);
     if (slot >= 0 && slot < kReferenceSlots) slots_[slot] = false;
   }
 
   int reference_capacity() const override { return kReferenceSlots; }
 
   int reserve_reference() override {
+    std::lock_guard<std::mutex> lk(slot_mutex_);
     const int slot = allocate_slot();
     if (slot >= 0) slots_[slot] = true; /* a later decode_reserved fills it */
     return slot;
@@ -1032,16 +1041,23 @@ class CudaBackend final : public Backend {
         /* an explicit slot reserved ahead of time by a pipelined caller */
         slot = forced_slot;
       } else {
+        std::lock_guard<std::mutex> lk(slot_mutex_);
         slot = allocate_slot();
         if (slot < 0) return fail(error, "CUDA reference pool exhausted");
+        slots_[slot] = true; /* mark atomically with the allocation */
       }
       cuda::CUresult rc = driver_.MemcpyDtoD(
           ref_pool_ + static_cast<size_t>(slot) * g.buffer_size * sizeof(uint16_t), frame_,
           g.buffer_size * sizeof(uint16_t));
-      if (rc != cuda::CUDA_SUCCESS) return fail(error, "reference copy failed");
+      if (rc != cuda::CUDA_SUCCESS) {
+        if (forced_slot < 0) {
+          std::lock_guard<std::mutex> lk(slot_mutex_);
+          slots_[slot] = false;
+        }
+        return fail(error, "reference copy failed");
+      }
       if (driver_.CtxSynchronize() != cuda::CUDA_SUCCESS)
         return fail(error, "reference copy did not complete");
-      slots_[slot] = true;
     }
     /* ---- film grain (7.18.3) ----------------------------------------------- */
     if (!plan.grain_chroma.empty() || !plan.grain_luma.empty()) {
@@ -1155,7 +1171,10 @@ class CudaBackend final : public Backend {
     const double t3 = now_ms();
 
     if (out_slot) *out_slot = slot;
-    last_slot_ = slot;
+    {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      last_slot_ = slot;
+    }
 
     if (stats) {
       stats->blocks = plan.blocks;
@@ -1201,6 +1220,7 @@ class CudaBackend final : public Backend {
     CUdeviceptr source = frame_;
     int base = 0;
     if (slot >= 0) {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
       if (slot >= kReferenceSlots || !slots_[slot]) {
         *error = "invalid reference slot";
         return false;
@@ -1277,6 +1297,7 @@ class CudaBackend final : public Backend {
     CUdeviceptr source = frame_;
     int base = 0;
     if (slot >= 0) {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
       if (slot >= kReferenceSlots || !slots_[slot]) {
         *error = "invalid reference slot";
         return false;
@@ -1348,6 +1369,7 @@ class CudaBackend final : public Backend {
   }
 
   void reset() override {
+    std::lock_guard<std::mutex> lk(slot_mutex_);
     for (int i = 0; i < kReferenceSlots; ++i) slots_[i] = false;
     last_slot_ = -1;
   }
@@ -1650,6 +1672,9 @@ class CudaBackend final : public Backend {
     return false;
   }
 
+  /* slots_/last_slot_ are the reference pool's bookkeeping. A pipelined
+   * caller reserves from its own thread while the worker decodes into and
+   * releases other slots, so every touch goes through slot_mutex_. */
   int allocate_slot() {
     for (int i = 0; i < kReferenceSlots; ++i)
       if (!slots_[i]) return i;
@@ -1694,6 +1719,9 @@ class CudaBackend final : public Backend {
   /* set once the first prepare() has sized the buffers for this geometry */
   bool ready_ = false;
   std::vector<uint16_t> staging_;
+  /* Guards slots_/last_slot_ (see allocate_slot). The decode paths run on the
+   * pipeline worker while reserve/release can come from the demuxer thread. */
+  mutable std::mutex slot_mutex_;
   bool slots_[kReferenceSlots] = {};
   int last_slot_ = -1;
 };

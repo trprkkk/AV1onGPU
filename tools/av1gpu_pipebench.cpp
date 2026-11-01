@@ -10,6 +10,7 @@
  *   av1gpu_pipebench clip.ivf [--frames N] [--backend cuda]
  */
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -18,7 +19,11 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+#ifdef _DEBUG
+#include <crtdbg.h>
+#endif
 
 #include "av1gpu/av1gpu.hpp"
 #include "dsfilter/decode_core.hpp"
@@ -53,6 +58,19 @@ uint32_t le32(const uint8_t* p) {
 } /* namespace */
 
 int main(int argc, char** argv) {
+#ifdef _DEBUG
+  /* AV1GPU_CRT_DEBUG=1 (Debug build only): verify the heap on every allocation
+   * and report damage with the offending block's allocation site. */
+  if (std::getenv("AV1GPU_CRT_DEBUG")) {
+    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_CHECK_ALWAYS_DF | _CRTDBG_DELAY_FREE_MEM_DF);
+    _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+  }
+#endif
   std::string path;
   int frames = 0;
   size_t pitch = 4096;
@@ -60,6 +78,9 @@ int main(int argc, char** argv) {
   int device = 0;
   bool copy_sink = false;
   bool cadence = false;
+  int seek_at = -1; /* reset the stream (a seek) after this many units */
+  int seek_every = 0; /* and then again every N units */
+  int seek_race_ms = 0; /* a second thread calls reset_stream() every N ms */
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const auto next = [&](const char* fallback) -> const char* {
@@ -77,6 +98,12 @@ int main(int argc, char** argv) {
       copy_sink = true;
     } else if (arg == "--cadence") {
       cadence = true;
+    } else if (arg == "--seek-at") {
+      seek_at = std::atoi(next("-1"));
+    } else if (arg == "--seek-every") {
+      seek_every = std::atoi(next("0"));
+    } else if (arg == "--seek-race") {
+      seek_race_ms = std::atoi(next("0"));
     } else if (arg.size() && arg[0] == '-') {
       std::fprintf(stderr, "av1gpu_pipebench: unknown option %s\n", arg.c_str());
       return 2;
@@ -86,7 +113,8 @@ int main(int argc, char** argv) {
   }
   if (path.empty()) {
     std::fprintf(stderr, "usage: av1gpu_pipebench CLIP.ivf [--frames N] "
-                         "[--backend B] [--device N] [--pitch N] [--copy-sink]\n");
+                         "[--backend B] [--device N] [--pitch N] [--copy-sink] [--seek-at N] "
+                         "[--seek-every N] [--seek-race MS]\n");
     return 2;
   }
 
@@ -117,6 +145,41 @@ int main(int argc, char** argv) {
   if (units.empty()) {
     std::fprintf(stderr, "av1gpu_pipebench: no frames in %s\n", path.c_str());
     return 1;
+  }
+
+  /* A player seeking does not continue mid-GOP: the splitter restarts delivery
+   * at the next keyframe. Mark the keyframe units (an OBU_FRAME/_HEADER whose
+   * frame header starts with show_existing=0, frame_type=KEY) so a synthetic
+   * seek can jump like a real one. */
+  std::vector<char> keyframe(units.size(), 0);
+  for (size_t i = 0; i < units.size(); ++i) {
+    const uint8_t* u = units[i];
+    const size_t n = sizes[i];
+    size_t p = 0;
+    while (p + 1 < n) {
+      const uint8_t h = u[p];
+      const int type = (h >> 3) & 0xf;
+      const bool has_ext = (h >> 2) & 1;
+      const bool has_size = (h >> 1) & 1;
+      size_t body = p + 1 + (has_ext ? 1 : 0);
+      size_t len = n - body;
+      if (has_size) {
+        size_t v = 0;
+        int shift = 0;
+        for (int k = 0; k < 8 && body < n; ++k, ++body) {
+          v |= static_cast<size_t>(u[body] & 0x7f) << shift;
+          shift += 7;
+          if (!(u[body] & 0x80)) break;
+        }
+        len = v;
+      }
+      if ((type == 6 || type == 3) && body < n) {
+        const uint8_t b = u[body];
+        if ((b & 0x80) == 0 && ((b >> 5) & 3) == 0) { keyframe[i] = 1; break; }
+      }
+      if (body + len > n) break;
+      p = body + len;
+    }
   }
 
   av1gpu::BackendOptions options;
@@ -176,12 +239,44 @@ int main(int argc, char** argv) {
     return true;
   };
 
+  /* --seek-race MS: a second thread calls reset_stream() every MS
+   * milliseconds, the way MPC-HC's GUI thread does EndFlush/NewSegment while
+   * the streaming thread is still inside Receive/push. */
+  std::atomic<bool> race_stop{false};
+  std::thread race_thread;
+  if (seek_race_ms > 0) {
+    race_thread = std::thread([&] {
+      while (!race_stop.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(seek_race_ms));
+        decoder.reset_stream();
+      }
+    });
+  }
+
   std::ofstream push_log;
   if (cadence) push_log.open("av1gpu_pushes.txt");
-  for (size_t i = 0; i < units.size(); ++i) {
+  for (size_t i = 0; i < units.size();) {
+    const int unit = static_cast<int>(i);
+    const bool do_seek = (seek_at >= 0 && unit == seek_at) ||
+                         (seek_every > 0 && unit > (seek_at < 0 ? 0 : seek_at) &&
+                          (unit - (seek_at < 0 ? 0 : seek_at)) % seek_every == 0);
+    if (do_seek) {
+      decoder.reset_stream(); /* what EndFlush/NewSegment do on a seek */
+      if (push_log.is_open()) push_log << "SEEK at unit " << i << "\n";
+      /* like a real seek: resume at the next keyframe unit */
+      size_t j = i + 1;
+      while (j < units.size() && !keyframe[j]) ++j;
+      if (j >= units.size()) break;
+      if (push_log.is_open()) push_log << "  -> resume at keyframe unit " << j << "\n";
+      i = j;
+      continue;
+    }
     if (!decoder.push(units[i], sizes[i], pitch, sink, &error)) {
       std::fprintf(stderr, "av1gpu_pipebench: unit %zu: %s\n", i, error.c_str());
-      return 1;
+      /* in race mode a reset can land mid-GOP and the next unit may name a
+       * reference the reset dropped; the real filter just keeps going */
+      if (seek_race_ms <= 0) return 1;
+      error.clear();
     }
     if (push_log.is_open()) push_log << "push " << i << " t " << since0() << "\n";
     if (cadence) {
@@ -199,7 +294,10 @@ int main(int argc, char** argv) {
       q0 = q1;
       have_q0 = true;
     }
+    ++i;
   }
+  race_stop.store(true);
+  if (race_thread.joinable()) race_thread.join();
   decoder.finish();
   const double elapsed =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

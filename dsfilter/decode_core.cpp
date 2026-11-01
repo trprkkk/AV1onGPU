@@ -350,6 +350,11 @@ void StreamDecoder::abort_pipe() {
 }
 
 void StreamDecoder::reset_stream() {
+  /* Serialized against push(): this runs on the seeking thread while the
+   * streaming thread may be inside push(). abort_pipe() waits for the worker
+   * under pipe_mutex_; push() can be blocked in queue_job()'s back pressure
+   * at the same time, but it holds no lock the worker needs, so no deadlock. */
+  std::lock_guard<std::mutex> stream_lock(stream_mutex_);
   abort_pipe();
   pending_.clear();
   static_cast<StreamState*>(state_)->clear();
@@ -380,6 +385,12 @@ const DeviceInfo& StreamDecoder::device() const { return decoder_->device(); }
 
 bool StreamDecoder::push(const uint8_t* data, size_t size, size_t pitch,
                          const Sink& sink, std::string* error) {
+  /* The whole sample is processed under stream_mutex_: a concurrent
+   * reset_stream() (a seek from another thread) must not clear pending_ or
+   * reset the decoder while this thread is mid-OBU in them. queue_job()
+   * takes pipe_mutex_ inside, which is fine: the worker never takes
+   * stream_mutex_, so the lock order stream -> pipe cannot deadlock. */
+  std::lock_guard<std::mutex> stream_lock(stream_mutex_);
   /* A stream whose OBUs never complete would grow the buffer without bound;
    * 64 MiB is far past any real temporal unit. */
   constexpr size_t kPendingLimit = 64u << 20;

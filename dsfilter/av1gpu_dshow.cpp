@@ -634,15 +634,20 @@ class Av1GpuFilter : public IBaseFilter {
 
   /* IMediaFilter */
   HRESULT __stdcall Stop() override {
-    Hold hold(lock_);
-    state_ = State_Stopped;
-    /* The pipeline's worker delivers on its own thread. Nothing may reach the
-     * renderer after this point: the graph is about to decommit the allocator
-     * and tear the peer down, and a queued job would deliver into a filter
-     * that is already going away (that was the exit crash). Disable delivery,
-     * wait for the worker to finish whatever it holds, then decommit. */
-    deliver_enabled_.store(false);
+    {
+      Hold hold(lock_);
+      state_ = State_Stopped;
+      /* The pipeline's worker delivers on its own thread. Nothing may reach
+       * the renderer after this point: the graph is about to decommit the
+       * allocator and tear the peer down, and a queued job would deliver into
+       * a filter that is already going away (that was the exit crash). */
+      deliver_enabled_.store(false);
+    }
+    /* Wait for the worker OUTSIDE the lock: a job that is mid-deliver takes
+     * the lock to snapshot the allocator, and would deadlock against a Stop
+     * that holds the lock while waiting for exactly that job. */
     if (core_) core_->finish();
+    Hold hold(lock_);
     output_.on_deactivate();
     return S_OK;
   }
@@ -955,8 +960,12 @@ HRESULT InputPin::EndFlush() {
   {
     Hold hold(filter_->lock());
     flushing_ = false;
-    if (StreamDecoder* core = filter_->core()) core->reset_stream();
   }
+  /* reset_stream() waits for the pipeline worker, and the worker takes the
+   * filter lock to snapshot the allocator in deliver() - calling it under
+   * the lock would deadlock. The core pointer is stable once created (it is
+   * only destroyed with the filter, which a queued job keeps alive). */
+  if (StreamDecoder* core = filter_->core()) core->reset_stream();
   return hr;
 }
 
@@ -964,10 +973,15 @@ HRESULT InputPin::NewSegment(REFERENCE_TIME start, REFERENCE_TIME stop, double r
   (void)stop;
   (void)start;
   (void)rate;
-  Hold hold(filter_->lock());
-  if (StreamDecoder* core = filter_->core()) {
+  StreamDecoder* core = nullptr;
+  {
+    Hold hold(filter_->lock());
+    core = filter_->core();
+  }
+  if (core) {
     /* a seek: references from before the seek are wrong; the sequence header
-     * arrives again with the next key frame */
+     * arrives again with the next key frame. Outside the lock for the same
+     * reason as EndFlush. */
     core->reset_stream();
   }
   return S_OK;
@@ -975,19 +989,20 @@ HRESULT InputPin::NewSegment(REFERENCE_TIME start, REFERENCE_TIME stop, double r
 
 HRESULT InputPin::Receive(IMediaSample* sample) {
   if (!sample) return E_POINTER;
+  std::string error;
   {
     Hold hold(filter_->lock());
     if (flushing_) return S_FALSE;
     if (!peer_) return VFW_E_NOT_CONNECTED;
     if (filter_->state_ == State_Stopped) return VFW_E_NOT_RUNNING;
+    /* create the decoder under the lock: EndFlush/NewSegment on the seeking
+     * thread read core() under the same lock */
+    if (!filter_->ensure_core(&error)) {
+      debug_log("decoder init failed: %s", error.c_str());
+      return E_FAIL;
+    }
   }
   debug_log("Receive: sample %ld bytes", sample->GetActualDataLength());
-
-  std::string error;
-  if (!filter_->ensure_core(&error)) {
-    debug_log("decoder init failed: %s", error.c_str());
-    return E_FAIL;
-  }
 
   BYTE* data = nullptr;
   const long size = sample->GetActualDataLength();
@@ -1322,6 +1337,9 @@ HRESULT OutputPin::deliver(const std::vector<uint8_t>& nv12, int width, int heig
   int w = 0, h = 0, s = 0;
   {
     Hold hold(filter_->lock());
+    /* re-check under the lock: the caller checked delivering() before taking
+     * it, and a Stop in between must not let this frame reach the renderer */
+    if (!filter_->delivering()) return S_FALSE;
     if (!connected()) return VFW_E_NOT_CONNECTED;
     allocator = allocator_;
     sink = sink_;

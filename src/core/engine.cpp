@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -46,6 +47,7 @@ class EngineDecoder final : public av1gpu::Decoder {
       : backend_(std::move(backend)), options_(options) {}
 
   ~EngineDecoder() override {
+    std::lock_guard<std::mutex> lk(slot_mutex_);
     for (int slot : held_slots_) backend_->release_reference(slot);
   }
 
@@ -54,6 +56,7 @@ class EngineDecoder final : public av1gpu::Decoder {
   const DecodeStats& stats() const override { return stats_; }
 
   void reset() override {
+    std::lock_guard<std::mutex> lk(slot_mutex_);
     for (int slot : held_slots_) backend_->release_reference(slot);
     held_slots_.clear();
     backend_->reset();
@@ -61,6 +64,7 @@ class EngineDecoder final : public av1gpu::Decoder {
   }
 
   void release_reference(int slot) override {
+    std::lock_guard<std::mutex> lk(slot_mutex_);
     auto it = std::find(held_slots_.begin(), held_slots_.end(), slot);
     if (it != held_slots_.end()) held_slots_.erase(it);
     backend_->release_reference(slot);
@@ -91,7 +95,10 @@ class EngineDecoder final : public av1gpu::Decoder {
 
     int slot = -1;
     if (!backend_->decode(plan, true, out, &slot, &stats_, error)) return -1;
-    if (slot >= 0) held_slots_.push_back(slot);
+    if (slot >= 0) {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      held_slots_.push_back(slot);
+    }
     if (t_on) {
       QueryPerformanceCounter(&e2);
       static double acc_plan = 0, acc_dec = 0;
@@ -120,7 +127,10 @@ class EngineDecoder final : public av1gpu::Decoder {
 
     int got = -1;
     if (!backend_->decode_reserved(plan, slot, out, &got, &stats_, error)) return -1;
-    if (got >= 0) held_slots_.push_back(got);
+    if (got >= 0) {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      held_slots_.push_back(got);
+    }
     return got;
   }
 
@@ -158,7 +168,10 @@ class EngineDecoder final : public av1gpu::Decoder {
     const bool ok = backend_->decode_reserved(*built, slot, out, &got, &stats_, error);
     delete built;
     if (!ok) return -1;
-    if (got >= 0) held_slots_.push_back(got);
+    if (got >= 0) {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      held_slots_.push_back(got);
+    }
     return got;
   }
 
@@ -226,6 +239,11 @@ class EngineDecoder final : public av1gpu::Decoder {
   std::unique_ptr<Backend> backend_;
   BackendOptions options_;
   DecodeStats stats_;
+  /* held_slots_ is touched from the pipeline's worker (decode_reference_*
+   * push the slot they decoded into) and from the caller's thread
+   * (release_reference/reset on a seek or a failed queue), so it has its own
+   * mutex - a concurrent push_back/erase corrupts the heap. */
+  std::mutex slot_mutex_;
   std::vector<int> held_slots_;
 };
 

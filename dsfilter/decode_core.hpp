@@ -119,6 +119,13 @@ class StreamDecoder {
   std::unique_ptr<Decoder> decoder_;
   void* state_; /* StreamState, defined in the .cpp */
 
+  /* push() runs on the demuxer's streaming thread; reset_stream() on whatever
+   * thread delivers the seek (EndFlush/NewSegment/Stop). They share pending_,
+   * the StreamState and the decoder's slot bookkeeping, so a dedicated mutex
+   * serializes them: without it a seek racing a Receive corrupts the heap
+   * (seen as 0xC0000374 in the player). Lock order is always stream_mutex_
+   * before pipe_mutex_, never the other way round. */
+  std::mutex stream_mutex_;
   std::vector<uint8_t> pending_; /* OBU bytes that wait for their tail */
   bool have_seq_ = false;
 

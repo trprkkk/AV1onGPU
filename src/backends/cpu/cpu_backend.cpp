@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #include "core/backend.hpp"
 
@@ -90,7 +91,12 @@ class CpuBackend final : public Backend {
   }
 
   int upload_reference(const Frame& frame, std::string* error) override {
-    const int slot = allocate_slot();
+    int slot;
+    {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      slot = allocate_slot();
+      if (slot >= 0) refs_[slot].used = true;
+    }
     if (slot < 0) {
       if (error) *error = "CPU reference pool exhausted";
       return -1;
@@ -98,7 +104,6 @@ class CpuBackend final : public Backend {
     /* pack into the same flat layout the jobs use */
     const PlanLayout& g = layout_;
     RefFrame& ref = refs_[slot];
-    ref.used = true;
     ref.width = frame.width;
     ref.height = frame.height;
     ref.bit_depth = frame.bit_depth;
@@ -118,12 +123,14 @@ class CpuBackend final : public Backend {
   }
 
   void release_reference(int slot) override {
+    std::lock_guard<std::mutex> lk(slot_mutex_);
     if (slot >= 0 && slot < kReferenceSlots) refs_[slot].used = false;
   }
 
   int reference_capacity() const override { return kReferenceSlots; }
 
   int reserve_reference() override {
+    std::lock_guard<std::mutex> lk(slot_mutex_);
     const int slot = allocate_slot();
     if (slot >= 0) refs_[slot].used = true; /* a later decode_reserved fills it */
     return slot;
@@ -427,19 +434,24 @@ class CpuBackend final : public Backend {
         /* an explicit slot reserved ahead of time by a pipelined caller */
         slot = forced_slot;
       } else {
+        std::lock_guard<std::mutex> lk(slot_mutex_);
         slot = allocate_slot();
         if (slot < 0) {
           *error = "CPU reference pool exhausted";
           return false;
         }
+        refs_[slot].used = true;
       }
-      RefFrame& ref = refs_[slot];
-      ref.used = true;
-      ref.width = g.frame.width;
-      ref.height = g.frame.height;
-      ref.bit_depth = g.frame.bit_depth;
-      ref.ss_x = g.frame.ss_x;
-      ref.ss_y = g.frame.ss_y;
+      {
+        std::lock_guard<std::mutex> lk(slot_mutex_);
+        RefFrame& ref = refs_[slot];
+        ref.used = true;
+        ref.width = g.frame.width;
+        ref.height = g.frame.height;
+        ref.bit_depth = g.frame.bit_depth;
+        ref.ss_x = g.frame.ss_x;
+        ref.ss_y = g.frame.ss_y;
+      }
       std::memcpy(ref_pool_.data() + static_cast<size_t>(slot) * g.buffer_size, frame,
                   g.buffer_size * sizeof(uint16_t));
     }
@@ -515,7 +527,10 @@ class CpuBackend final : public Backend {
     }
 
     if (out_slot) *out_slot = slot;
-    last_slot_ = slot;
+    {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      last_slot_ = slot;
+    }
 
     if (stats) {
       stats->blocks = plan.blocks;
@@ -537,6 +552,7 @@ class CpuBackend final : public Backend {
      * reads frame_ - the reference is only the fallback for an older slot. */
     const uint16_t* samples = frame_.data();
     if (slot >= 0) {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
       if (slot >= kReferenceSlots || !refs_[slot].used) {
         if (error) *error = "invalid reference slot";
         return false;
@@ -582,7 +598,11 @@ class CpuBackend final : public Backend {
   }
 
   void reset() override {
-    for (int i = 0; i < kReferenceSlots; ++i) refs_[i].used = false;
+    {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      for (int i = 0; i < kReferenceSlots; ++i) refs_[i].used = false;
+      last_slot_ = -1;
+    }
     std::fill(frame_.begin(), frame_.end(), 0);
     std::fill(ref_pool_.begin(), ref_pool_.end(), 0);
   }
@@ -604,6 +624,9 @@ class CpuBackend final : public Backend {
   std::vector<uint16_t> lr_prev_up_;/* the upscaled deblocked picture      */
   /* kReferenceSlots pictures of buffer_size samples, one after another */
   std::vector<uint16_t> ref_pool_;
+  /* Guards refs_[].used/last_slot_: a pipelined caller reserves from its own
+   * thread while the worker decodes into and releases other slots. */
+  mutable std::mutex slot_mutex_;
   RefFrame refs_[kReferenceSlots];
   int last_slot_ = -1;
 };
