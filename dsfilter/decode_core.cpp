@@ -16,9 +16,14 @@
 void debug_log(const char* fmt, ...);
 
 inline bool ds_debug_enabled() {
-  char flag[8] = {0};
-  const DWORD n = GetEnvironmentVariableA("AV1GPU_DS_DEBUG", flag, sizeof(flag));
-  return n > 0 && n < sizeof(flag) && flag[0] != '0';
+  /* cached: this is called on the per-frame hot path, and walking the
+   * environment block per call showed up in the pipeline timings */
+  static const bool enabled = [] {
+    char flag[8] = {0};
+    const DWORD n = GetEnvironmentVariableA("AV1GPU_DS_DEBUG", flag, sizeof(flag));
+    return n > 0 && n < sizeof(flag) && flag[0] != '0';
+  }();
+  return enabled;
 }
 
 void ds_debug_log(const char* fmt, ...) {
@@ -182,7 +187,13 @@ void StreamDecoder::queue_job(PipeJob job, std::string* error) {
   std::unique_lock<std::mutex> lk(pipe_mutex_);
   /* back pressure: a bounded queue keeps the decoder a few frames behind the
    * demuxer instead of planning the whole file into memory */
-  pipe_cv_.wait(lk, [&] { return jobs_.size() < kPipeDepth || pipe_failed_ || quitting_; });
+  /* Back pressure counts both queues: the planner moves a job from jobs_ to
+   * ready_jobs_ without running it, so bounding jobs_ alone would let the
+   * demuxer queue far more reserved slots than the backend pool has and force
+   * the reserve-fail drain (a visible hitch) once 8 + kPipeDepth is passed. */
+  pipe_cv_.wait(lk, [&] {
+    return jobs_.size() + ready_jobs_.size() < kPipeDepth || pipe_failed_ || quitting_;
+  });
   if (pipe_failed_ || quitting_) {
     /* the job will never run: hand its reservation straight back */
     const int slot = job.slot;
@@ -269,6 +280,7 @@ void StreamDecoder::worker_loop() {
     if (ready_jobs_.empty()) return; /* quitting_ */
     PipeJob job = std::move(ready_jobs_.front());
     ready_jobs_.pop_front();
+    pipe_cv_.notify_all(); /* in-flight space for queue_job() */
     busy_ = true;
     lk.unlock();
     run_job(&job);
@@ -477,7 +489,19 @@ bool StreamDecoder::push(const uint8_t* data, size_t size, size_t pitch,
    * reset the decoder while this thread is mid-OBU in them. queue_job()
    * takes pipe_mutex_ inside, which is fine: the worker never takes
    * stream_mutex_, so the lock order stream -> pipe cannot deadlock. */
-  std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+  LARGE_INTEGER d0{}, d1{}, df{};
+  const bool dtimed = ds_debug_enabled();
+  if (dtimed) {
+    QueryPerformanceFrequency(&df);
+    QueryPerformanceCounter(&d0);
+  }
+  std::unique_lock<std::mutex> stream_lock(stream_mutex_);
+  if (dtimed) {
+    QueryPerformanceCounter(&d1);
+    const double lms = double(d1.QuadPart - d0.QuadPart) * 1000.0 / double(df.QuadPart);
+    if (lms > 60.0) ds_debug_log("SLOW stream_lock: %.1f ms", lms);
+    QueryPerformanceCounter(&d0);
+  }
   /* A stream whose OBUs never complete would grow the buffer without bound;
    * 64 MiB is far past any real temporal unit. */
   constexpr size_t kPendingLimit = 64u << 20;
@@ -521,6 +545,11 @@ bool StreamDecoder::push(const uint8_t* data, size_t size, size_t pitch,
    * an incomplete tail for the next push. */
   pending_.erase(pending_.begin(),
                  pending_.begin() + static_cast<std::ptrdiff_t>(pos));
+  if (dtimed) {
+    QueryPerformanceCounter(&d1);
+    const double ms = double(d1.QuadPart - d0.QuadPart) * 1000.0 / double(df.QuadPart);
+    if (ms > 60.0) ds_debug_log("SLOW push body: %.1f ms (sample %zu bytes)", ms, size);
+  }
   return ok;
 }
 
@@ -591,8 +620,18 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   }
 
   frontend::FrameHeader frame;
+  LARGE_INTEGER h0{}, h1{}, hf{};
+  if (ds_debug_enabled()) {
+    QueryPerformanceFrequency(&hf);
+    QueryPerformanceCounter(&h0);
+  }
   const frontend::ParseStatus parsed =
       frontend::parse_frame_header(st->seq, data, size, &frame, error, &st->refs);
+  if (ds_debug_enabled()) {
+    QueryPerformanceCounter(&h1);
+    const double ms = double(h1.QuadPart - h0.QuadPart) * 1000.0 / double(hf.QuadPart);
+    if (ms > 60.0) ds_debug_log("SLOW stage frame_header: %.1f ms", ms);
+  }
   if (parsed == frontend::ParseStatus::Invalid) return false;
   if (parsed == frontend::ParseStatus::Unsupported) {
     frontend::refresh_ref_pool(frame, &st->refs);
@@ -619,9 +658,15 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   }
 
   frontend::TileGroup group;
+  if (ds_debug_enabled()) QueryPerformanceCounter(&h0);
   if (frontend::parse_tile_group(st->seq, frame, data, size, &group, error) !=
       frontend::ParseStatus::Ok) {
     return false;
+  }
+  if (ds_debug_enabled()) {
+    QueryPerformanceCounter(&h1);
+    const double ms = double(h1.QuadPart - h0.QuadPart) * 1000.0 / double(hf.QuadPart);
+    if (ms > 60.0) ds_debug_log("SLOW stage tile_group: %.1f ms", ms);
   }
   if (!frontend::tile_group_is_complete(frame, group)) {
     *error = "the tile group covers " + std::to_string(group.tiles.size()) +
@@ -658,7 +703,8 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   };
   static Stage st_tiles{"tiles"}, st_deq{"dequantise"}, st_plan{"plan"},
                st_gpu{"gpu_decode"}, st_nv12{"nv12_pack"}, st_preplan{"preplan"},
-               st_queue{"queue_wait"}, st_refresh{"refpool"};
+               st_queue{"queue_wait"}, st_refresh{"refpool"}, st_hdr{"frame_header"},
+               st_tg{"tile_group"}, st_res{"reserve"};
   LARGE_INTEGER pc0, pc1;
 
   QueryPerformanceCounter(&pc0);
@@ -755,6 +801,7 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
 
   bool pipelined = pipelined_;
   int reserved = -1;
+  if (ds_debug_enabled()) QueryPerformanceCounter(&h0);
   if (pipelined && kept) {
     reserved = decoder_->reserve_reference();
     if (reserved < 0) {
@@ -789,6 +836,11 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
         return false;
       }
     }
+  }
+  if (ds_debug_enabled()) {
+    QueryPerformanceCounter(&h1);
+    const double ms = double(h1.QuadPart - h0.QuadPart) * 1000.0 / double(hf.QuadPart);
+    if (ms > 60.0) ds_debug_log("SLOW stage reserve: %.1f ms", ms);
   }
 
   if (pipelined) {

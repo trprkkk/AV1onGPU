@@ -38,7 +38,7 @@ double now_ms() {
  * pipelined caller keeps one reserved per queued frame plus the ones a frame
  * displaces until its job has run (see kReferenceSlots in the CUDA backend,
  * which documents the sizing). */
-constexpr int kReferenceSlots = 24;
+constexpr int kReferenceSlots = 32;
 
 /* The slots live in one flat buffer, slot after slot, so a job can name any
  * reference (a compound prediction, or the neighbour of an OBMC strip) with an

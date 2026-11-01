@@ -740,7 +740,7 @@ class OpenCLBackend final : public Backend {
  private:
   /* one pool slot per AV1 reference slot plus the picture being decoded; see
    * the CPU backend */
-  static constexpr int kReferenceSlots = 24;
+  static constexpr int kReferenceSlots = 32;
 
   void shutdown() {
     for (auto& entry : kernels_) {

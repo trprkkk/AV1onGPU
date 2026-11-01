@@ -1377,7 +1377,7 @@ class CudaBackend final : public Backend {
    * headroom over 8 + kPipeDepth: a queued frame holds the slot it reserved and
    * the slots it displaced until its job has run, and when the pool runs out
    * the decode core drains the whole queue for one slot - a hitch. */
-  static constexpr int kReferenceSlots = 24;
+  static constexpr int kReferenceSlots = 32;
   /* the smallest device allocation ensure() hands out; see ensure() */
   static constexpr size_t kMinAllocation = 1024;
 

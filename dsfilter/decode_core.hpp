@@ -146,12 +146,13 @@ class StreamDecoder {
   std::condition_variable worker_cv_;   /* wake the worker */
   std::deque<PipeJob> jobs_;       /* parsed, waiting for the planner */
   std::deque<PipeJob> ready_jobs_; /* planned, waiting for the worker */
-  /* Back pressure: a bounded queue keeps the decoder a few frames behind the
-   * demuxer instead of planning the whole file into memory. Six frames of
-   * slack is what lets the pipeline run ahead during simple scenes and hide a
-   * keyframe's cost at a scene cut: with three, every GPU or scheduler spike
-   * reached the renderer as a visible hitch. */
-  static constexpr size_t kPipeDepth = 6;
+  /* Back pressure: a bounded number of in-flight jobs (parsed + planned) keeps
+   * the decoder a few frames behind the demuxer instead of planning the whole
+   * file into memory. The bound has to cover both queues (see queue_job), and
+   * it also has to stay under kReferenceSlots - 8: each in-flight kept frame
+   * holds one reserved backend slot on top of the eight the reference pool can
+   * name, and running out is what triggers the reserve-fail drain. */
+  static constexpr size_t kPipeDepth = 12;
   bool pipelined_ = false;   /* frames go through the queue */
   bool plan_thread_ = true;  /* the planner thread builds the plans */
   bool preplan_ = false;     /* the decoder can pre-build frame plans */

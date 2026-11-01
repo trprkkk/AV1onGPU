@@ -49,7 +49,7 @@ FORMAT_VERSION = 8       # 2 the palette map, 3 the itx scratch size,
                          # 6 that noise image as 16 bit samples,
                          # 7 the loop restoration jobs,
                          # 8 the inter job's plane
-REFERENCE_SLOTS = 24      # kReferenceSlots in the backends
+REFERENCE_SLOTS = 32      # kReferenceSlots in the backends
 CDEF_DIM = 8             # AV1G_CDEF_DIM
 MASK_DIFFWTD = 2         # AV1G_MASK_DIFFWTD
 # the ctypes mirror flattens nested struct arrays, so field `n` of the `k`th
