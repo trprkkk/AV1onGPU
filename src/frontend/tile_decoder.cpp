@@ -19,24 +19,31 @@ namespace {
  * are grouped into the context alphabet of the key frame y mode symbol. */
 constexpr int8_t kIntraModeContext[kModeLumaCount] = {0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0};
 
+/* The frame this decoder is currently parsing, counted from zero. Only the
+ * debug probes read it, and only so a dump can be attributed to a frame. */
+int g_frame_ordinal = -1;
+
 /* AV1GPU_TRACE=1 dumps one line per parsed block, in the same shape a patched
  * dav1d prints for the same stream, so the two decoders can be diffed line by
  * line. A wrong probability or a context read from the wrong neighbour shows up
  * as the first line that differs, which is far easier to chase than a PSNR.
  * This is a debugging aid: it is off unless the variable is set, costs one
- * branch per block, and never runs on the GPU paths. */
+ * branch per block, and never runs on the GPU paths. AV1GPU_TRACE_FROM=N
+ * suppresses the dump before frame N (4K frames are tens of thousands of
+ * lines each). */
 bool trace_enabled() {
   static const bool enabled = std::getenv("AV1GPU_TRACE") != nullptr;
-  return enabled;
+  if (!enabled) return false;
+  static const int from = [] {
+    const char* e = std::getenv("AV1GPU_TRACE_FROM");
+    return e ? std::atoi(e) : -1;
+  }();
+  return from < 0 || g_frame_ordinal >= from;
 }
 
 /* AV1GPU_TRACE_CDF=1 adds the partition context derivation and the whole CDF
  * row to that trace. Finding the first block where two decoders disagree needs
  * it, but it is far too much output for every other use of the trace. */
-/* The frame this decoder is currently parsing, counted from zero. Only the
- * debug probes read it, and only so a dump can be attributed to a frame. */
-int g_frame_ordinal = -1;
-
 bool cdf_trace_enabled() {
   static const bool enabled = std::getenv("AV1GPU_TRACE_CDF") != nullptr;
   return enabled;
