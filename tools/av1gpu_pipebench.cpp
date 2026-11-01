@@ -228,9 +228,9 @@ int main(int argc, char** argv) {
       if (have_prev) {
         const double gap = std::chrono::duration<double, std::milli>(now - prev).count();
         intervals.push_back(gap);
-        if (gap > 100.0 && gap_log.is_open())
-          gap_log << "gap " << gap << " ms before frame " << shown << " decoded "
-                  << decoder.decoded_frames() << " t " << since0() << "\n";
+        if (gap_log.is_open())
+          gap_log << "sink " << shown << " t " << since0() << " gap " << gap << " decoded "
+                  << decoder.decoded_frames() << "\n";
       }
       prev = now;
       have_prev = true;

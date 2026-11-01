@@ -22,10 +22,14 @@
  * carry a plain sample offset and the backends need a single allocation.
  */
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <mutex>
+#include <thread>
+#include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -34,6 +38,7 @@
 #endif
 
 #include "core/backend.hpp"
+#include "frontend/thread_pool.hpp"
 
 namespace av1gpu {
 namespace internal {
@@ -295,7 +300,8 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         n = 0;
       }
       void tick() {
-        if (++n % 100 == 0) report(100);
+        /* eight marks per call, so 800 ticks are 100 frames */
+        if (++n % 800 == 0) report(100);
       }
     };
     static PlanTimer ptimer;
@@ -435,17 +441,21 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
       if (!plane_needs_owner[p]) continue;
       owner[p].assign(static_cast<size_t>(cell_w[p]) * cell_h[p], -1);
     }
-    for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
-      const BlockSyntax& b = syntax.blocks[bi];
-      const int p = b.plane;
-      if (!plane_needs_owner[p]) continue;
-      const int oc = owner_cell[p];
-      const int cx1 = std::min((b.x + b.w + oc - 1) / oc, cell_w[p]);
-      const int cy1 = std::min((b.y + b.h + oc - 1) / oc, cell_h[p]);
-      for (int cy = std::max(b.y, 0) / oc; cy < cy1; ++cy)
-        for (int cx = std::max(b.x, 0) / oc; cx < cx1; ++cx)
-          owner[p][static_cast<size_t>(cy) * cell_w[p] + cx] = static_cast<int>(bi);
-    }
+    /* Blocks tile the frame, so no two of them write the same cell: the owner
+     * grid builds in chunks on several threads. */
+    frontend::parallel_chunks(syntax.blocks.size(), 6, [&](size_t, size_t b0, size_t e0) {
+      for (size_t bi = b0; bi < e0; ++bi) {
+        const BlockSyntax& b = syntax.blocks[bi];
+        const int p = b.plane;
+        if (!plane_needs_owner[p]) continue;
+        const int oc = owner_cell[p];
+        const int cx1 = std::min((b.x + b.w + oc - 1) / oc, cell_w[p]);
+        const int cy1 = std::min((b.y + b.h + oc - 1) / oc, cell_h[p]);
+        for (int cy = std::max(b.y, 0) / oc; cy < cy1; ++cy)
+          for (int cx = std::max(b.x, 0) / oc; cx < cx1; ++cx)
+            owner[p][static_cast<size_t>(cy) * cell_w[p] + cx] = static_cast<int>(bi);
+      }
+    });
     AV1GPU_PT_MARK(ptimer.rest);
     auto sample_owner = [&](int p, int x, int y) {
       if (x < 0 || y < 0 || x >= grid_w[p] || y >= grid_h[p]) return -1;
@@ -612,11 +622,28 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     AV1GPU_PT_MARK(ptimer.waves);
     /* The transform scratch is handed out in job order, one w * h block per
      * job. Two jobs never share a region, so the passes of a wave stay
-     * independent even when the coefficient areas are smaller. */
-    size_t tmp_cursor = 0;
+     * independent even when the coefficient areas are smaller. The prefix sum
+     * gives every block its scratch start without a shared cursor, so the job
+     * loop can run in chunks: chunk [b, e) starts its cursor at block_tmp[b],
+     * exactly where the sequential loop would be at that block. */
+    std::vector<size_t> block_tmp(syntax.blocks.size() + 1, 0);
     for (size_t bi = 0; bi < syntax.blocks.size(); ++bi) {
+      size_t sum = block_tmp[bi];
+      for (const TransformBlock& tx : syntax.blocks[bi].transforms)
+        sum += static_cast<size_t>(tx.w) * static_cast<size_t>(tx.h);
+      block_tmp[bi + 1] = sum;
+    }
+    plan->tmp_size = block_tmp.back();
+
+    /* Building one block's jobs touches nothing but its own wave's vectors,
+     * so chunks of blocks build in parallel into per-chunk wave tables and are
+     * merged in chunk order afterwards - which is the sequential order. */
+    std::atomic<bool> job_failed{false};
+    auto build_jobs = [&](size_t b_begin, size_t b_end, WaveJobs* waves_out) {
+      size_t tmp_cursor = block_tmp[b_begin];
+      for (size_t bi = b_begin; bi < b_end; ++bi) {
       const BlockSyntax& b = syntax.blocks[bi];
-      WaveJobs& wj = plan->waves[block_wave[bi]];
+      WaveJobs& wj = waves_out[block_wave[bi]];
       const int plane = b.plane;
       const int stride = g.stride[plane];
       const int dst_off = at(plane, b.x, b.y);
@@ -724,8 +751,9 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
           if (job.mask_kind == AV1G_MASK_WEDGE) {
             int dir = AV1G_WEDGE_HORIZONTAL, xoff = 0, yoff = 0, flip = 0;
             if (!tables::wedge_entry(luma_w, luma_h, b.wedge_index, &dir, &xoff, &yoff, &flip)) {
-              *error = "engine: a wedge on a block size that has none";
-              return false;
+              if (!job_failed.exchange(true))
+                *error = "engine: a wedge on a block size that has none";
+              return;
             }
             job.wedge_dir = dir;
             job.wedge_xoff = xoff;
@@ -763,8 +791,9 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
           int dir = AV1G_WEDGE_HORIZONTAL, xoff = 0, yoff = 0, flip = 0;
           if (!tables::wedge_entry(luma_w, luma_h, b.wedge_index, &dir, &xoff, &yoff,
                                    &flip)) {
-            *error = "engine: an inter/intra wedge on a block size that has none";
-            return false;
+            if (!job_failed.exchange(true))
+              *error = "engine: an inter/intra wedge on a block size that has none";
+            return;
           }
           job.interintra_wedge = 1;
           job.wedge_dir = dir;
@@ -804,8 +833,10 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
          * because the model is a frame property and the two passes of the
          * warp need it. A model whose shear is too steep to apply is not
          * warped at all - the block falls back to its vector, which is the
-         * specification's warpValid. */
-        const bool warp_disabled = std::getenv("AV1GPU_NO_WARP") != nullptr;
+         * specification's warpValid. The environment is read once: this loop
+         * runs per block, and getenv walks the whole environment block. */
+        static const bool warp_disabled = std::getenv("AV1GPU_NO_WARP") != nullptr;
+        static const bool warp_debug = std::getenv("AV1GPU_WARPDEBUG") != nullptr;
         for (int i = 0; i < 2; ++i) {
           job.warp[i] = 0;
           job.mask_warp[i] = 0;
@@ -822,7 +853,7 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
           job.warp_abcd[i][1] = beta;
           job.warp_abcd[i][2] = gamma;
           job.warp_abcd[i][3] = delta;
-          if (std::getenv("AV1GPU_WARPDEBUG"))
+          if (warp_debug)
             std::fprintf(stderr, "WARP ref=%d plane=%d x=%d y=%d w=%d h=%d params=%d,%d,%d,%d,%d,%d abcd=%d,%d,%d,%d\n",
                          i, plane, b.x, b.y, b.w, b.h, b.warp_params[i][0], b.warp_params[i][1],
                          b.warp_params[i][2], b.warp_params[i][3], b.warp_params[i][4],
@@ -837,7 +868,6 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         itx.coef_off = tx.coef_offset;
         itx.tmp_off = static_cast<int>(tmp_cursor);
         tmp_cursor += static_cast<size_t>(tx.w) * static_cast<size_t>(tx.h);
-        plan->tmp_size = tmp_cursor;
         itx.dst_off = dst_off + tx.y * stride + tx.x;
         itx.dst_stride = stride;
         itx.w = tx.w;
@@ -853,64 +883,116 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         else
           wj.itx.push_back(itx);
       }
-    }
+      }
+    };
+
+    /* At most 6 chunks (the pool's cap); a chunk marks itself used, and the
+     * merge below walks the chunks in order - the sequential order. */
+    std::vector<std::vector<WaveJobs>> local(6);
+    std::vector<char> used(6, 0);
+    frontend::parallel_chunks(syntax.blocks.size(), 6, [&](size_t t, size_t b0, size_t e0) {
+      if (t >= local.size()) return;
+      used[t] = 1;
+      local[t].assign(static_cast<size_t>(max_wave) + 1, WaveJobs());
+      build_jobs(b0, e0, local[t].data());
+    });
+    for (int w = 0; w <= max_wave; ++w)
+      for (size_t t = 0; t < local.size(); ++t) {
+        if (!used[t]) continue;
+        WaveJobs& dst = plan->waves[static_cast<size_t>(w)];
+        WaveJobs& src = local[t][static_cast<size_t>(w)];
+        dst.intra.insert(dst.intra.end(), std::make_move_iterator(src.intra.begin()),
+                         std::make_move_iterator(src.intra.end()));
+        dst.inter.insert(dst.inter.end(), std::make_move_iterator(src.inter.begin()),
+                         std::make_move_iterator(src.inter.end()));
+        dst.itx.insert(dst.itx.end(), std::make_move_iterator(src.itx.begin()),
+                       std::make_move_iterator(src.itx.end()));
+        dst.residual.insert(dst.residual.end(), std::make_move_iterator(src.residual.begin()),
+                            std::make_move_iterator(src.residual.end()));
+      }
+    if (job_failed) return false;
 
     /* ---- deblock ---------------------------------------------------------- */
     AV1GPU_PT_MARK(ptimer.jobs);
-    for (const DeblockEdge& e : syntax.deblock) {
-      Av1gDeblockJob job;
-      std::memset(&job, 0, sizeof(job));
-      const int plane = e.plane;
-      /* e.x / e.y is the first sample on the far side of the edge, so p1 (two
-       * samples in) sits two steps before it. `stride` steps across the edge,
-       * `step` runs along it. */
-      job.p_off = e.vertical ? at(plane, e.x - 2, e.y) : at(plane, e.x, e.y - 2);
-      job.stride = e.vertical ? 1 : g.stride[plane];
-      job.step = e.vertical ? g.stride[plane] : 1;
-      job.len = e.length;
-      job.level = e.level;
-      job.sharpness = syntax.sharpness;
-      job.filter_size = e.filter_size;
-      job.is_chroma = plane != 0;
-      job.bitdepth = geom.bit_depth;
-      (e.vertical ? plan->deblock_v : plan->deblock_h).push_back(job);
+    /* One chunk per thread, merged in chunk order: each chunk's edges keep
+     * their relative order, so the merged vectors are the sequential ones. */
+    const unsigned hw_deb = std::thread::hardware_concurrency();
+    const unsigned k_deb =
+        syntax.deblock.size() >= 256 && hw_deb > 1 ? std::min<unsigned>(6, hw_deb) : 1;
+    std::vector<std::vector<Av1gDeblockJob>> deb_v(k_deb), deb_h(k_deb);
+    frontend::parallel_chunks(syntax.deblock.size(), 6, [&](size_t t, size_t b0, size_t e0) {
+      for (size_t i = b0; i < e0; ++i) {
+        const DeblockEdge& e = syntax.deblock[i];
+        Av1gDeblockJob job;
+        std::memset(&job, 0, sizeof(job));
+        const int plane = e.plane;
+        /* e.x / e.y is the first sample on the far side of the edge, so p1 (two
+         * samples in) sits two steps before it. `stride` steps across the edge,
+         * `step` runs along it. */
+        job.p_off = e.vertical ? at(plane, e.x - 2, e.y) : at(plane, e.x, e.y - 2);
+        job.stride = e.vertical ? 1 : g.stride[plane];
+        job.step = e.vertical ? g.stride[plane] : 1;
+        job.len = e.length;
+        job.level = e.level;
+        job.sharpness = syntax.sharpness;
+        job.filter_size = e.filter_size;
+        job.is_chroma = plane != 0;
+        job.bitdepth = geom.bit_depth;
+        (e.vertical ? deb_v[t] : deb_h[t]).push_back(job);
+      }
+    });
+    for (unsigned t = 0; t < k_deb; ++t) {
+      plan->deblock_v.insert(plan->deblock_v.end(), std::make_move_iterator(deb_v[t].begin()),
+                             std::make_move_iterator(deb_v[t].end()));
+      plan->deblock_h.insert(plan->deblock_h.end(), std::make_move_iterator(deb_h[t].begin()),
+                             std::make_move_iterator(deb_h[t].end()));
     }
 
     /* ---- CDEF -------------------------------------------------------------- */
     AV1GPU_PT_MARK(ptimer.deblock);
-    for (const CdefBlock& c : syntax.cdef) {
-      Av1gCdefJob job;
-      std::memset(&job, 0, sizeof(job));
-      const int plane = c.plane;
-      const bool chroma = plane > 0;
-      job.x = c.x;
-      job.y = c.y;
-      job.src_off = at(plane, c.x, c.y);
-      job.src_stride = g.stride[plane];
-      job.dst_off = job.src_off;
-      job.dst_stride = g.stride[plane];
-      /* the direction always comes from the luma, so a chroma block carries the
-       * luma block it is co-located with */
-      job.luma_off = at(0, chroma ? c.x << geom.ss_x : c.x,
-                        chroma ? c.y << geom.ss_y : c.y);
-      job.luma_stride = g.stride[0];
-      job.pri_strength = c.pri_strength;
-      job.sec_strength = c.sec_strength;
-      job.damping = c.damping;
-      job.dir = c.dir;
-      job.uv = chroma ? 1 : 0;
-      job.ss_x = geom.ss_x;
-      job.ss_y = geom.ss_y;
-      job.bitdepth = geom.bit_depth;
-      /* The block grid and the halo are the *coded* extent (MiCols * MI_SIZE,
-       * rounded to eight), not the visible one: 7.15 copies and writes the
-       * whole 8x8 block and decides availability in mi units, so the last
-       * partial block of a frame whose size is not a multiple of eight filters
-       * against samples that exist in the border but not in the picture. */
-      job.plane_w = grid_w[plane];
-      job.plane_h = grid_h[plane];
-      plan->cdef.push_back(job);
-    }
+    const unsigned hw_cd = std::thread::hardware_concurrency();
+    const unsigned k_cd =
+        syntax.cdef.size() >= 256 && hw_cd > 1 ? std::min<unsigned>(6, hw_cd) : 1;
+    std::vector<std::vector<Av1gCdefJob>> cdef_l(k_cd);
+    frontend::parallel_chunks(syntax.cdef.size(), 6, [&](size_t t, size_t b0, size_t e0) {
+      for (size_t i = b0; i < e0; ++i) {
+        const CdefBlock& c = syntax.cdef[i];
+        Av1gCdefJob job;
+        std::memset(&job, 0, sizeof(job));
+        const int plane = c.plane;
+        const bool chroma = plane > 0;
+        job.x = c.x;
+        job.y = c.y;
+        job.src_off = at(plane, c.x, c.y);
+        job.src_stride = g.stride[plane];
+        job.dst_off = job.src_off;
+        job.dst_stride = g.stride[plane];
+        /* the direction always comes from the luma, so a chroma block carries the
+         * luma block it is co-located with */
+        job.luma_off = at(0, chroma ? c.x << geom.ss_x : c.x,
+                          chroma ? c.y << geom.ss_y : c.y);
+        job.luma_stride = g.stride[0];
+        job.pri_strength = c.pri_strength;
+        job.sec_strength = c.sec_strength;
+        job.damping = c.damping;
+        job.dir = c.dir;
+        job.uv = chroma ? 1 : 0;
+        job.ss_x = geom.ss_x;
+        job.ss_y = geom.ss_y;
+        job.bitdepth = geom.bit_depth;
+        /* The block grid and the halo are the *coded* extent (MiCols * MI_SIZE,
+         * rounded to eight), not the visible one: 7.15 copies and writes the
+         * whole 8x8 block and decides availability in mi units, so the last
+         * partial block of a frame whose size is not a multiple of eight filters
+         * against samples that exist in the border but not in the picture. */
+        job.plane_w = grid_w[plane];
+        job.plane_h = grid_h[plane];
+        cdef_l[t].push_back(job);
+      }
+    });
+    for (unsigned t = 0; t < k_cd; ++t)
+      plan->cdef.insert(plan->cdef.end(), std::make_move_iterator(cdef_l[t].begin()),
+                        std::make_move_iterator(cdef_l[t].end()));
 
     /* ---- superres ---------------------------------------------------------- */
     /* The upscaling process (7.15) runs on the CDEF output and before the loop

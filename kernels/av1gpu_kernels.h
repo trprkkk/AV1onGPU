@@ -3235,12 +3235,12 @@ AV1G_HOST_FN void av1g_color_block(const Av1gColorJob *job, const av1g_px *y_pla
       av1g_color_px(job, y_plane, u_plane, v_plane, rgb, x, y);
 }
 
-/* The whole interleaved buffer, described by one job: `h + ch` rows of `pitch`
- * bytes. The host path and the kernels therefore fill every byte, padding
- * included. */
-AV1G_HOST_FN void av1g_nv12_block(const Av1gNv12Job *job, const av1g_px *y_plane,
-                                  const av1g_px *u_plane, const av1g_px *v_plane,
-                                  unsigned char *dst) {
+/* Rows [r0, r1) of the interleaved buffer, described by one job: luma rows
+ * `0 .. h` then `ch` chroma rows, `pitch` bytes each. Split out so the host
+ * pack can spread the rows over threads - every row is independent. */
+AV1G_HOST_FN void av1g_nv12_rows(const Av1gNv12Job *job, const av1g_px *y_plane,
+                                 const av1g_px *u_plane, const av1g_px *v_plane,
+                                 unsigned char *dst, int r0, int r1) {
   const int ch = (job->h + (1 << job->ss_y) - 1) >> job->ss_y;
   const int cw = (job->w + (1 << job->ss_x) - 1) >> job->ss_x;
   const int shift = job->bitdepth - 8;
@@ -3250,7 +3250,7 @@ AV1G_HOST_FN void av1g_nv12_block(const Av1gNv12Job *job, const av1g_px *y_plane
    * - with its per sample clamp and interleave branches - for each of
    * `pitch * (h + ch)` bytes. Padding is zero, the same bytes the per sample
    * kernel produces. */
-  for (row = 0; row < job->h; ++row) {
+  for (row = r0; row < r1 && row < job->h; ++row) {
     const av1g_px *src = y_plane + job->y_off + row * job->y_stride;
     unsigned char *d = dst + row * job->pitch;
     if (shift == 0) {
@@ -3260,10 +3260,11 @@ AV1G_HOST_FN void av1g_nv12_block(const Av1gNv12Job *job, const av1g_px *y_plane
     }
     for (x = job->w; x < job->pitch; ++x) d[x] = 0;
   }
-  for (row = 0; row < ch; ++row) {
-    const av1g_px *u = u_plane + job->u_off + row * job->c_stride;
-    const av1g_px *v = v_plane + job->v_off + row * job->c_stride;
-    unsigned char *d = dst + (job->h + row) * job->pitch;
+  for (row = (r0 > job->h ? r0 : job->h); row < r1 && row < job->h + ch; ++row) {
+    const int c_row = row - job->h;
+    const av1g_px *u = u_plane + job->u_off + c_row * job->c_stride;
+    const av1g_px *v = v_plane + job->v_off + c_row * job->c_stride;
+    unsigned char *d = dst + row * job->pitch;
     if (shift == 0) {
       for (x = 0; x < cw; ++x) {
         d[2 * x] = (unsigned char)u[x];
@@ -3277,6 +3278,16 @@ AV1G_HOST_FN void av1g_nv12_block(const Av1gNv12Job *job, const av1g_px *y_plane
     }
     for (x = 2 * cw; x < job->pitch; ++x) d[x] = 0;
   }
+}
+
+/* The whole interleaved buffer, described by one job: `h + ch` rows of `pitch`
+ * bytes. The host path and the kernels therefore fill every byte, padding
+ * included. */
+AV1G_HOST_FN void av1g_nv12_block(const Av1gNv12Job *job, const av1g_px *y_plane,
+                                   const av1g_px *u_plane, const av1g_px *v_plane,
+                                   unsigned char *dst) {
+  const int ch = (job->h + (1 << job->ss_y) - 1) >> job->ss_y;
+  av1g_nv12_rows(job, y_plane, u_plane, v_plane, dst, 0, job->h + ch);
 }
 
 #endif

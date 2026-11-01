@@ -34,11 +34,11 @@ double now_ms() {
 }
 
 /* AV1 has eight reference slots, and a stream may keep a different picture in
- * every one of them. The ninth buffer is the picture being decoded: it cannot
- * be written into a buffer whose samples the prediction still has to read, and
- * a frame is allowed to refresh a slot it also predicts from, so the output
- * always needs a buffer of its own. */
-constexpr int kReferenceSlots = 9;
+ * every one of them. The buffers past the eighth are the pictures in flight: a
+ * pipelined caller keeps one reserved per queued frame plus the ones a frame
+ * displaces until its job has run (see kReferenceSlots in the CUDA backend,
+ * which documents the sizing). */
+constexpr int kReferenceSlots = 24;
 
 /* The slots live in one flat buffer, slot after slot, so a job can name any
  * reference (a compound prediction, or the neighbour of an OBMC strip) with an
@@ -165,14 +165,25 @@ class CpuBackend final : public Backend {
      * astray, which is why the dump is on the job rather than on the block. */
     static int g_decode_count = 0;
     ++g_decode_count;
+    /* The debug switches below are read once: the job loops run thousands of
+     * times per frame (and under OpenMP), and getenv walks the environment
+     * block every time it is called. */
+    static const char* const dump_coded_env = std::getenv("AV1GPU_DUMPCODED");
+    static const bool plan_stats = std::getenv("AV1GPU_PLAN_STATS") != nullptr;
+    static const bool obmc_dump = std::getenv("AV1GPU_OBMCDUMP") != nullptr;
+    static const bool mc_dump = std::getenv("AV1GPU_MCDUMP") != nullptr;
+    static const char* const inter_rect = std::getenv("AV1GPU_INTERRECT");
+    static const char* const no_lf_env = std::getenv("AV1GPU_NO_DEBLOCK");
+    static const char* const no_cdef_env = std::getenv("AV1GPU_NO_CDEF");
+    static const char* const no_lr_env = std::getenv("AV1GPU_NO_LR");
     /* AV1GPU_DUMPCODED=<file> appends every decoded picture, shown or not, in
      * coding order. Comparing against a reference decoder's invisible frame
      * output (dav1d's output_invisible_frames) is the only way to tell which
      * frame a drift starts on: a display-order dump cannot, because a stream
      * with show_existing_frame reorders them. */
-    const char* dump_coded = std::getenv("AV1GPU_DUMPCODED");
+    const char* dump_coded = dump_coded_env;
 
-    if (std::getenv("AV1GPU_PLAN_STATS")) {
+    if (plan_stats) {
       size_t ni = 0, nt = 0, nr = 0, nx = 0;
       for (const WaveJobs& w : plan.waves) {
         ni += w.intra.size();
@@ -220,7 +231,7 @@ class CpuBackend final : public Backend {
         for (int k = 0; k < job.obmc_count; ++k)
           if (job.obmc[k].ref_slot >= 0)
             job.obmc[k].ref_off += job.obmc[k].ref_slot * static_cast<int>(g.buffer_size);
-        if (job.obmc_count > 0 && std::getenv("AV1GPU_OBMCDUMP")) {
+        if (job.obmc_count > 0 && obmc_dump) {
           static int obmc_dumped = 0;
           if (obmc_dumped < 4) {
             ++obmc_dumped;
@@ -237,7 +248,7 @@ class CpuBackend final : public Backend {
                            job.obmc[k].filt_v, job.obmc[k].ref_slot, job.obmc[k].ref_off);
           }
         }
-        if (std::getenv("AV1GPU_MCDUMP") && job.dst_off == g.plane_off[0]) {
+        if (mc_dump && job.dst_off == g.plane_off[0]) {
           static int dumped = 0;
           if (dumped < 3) {
             ++dumped;
@@ -249,7 +260,7 @@ class CpuBackend final : public Backend {
                          job.ref1_slot, job.obmc_count, job.dst_off);
           }
         }
-        if (const char* rect = std::getenv("AV1GPU_INTERRECT")) {
+        if (const char* rect = inter_rect) {
           int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
           if (std::sscanf(rect, "%d,%d,%d,%d", &x0, &y0, &x1, &y1) == 4) {
             for (int p = 0; p < 3; ++p) {
@@ -269,7 +280,7 @@ class CpuBackend final : public Backend {
           }
         }
         av1g_inter_block(&job, frame, frame, ref_pool_.data(), filters, maxv);
-        if (job.obmc_count > 0 && std::getenv("AV1GPU_OBMCDUMP")) {
+        if (job.obmc_count > 0 && obmc_dump) {
           static int obmc_dumped = 0;
           if (obmc_dumped < 4) {
             ++obmc_dumped;
@@ -285,7 +296,7 @@ class CpuBackend final : public Backend {
                            job.obmc[k].filt_v, job.obmc[k].ref_slot, job.obmc[k].ref_off);
           }
         }
-        if (std::getenv("AV1GPU_MCDUMP") && job.dst_off == g.plane_off[0]) {
+        if (mc_dump && job.dst_off == g.plane_off[0]) {
           static int dumped2 = 0;
           if (dumped2 < 3) {
             ++dumped2;
@@ -331,7 +342,6 @@ class CpuBackend final : public Backend {
      * sequential passes (the order the specification defines). Inside one group
      * the edges are disjoint, which makes the pass fully parallel. */
     /* AV1GPU_NO_DEBLOCK is a debug bitmask of planes to leave unfiltered. */
-    const char* no_lf_env = std::getenv("AV1GPU_NO_DEBLOCK");
     const int no_lf = no_lf_env ? std::atoi(no_lf_env) : 0;
     for (const std::vector<Av1gDeblockJob>* pass : {&plan.deblock_v, &plan.deblock_h}) {
       const int n = static_cast<int>(pass->size());
@@ -352,7 +362,6 @@ class CpuBackend final : public Backend {
     if (uses_lr) std::memcpy(lr_curr_.data(), frame, g.buffer_size * sizeof(uint16_t));
 
     /* AV1GPU_NO_CDEF is a debug bitmask of planes to leave unfiltered. */
-    const char* no_cdef_env = std::getenv("AV1GPU_NO_CDEF");
     const int no_cdef = no_cdef_env ? std::atoi(no_cdef_env) : 0;
     if (!plan.cdef.empty()) {
       /* CDEF reads a copy of the frame so that neighbouring blocks cannot
@@ -407,7 +416,6 @@ class CpuBackend final : public Backend {
      * units and needs no ordering. */
     /* AV1GPU_NO_LR is a debug bitmask of planes to leave unrestored, the same
      * convention AV1GPU_NO_DEBLOCK and AV1GPU_NO_CDEF use. */
-    const char* no_lr_env = std::getenv("AV1GPU_NO_LR");
     const int no_lr = no_lr_env ? std::atoi(no_lr_env) : 0;
     if (uses_lr && no_lr != 7) {
       std::memcpy(lr_cdef_.data(), frame, g.buffer_size * sizeof(uint16_t));
@@ -478,7 +486,7 @@ class CpuBackend final : public Backend {
     }
 
 
-    if (std::getenv("AV1GPU_MCDUMP")) {
+    if (mc_dump) {
       static int dumped3 = 0;
       if (dumped3 < 3) {
         ++dumped3;

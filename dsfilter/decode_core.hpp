@@ -111,6 +111,7 @@ class StreamDecoder {
   bool emit(const Frame& picture, size_t pitch, const Sink& sink, std::string* error);
 
   void queue_job(PipeJob job, std::string* error);
+  void planner_loop();
   void worker_loop();
   void run_job(PipeJob* job);
   void pipe_fail(const std::string& message);
@@ -129,25 +130,35 @@ class StreamDecoder {
   std::vector<uint8_t> pending_; /* OBU bytes that wait for their tail */
   bool have_seq_ = false;
 
-  /* The frame pipeline. `pipe_picture_`/`pipe_valid_` are the decoded-picture
-   * half of the reference pool (for show_existing_frame); both the main thread
-   * (synchronous fallback) and the worker write them under `pipe_mutex_`. */
+  /* The frame pipeline is three stages: the demuxer's thread parses and plans
+   * the syntax (jobs_), a planner thread turns the syntax into the CPU-heavy
+   * frame plan (ready_jobs_), and the worker runs the kernels and emits. The
+   * planner stage is what overlaps frame N's plan build with frame N-1's GPU
+   * work; without it the worker paid the two back to back. `pipe_picture_`/
+   * `pipe_valid_` are the decoded-picture half of the reference pool (for
+   * show_existing_frame); both the main thread (synchronous fallback) and the
+   * worker write them under `pipe_mutex_`. */
+  std::thread planner_;
   std::thread worker_;
   mutable std::mutex pipe_mutex_;
-  std::condition_variable pipe_cv_;    /* queue space or drain */
-  std::condition_variable worker_cv_;  /* wake the worker */
-  std::deque<PipeJob> jobs_;
+  std::condition_variable pipe_cv_;     /* queue space or drain */
+  std::condition_variable planner_cv_;  /* wake the planner */
+  std::condition_variable worker_cv_;   /* wake the worker */
+  std::deque<PipeJob> jobs_;       /* parsed, waiting for the planner */
+  std::deque<PipeJob> ready_jobs_; /* planned, waiting for the worker */
   /* Back pressure: a bounded queue keeps the decoder a few frames behind the
    * demuxer instead of planning the whole file into memory. Six frames of
    * slack is what lets the pipeline run ahead during simple scenes and hide a
    * keyframe's cost at a scene cut: with three, every GPU or scheduler spike
    * reached the renderer as a visible hitch. */
-  static constexpr size_t kPipeDepth = 3;
+  static constexpr size_t kPipeDepth = 6;
   bool pipelined_ = false;   /* frames go through the queue */
+  bool plan_thread_ = true;  /* the planner thread builds the plans */
   bool preplan_ = false;     /* the decoder can pre-build frame plans */
   bool fallback_used_ = false; /* a failed reservation switched us to sync */
-  bool quitting_ = false;    /* worker must exit */
+  bool quitting_ = false;    /* threads must exit once the queues are empty */
   bool busy_ = false;        /* the worker is inside a job */
+  bool planner_busy_ = false; /* the planner is inside a job */
   bool pipe_failed_ = false; /* a queued job failed; the stream is broken */
   Frame pipe_picture_[8];
   bool pipe_valid_[8] = {false, false, false, false, false,

@@ -48,8 +48,11 @@
 #define AV1GPU_FRONTEND_RECONSTRUCT_HPP
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -413,6 +416,8 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
    * the block that covers it. Overlapped block motion compensation reads the
    * above and left neighbours of a block through it; the block itself is in the
    * map too, but a candidate is never the block's own cell. */
+  static const bool pstage = std::getenv("AV1GPU_PLAN_STAGE") != nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
   std::vector<int> mi_owner(static_cast<size_t>(st.mi_cols) * st.mi_rows, -1);
   for (size_t bi = 0; bi < tile.blocks.size(); ++bi) {
     const TileBlock& owner = tile.blocks[bi];
@@ -427,6 +432,7 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
       }
     }
   }
+  const auto t1 = std::chrono::steady_clock::now();
   auto mi_block = [&](int row, int col) -> const TileBlock* {
     if (row < 0 || col < 0 || row >= st.mi_rows || col >= st.mi_cols) return nullptr;
     const int idx = mi_owner[static_cast<size_t>(row) * st.mi_cols + col];
@@ -446,7 +452,20 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
   const bool lossless = frame.coded_lossless;
   size_t next_offset = 0;
 
+  /* Reused across the block loop: declaring them inside it would allocate
+   * three vectors per block, and a frame has thousands of blocks. They are
+   * drained (moved out) before the next block starts, so clear is all the
+   * reset they need. */
+  BlockSyntax inter_block[3];
+  std::vector<BlockSyntax> inter_regions[3];
+  bool inter_used[3] = {false, false, false};
+
   for (const TileBlock& block : tile.blocks) {
+    for (int p = 0; p < 3; ++p) {
+      inter_block[p].obmc.clear();
+      inter_regions[p].clear();
+    }
+    inter_used[0] = inter_used[1] = inter_used[2] = false;
     const int bw4 = block_width4(block.size);
     const int bh4 = block_height4(block.size);
     if (block.mi_col >= mi_cols || block.mi_row >= mi_rows) continue;
@@ -505,9 +524,6 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
      * direction, and the specification predicts each of them with its own
      * motion vector (compute_prediction(): predW = Block_Width >> subX), so the
      * chroma block is split into one prediction block per luma cell. */
-    BlockSyntax inter_block[3];
-    std::vector<BlockSyntax> inter_regions[3];
-    bool inter_used[3] = {false, false, false};
     if (inter) {
       /* An inter/intra block codes one reference and one intra mode, so the
        * compound of two references is off and the intra half is a property of
@@ -742,7 +758,7 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
           BlockSyntax region = bs;
           apply_global_warp(&region);
           apply_local_warp(&region);
-          inter_regions[plane].push_back(region);
+          inter_regions[plane].push_back(std::move(region));
         } else {
           for (int y = 0; y < bs.h; y += pred_h) {
             for (int x = 0; x < bs.w; x += pred_w) {
@@ -775,7 +791,7 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
               }
               apply_global_warp(&region);
               apply_local_warp(&region);
-              inter_regions[plane].push_back(region);
+              inter_regions[plane].push_back(std::move(region));
             }
           }
         }
@@ -929,10 +945,12 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
     if (inter) {
       for (int plane = 0; plane < 3; ++plane) {
         if (!inter_used[plane]) continue;
-        for (const BlockSyntax& region : inter_regions[plane]) out->blocks.push_back(region);
+        for (BlockSyntax& region : inter_regions[plane])
+          out->blocks.push_back(std::move(region));
       }
     }
   }
+  const auto t2 = std::chrono::steady_clock::now();
 
   /* The loop filter's edges come from the block grid, not from the transform
    * blocks: whether an edge is filtered depends on the transform sizes on both
@@ -949,6 +967,14 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
    * parameters and the unit table the tile decoder read. */
   if (!plan_restoration(seq, frame, tile, out, error)) return false;
 
+  if (pstage) {
+    const auto t3 = std::chrono::steady_clock::now();
+    const auto ms = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    std::fprintf(stderr, "[plan-stage] owner %.2f blocks %.2f tail %.2f (nblocks %zu)\n",
+                 ms(t0, t1), ms(t1, t2), ms(t2, t3), tile.blocks.size());
+  }
   return true;
 }
 

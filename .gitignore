@@ -1,18 +1,3 @@
-# build trees
-build/
-build-*/
-out/
-cmake-build-*/
-
-# editor / tool droppings
-.vscode/
-.idea/
-*.swp
-compile_commands.json
-
-# python
-__pycache__/
-*.pyc
-
-# local verification logs
-gpu_verify_*.log
+# benchmark output written to the working directory by av1gpu_pipebench --cadence
+av1gpu_gaps.txt
+av1gpu_pushes.txt

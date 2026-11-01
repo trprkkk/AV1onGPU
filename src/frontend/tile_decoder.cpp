@@ -3212,6 +3212,7 @@ class TileParser {
                    block_height4(size), static_cast<unsigned long long>(st.window), st.range,
                    st.count);
     }
+    trace_point(row, col, "entry");
     block.mi_row = row;
     block.mi_col = col;
     block.size = size;
@@ -4652,6 +4653,9 @@ ParseStatus decode_tiles(const SequenceHeader& seq, const FrameHeader& frame,
     std::fprintf(stderr, "FR %d oh=%d type=%d show=%d\n", g_frame_ordinal, frame.order_hint,
                  static_cast<int>(frame.type), frame.show_frame ? 1 : 0);
   }
+  if (std::getenv("AV1GPU_TILEINFO"))
+    std::fprintf(stderr, "TILES %d x %d (group %zu)\n", frame.tiles.cols, frame.tiles.rows,
+                 tile_count);
   TileDecodeResult frame_out;
   TileParser parser(seq, frame, refs, data, size, &frame_out, error);
   parser.init_state();

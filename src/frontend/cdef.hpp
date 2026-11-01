@@ -22,12 +22,14 @@
 #define AV1GPU_FRONTEND_CDEF_HPP
 
 #include <cstdint>
+#include <iterator>
 #include <string>
 #include <vector>
 
 #include "av1gpu/av1gpu.hpp"
 #include "frontend/block_size.hpp"
 #include "frontend/headers.hpp"
+#include "frontend/thread_pool.hpp"
 #include "frontend/tile_decoder.hpp"
 
 namespace av1gpu {
@@ -66,19 +68,23 @@ inline bool plan_cdef(const SequenceHeader& seq, const FrameHeader& frame,
   const int planes = seq.monochrome ? 1 : 3;
   const int width = frame.width, height = frame.height;
 
-  /* Skips per 4x4 cell, which is what the block process looks at. */
+  /* Skips per 4x4 cell, which is what the block process looks at. Blocks
+   * partition the mi grid, so the fill splits over the shared pool. */
   std::vector<uint8_t> skip(static_cast<size_t>(mi_cols) * mi_rows, 0);
-  for (const TileBlock& block : tile.blocks) {
-    const int bw4 = block_width4(block.size);
-    const int bh4 = block_height4(block.size);
-    for (int y = 0; y < bh4; ++y) {
-      for (int x = 0; x < bw4; ++x) {
-        const int row = block.mi_row + y, col = block.mi_col + x;
-        if (row >= mi_rows || col >= mi_cols) continue;
-        skip[static_cast<size_t>(row) * mi_cols + col] = block.skip ? 1 : 0;
+  parallel_chunks(tile.blocks.size(), 6, [&](size_t, size_t b0, size_t e0) {
+    for (size_t bi = b0; bi < e0; ++bi) {
+      const TileBlock& block = tile.blocks[bi];
+      const int bw4 = block_width4(block.size);
+      const int bh4 = block_height4(block.size);
+      for (int y = 0; y < bh4; ++y) {
+        for (int x = 0; x < bw4; ++x) {
+          const int row = block.mi_row + y, col = block.mi_col + x;
+          if (row >= mi_rows || col >= mi_cols) continue;
+          skip[static_cast<size_t>(row) * mi_cols + col] = block.skip ? 1 : 0;
+        }
       }
     }
-  }
+  });
 
   const int cdef_cols = tile.cdef_cols;
   const int cdef_rows = tile.cdef_rows;
@@ -90,7 +96,18 @@ inline bool plan_cdef(const SequenceHeader& seq, const FrameHeader& frame,
 
   const int damping = frame.cdef.damping;
 
-  for (int row = 0; row < mi_rows; row += 2) {
+  /* Every 8x8 block only reads the skip map and the index table and appends
+   * its own entries, so rows go out in contiguous chunks on the shared pool;
+   * merging the per-chunk vectors in chunk order is the sequential order. */
+  const size_t n_rows = (static_cast<size_t>(mi_rows) + 1) / 2;
+  std::vector<std::vector<CdefBlock>> blocks_out(6);
+  std::vector<char> used(6, 0);
+  parallel_chunks(n_rows, 6, [&](size_t t, size_t b0, size_t e0) {
+    if (t >= blocks_out.size()) return;
+    used[t] = 1;
+    std::vector<CdefBlock>& dst = blocks_out[t];
+    for (size_t ri = b0; ri < e0; ++ri) {
+    const int row = static_cast<int>(ri) * 2;
     for (int col = 0; col < mi_cols; col += 2) {
       const int cell_row = row >> 4, cell_col = col >> 4;
       const int idx =
@@ -125,7 +142,7 @@ inline bool plan_cdef(const SequenceHeader& seq, const FrameHeader& frame,
         block.sec_strength = sec_y;
         block.damping = damping;
         block.dir = -1; /* the kernel finds it, as a decoder must */
-        out->cdef.push_back(block);
+        dst.push_back(block);
       }
 
       if (planes < 3) continue;
@@ -141,9 +158,15 @@ inline bool plan_cdef(const SequenceHeader& seq, const FrameHeader& frame,
         block.sec_strength = sec_uv;
         block.damping = damping;
         block.dir = -1;
-        out->cdef.push_back(block);
+        dst.push_back(block);
       }
     }
+    }
+  });
+  for (size_t t = 0; t < blocks_out.size(); ++t) {
+    if (!used[t]) continue;
+    out->cdef.insert(out->cdef.end(), std::make_move_iterator(blocks_out[t].begin()),
+                     std::make_move_iterator(blocks_out[t].end()));
   }
   return true;
 }

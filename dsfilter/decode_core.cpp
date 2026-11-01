@@ -154,7 +154,10 @@ StreamDecoder::~StreamDecoder() {
     std::lock_guard<std::mutex> lk(pipe_mutex_);
     quitting_ = true;
   }
+  pipe_cv_.notify_all();
+  planner_cv_.notify_all();
   worker_cv_.notify_all();
+  if (planner_.joinable()) planner_.join();
   if (worker_.joinable()) worker_.join();
   delete static_cast<StreamState*>(state_);
 }
@@ -174,6 +177,7 @@ void StreamDecoder::pipe_fail(const std::string& message) {
 }
 
 void StreamDecoder::queue_job(PipeJob job, std::string* error) {
+  if (!planner_.joinable()) planner_ = std::thread(&StreamDecoder::planner_loop, this);
   if (!worker_.joinable()) worker_ = std::thread(&StreamDecoder::worker_loop, this);
   std::unique_lock<std::mutex> lk(pipe_mutex_);
   /* back pressure: a bounded queue keeps the decoder a few frames behind the
@@ -189,16 +193,82 @@ void StreamDecoder::queue_job(PipeJob job, std::string* error) {
     return;
   }
   jobs_.push_back(std::move(job));
-  worker_cv_.notify_one();
+  planner_cv_.notify_one();
+}
+
+void StreamDecoder::planner_loop() {
+  std::unique_lock<std::mutex> lk(pipe_mutex_);
+  LARGE_INTEGER p0{}, p1{}, pf{};
+  QueryPerformanceFrequency(&pf);
+  for (;;) {
+    planner_cv_.wait(lk, [&] {
+      return (quitting_ && jobs_.empty()) || pipe_failed_ || !jobs_.empty();
+    });
+    if (jobs_.empty()) return; /* quitting_ or failed */
+    PipeJob job = std::move(jobs_.front());
+    jobs_.pop_front();
+    const bool dead = pipe_failed_ || quitting_; /* read under the lock */
+    pipe_cv_.notify_all(); /* queue space for queue_job() */
+    planner_busy_ = true;
+    lk.unlock();
+    bool ok = true;
+    std::string err;
+    if (!dead && !job.show_existing && job.slot >= 0 && !job.frame_plan && plan_thread_) {
+      if (ds_debug_enabled()) QueryPerformanceCounter(&p0);
+      ok = decoder_->plan_frame(job.syntax, &job.frame_plan, &err);
+      if (ds_debug_enabled()) {
+        QueryPerformanceCounter(&p1);
+        const double ms = double(p1.QuadPart - p0.QuadPart) * 1000.0 / double(pf.QuadPart);
+        static double acc = 0, worst = 0;
+        static long n = 0;
+        if (ms > 60.0) ds_debug_log("SLOW planner plan: %.1f ms", ms);
+        acc += ms;
+        if (ms > worst) worst = ms;
+        if (++n % 50 == 0) {
+          ds_debug_log("perf planner plan: avg %.1f, worst %.1f ms over %ld", acc / n, worst, n);
+          acc = worst = 0;
+          n = 0;
+        }
+      }
+      if (!ok) pipe_fail(err.empty() ? "planner: plan_frame failed" : err);
+    }
+    lk.lock();
+    planner_busy_ = false;
+    if (ok && !pipe_failed_) {
+      ready_jobs_.push_back(std::move(job));
+      worker_cv_.notify_one();
+    } else {
+      /* dropped (failed plan, or the pipe is broken): hand the reservation
+       * back (decoder calls are made without the lock, like queue_job()'s
+       * failure path) */
+      const int slot = job.slot;
+      decoder_->discard_frame_plan(job.frame_plan);
+      job.frame_plan = nullptr;
+      lk.unlock();
+      if (slot >= 0) decoder_->release_reference(slot);
+      lk.lock();
+    }
+    pipe_cv_.notify_all(); /* drain waiters (finish) */
+  }
 }
 
 void StreamDecoder::worker_loop() {
   std::unique_lock<std::mutex> lk(pipe_mutex_);
+  LARGE_INTEGER i0{}, iff{};
+  QueryPerformanceFrequency(&iff);
   for (;;) {
-    worker_cv_.wait(lk, [&] { return (quitting_ && jobs_.empty()) || !jobs_.empty(); });
-    if (jobs_.empty()) return; /* quitting_ */
-    PipeJob job = std::move(jobs_.front());
-    jobs_.pop_front();
+    if (ds_debug_enabled()) QueryPerformanceCounter(&i0);
+    worker_cv_.wait(lk,
+                    [&] { return (quitting_ && ready_jobs_.empty()) || !ready_jobs_.empty(); });
+    if (ds_debug_enabled() && !ready_jobs_.empty()) {
+      LARGE_INTEGER i1;
+      QueryPerformanceCounter(&i1);
+      const double idle = double(i1.QuadPart - i0.QuadPart) * 1000.0 / double(iff.QuadPart);
+      if (idle > 50.0) ds_debug_log("SLOW worker idle: %.1f ms", idle);
+    }
+    if (ready_jobs_.empty()) return; /* quitting_ */
+    PipeJob job = std::move(ready_jobs_.front());
+    ready_jobs_.pop_front();
     busy_ = true;
     lk.unlock();
     run_job(&job);
@@ -277,6 +347,7 @@ void StreamDecoder::run_job(PipeJob* job) {
     static double acc_b = 0, worst_b = 0;
     static long nb = 0;
     const double ms = double(b1.QuadPart - b0.QuadPart) * 1000.0 / double(jf.QuadPart);
+    if (ms > 50.0) ds_debug_log("SLOW worker decode: %.1f ms", ms);
     acc_b += ms;
     if (ms > worst_b) worst_b = ms;
     if (++nb % 50 == 0) {
@@ -309,6 +380,7 @@ void StreamDecoder::run_job(PipeJob* job) {
     static double acc = 0, worst = 0;
     static long n = 0;
     const double ms = double(j1.QuadPart - j0.QuadPart) * 1000.0 / double(jf.QuadPart);
+    if (ms > 50.0) ds_debug_log("SLOW worker job: %.1f ms", ms);
     acc += ms;
     if (ms > worst) worst = ms;
     if (++n % 50 == 0) {
@@ -322,7 +394,9 @@ void StreamDecoder::run_job(PipeJob* job) {
 void StreamDecoder::finish() {
   if (!worker_.joinable()) return;
   std::unique_lock<std::mutex> lk(pipe_mutex_);
-  pipe_cv_.wait(lk, [&] { return jobs_.empty() && !busy_; });
+  pipe_cv_.wait(lk, [&] {
+    return jobs_.empty() && ready_jobs_.empty() && !busy_ && !planner_busy_;
+  });
 }
 
 void StreamDecoder::abort_pipe() {
@@ -341,10 +415,21 @@ void StreamDecoder::abort_pipe() {
       job.frame_plan = nullptr;
     }
     jobs_.clear();
-    pipe_cv_.wait(lk, [&] { return !busy_; });
+    /* the planner may be mid-plan on a job it already popped; wait for it,
+     * then drop what it queued */
+    pipe_cv_.wait(lk, [&] { return !busy_ && !planner_busy_; });
+    for (auto& job : ready_jobs_) {
+      if (job.slot >= 0) orphan_slots.push_back(job.slot);
+      decoder_->discard_frame_plan(job.frame_plan);
+      job.frame_plan = nullptr;
+    }
+    ready_jobs_.clear();
     for (int i = 0; i < 8; ++i) pipe_valid_[i] = false;
     pipe_failed_ = false;
   }
+  pipe_cv_.notify_all();
+  planner_cv_.notify_all();
+  worker_cv_.notify_all();
   /* slots reserved for frames that will now never be decoded */
   for (int slot : orphan_slots) decoder_->release_reference(slot);
 }
@@ -374,8 +459,10 @@ bool StreamDecoder::init(std::string* error) {
   /* Building the plan on the demuxer's thread sounds like free parallelism,
    * but in the filter that thread is the one parsing and planning the frame,
    * and moving the scheduler there made it the bottleneck: 25.7 fps with
-   * pre-planning against 28.0 without. The worker is the thread with slack,
-   * so the planner stays with it unless asked otherwise. */
+   * pre-planning against 28.0 without. The pipeline therefore has a dedicated
+   * planner thread between the demuxer's and the worker's (see planner_loop);
+   * AV1GPU_DS_NOPLANNER=1 turns it off and the worker plans as it decodes. */
+  plan_thread_ = pipelined_ && std::getenv("AV1GPU_DS_NOPLANNER") == nullptr;
   preplan_ = pipelined_ && decoder_->supports_preplanning() &&
              std::getenv("AV1GPU_DS_PREPLAN") != nullptr;
   return true;
@@ -673,7 +760,15 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
     if (reserved < 0) {
       /* every slot may be marked because queued frames still hold the ones
        * the pool dropped; drain the queue and try again before giving up */
-      finish();
+      {
+        LARGE_INTEGER f0, f1, ff;
+        QueryPerformanceFrequency(&ff);
+        QueryPerformanceCounter(&f0);
+        finish();
+        QueryPerformanceCounter(&f1);
+        ds_debug_log("SLOW reserve-fail drain: %.1f ms",
+                     double(f1.QuadPart - f0.QuadPart) * 1000.0 / double(ff.QuadPart));
+      }
       reserved = decoder_->reserve_reference();
     }
     if (reserved < 0) {

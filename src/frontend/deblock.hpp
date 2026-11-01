@@ -29,12 +29,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <string>
 #include <vector>
 
 #include "av1gpu/av1gpu.hpp"
 #include "frontend/block_size.hpp"
 #include "frontend/headers.hpp"
+#include "frontend/thread_pool.hpp"
 #include "frontend/tile_decoder.hpp"
 #include "frontend/tx_size.hpp"
 
@@ -170,43 +172,65 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
     grid.tx[p].assign(static_cast<size_t>(grid.cols[p]) * grid.rows[p], TxSize{0, 0});
   }
 
-  /* MiSizes, Skips, SegmentIds, YModes and the transform sizes, cell by cell. */
-  for (const TileBlock& block : tile.blocks) {
-    const int bw4 = block_width4(block.size);
-    const int bh4 = block_height4(block.size);
-    for (int y = 0; y < bh4; ++y) {
-      for (int x = 0; x < bw4; ++x) {
-        const int row = block.mi_row + y, col = block.mi_col + x;
-        if (row >= mi_rows || col >= mi_cols) continue;
-        const size_t cell = static_cast<size_t>(row) * mi_cols + col;
-        grid.size[cell] = block.size;
-        grid.skip[cell] = block.skip ? 1 : 0;
-        grid.segment[cell] = static_cast<uint8_t>(block.segment_id);
-        grid.ref_frame[cell] = static_cast<uint8_t>(block.is_inter ? block.ref_frame[0] : 0);
-        grid.mode[cell] = static_cast<uint8_t>(block.y_mode);
-        for (int i = 0; i < 4; ++i)
-          grid.delta_lf[cell * 4 + i] = static_cast<int8_t>(block.delta_lf[i]);
+  /* MiSizes, Skips, SegmentIds, YModes and the transform sizes, cell by cell.
+   * Blocks partition the frame's mi grid and the transforms of one block are
+   * disjoint, so no two blocks write the same cell: the fill splits over the
+   * shared pool with no lock. */
+  parallel_chunks(tile.blocks.size(), 6, [&](size_t, size_t b0, size_t e0) {
+    for (size_t bi = b0; bi < e0; ++bi) {
+      const TileBlock& block = tile.blocks[bi];
+      const int bw4 = block_width4(block.size);
+      const int bh4 = block_height4(block.size);
+      for (int y = 0; y < bh4; ++y) {
+        for (int x = 0; x < bw4; ++x) {
+          const int row = block.mi_row + y, col = block.mi_col + x;
+          if (row >= mi_rows || col >= mi_cols) continue;
+          const size_t cell = static_cast<size_t>(row) * mi_cols + col;
+          grid.size[cell] = block.size;
+          grid.skip[cell] = block.skip ? 1 : 0;
+          grid.segment[cell] = static_cast<uint8_t>(block.segment_id);
+          grid.ref_frame[cell] = static_cast<uint8_t>(block.is_inter ? block.ref_frame[0] : 0);
+          grid.mode[cell] = static_cast<uint8_t>(block.y_mode);
+          for (int i = 0; i < 4; ++i)
+            grid.delta_lf[cell * 4 + i] = static_cast<int8_t>(block.delta_lf[i]);
+        }
       }
-    }
-    /* A block with chroma that is coded as a sub 8x8 block does not own its
-     * chroma; has_chroma says which block does, so the chroma transform sizes
-     * land on exactly the cells that carry them. */
-    for (const TileTransform& transform : block.transforms) {
-      const int p = transform.plane;
-      if (p < 0 || p >= planes) continue;
-      const TxSize tx = transform.size;
-      if (tx.lw < 0 || tx.lh < 0) continue;
-      const int x0 = transform.x >> 2, y0 = transform.y >> 2;
-      for (int y = y0; y < y0 + tx.h4() && y < grid.rows[p]; ++y) {
-        for (int x = x0; x < x0 + tx.w4() && x < grid.cols[p]; ++x) {
-          if (x >= 0 && y >= 0) grid.tx[p][static_cast<size_t>(y) * grid.cols[p] + x] = tx;
+      /* A block with chroma that is coded as a sub 8x8 block does not own its
+       * chroma; has_chroma says which block does, so the chroma transform sizes
+       * land on exactly the cells that carry them. */
+      for (const TileTransform& transform : block.transforms) {
+        const int p = transform.plane;
+        if (p < 0 || p >= planes) continue;
+        const TxSize tx = transform.size;
+        if (tx.lw < 0 || tx.lh < 0) continue;
+        const int x0 = transform.x >> 2, y0 = transform.y >> 2;
+        for (int y = y0; y < y0 + tx.h4() && y < grid.rows[p]; ++y) {
+          for (int x = x0; x < x0 + tx.w4() && x < grid.cols[p]; ++x) {
+            if (x >= 0 && y >= 0) grid.tx[p][static_cast<size_t>(y) * grid.cols[p] + x] = tx;
+          }
         }
       }
     }
-  }
+  });
 
   /* ---- the edge loop ---------------------------------------------------- */
-  for (int plane = 0; plane < planes; ++plane) {
+  /* Each (plane, pass, row) triple only reads the grid and appends edges, and
+   * no triple reads what another appends, so the triples go out in contiguous
+   * chunks on the shared pool. The per-chunk vectors are merged in chunk
+   * order, which is exactly the sequential order of the nested loops. */
+  const size_t rows2 = 2 * static_cast<size_t>(mi_rows);
+  const size_t n_chunks = static_cast<size_t>(planes) * rows2;
+  std::vector<std::vector<DeblockEdge>> edges(6);
+  std::vector<char> used(6, 0);
+  parallel_chunks(n_chunks, 6, [&](size_t t, size_t b0, size_t e0) {
+    if (t >= edges.size()) return;
+    used[t] = 1;
+    std::vector<DeblockEdge>& dst = edges[t];
+    for (size_t ci = b0; ci < e0; ++ci) {
+      const int plane = static_cast<int>(ci / rows2);
+      const size_t rem = ci % rows2;
+      const int pass = static_cast<int>(rem / static_cast<size_t>(mi_rows));
+      const int row = static_cast<int>(rem % static_cast<size_t>(mi_rows));
     /* The specification only walks a chroma plane that has a level at all. */
     if (plane > 0 && loop_filter_level(frame, plane + 1) == 0) continue;
     const int sub_x = plane > 0 ? ss_x : 0;
@@ -229,11 +253,12 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
     const int edge_end_y = (plane_h + 3) & ~3;
     const bool chroma = plane > 0;
 
-    for (int pass = 0; pass < 2; ++pass) {
       const bool vertical = pass == 0;
       const int row_step = chroma ? (1 << sub_y) : 1;
       const int col_step = chroma ? (1 << sub_x) : 1;
-      for (int row = 0; row < mi_rows; row += row_step) {
+      /* the flattened loop visits every mi row; the sequential one stepped */
+      if (row % row_step != 0) continue;
+      {
         for (int col = 0; col < mi_cols; col += col_step) {
           /* the plane's cell: the specification keeps row/col on the luma grid
            * and skips the cells the plane does not have */
@@ -308,10 +333,15 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
           edge.length = length;
           edge.level = level;
           edge.filter_size = filter_size;
-          out->deblock.push_back(edge);
+          dst.push_back(edge);
         }
       }
     }
+  });
+  for (size_t t = 0; t < edges.size(); ++t) {
+    if (!used[t]) continue;
+    out->deblock.insert(out->deblock.end(), std::make_move_iterator(edges[t].begin()),
+                        std::make_move_iterator(edges[t].end()));
   }
 
   out->sharpness = frame.loop_filter.sharpness;

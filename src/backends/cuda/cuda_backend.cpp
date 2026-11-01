@@ -33,6 +33,7 @@
 #include "backends/cuda/cuda_min.hpp"
 #include "core/backend.hpp"
 #include "core/kernel_source.hpp"
+#include "frontend/thread_pool.hpp"
 
 namespace av1gpu {
 namespace internal {
@@ -606,8 +607,7 @@ class CudaBackend final : public Backend {
       return fail(error, "palette map write failed");
 
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    const unsigned k_workers =
-        plan.waves.size() >= 8 ? std::min<unsigned>(6, std::max(1u, hw - 1)) : 1;
+    (void)hw; /* the shared pool picks the worker count itself */
 
     /* ---- build the arena on the host, then upload it once ----------------
      * The job arrays and their prefix sums go into one host buffer per arena
@@ -621,8 +621,8 @@ class CudaBackend final : public Backend {
     char* const hjobs = host_job_.data();
     char* const hpref = host_pref_.data();
 
-    auto prep_waves = [&](unsigned id) {
-      for (size_t i = id; i < plan.waves.size(); i += k_workers) {
+    auto prep_wave = [&](size_t i) {
+      {
         const WaveJobs& w = plan.waves[i];
         WaveLaunch& L = prepped[i];
         const WaveOffsets& o = offs[i];
@@ -710,14 +710,9 @@ class CudaBackend final : public Backend {
       }
     };
 
-    if (k_workers <= 1) {
-      prep_waves(0);
-    } else {
-      std::vector<std::thread> pool;
-      pool.reserve(k_workers);
-      for (unsigned id = 0; id < k_workers; ++id) pool.emplace_back(prep_waves, id);
-      for (std::thread& t : pool) t.join();
-    }
+    frontend::parallel_chunks(plan.waves.size(), 6, [&](size_t, size_t b0, size_t e0) {
+      for (size_t i = b0; i < e0; ++i) prep_wave(i);
+    });
 
     /* the device addresses, once the host copy is complete */
     for (size_t i = 0; i < plan.waves.size(); ++i) {
@@ -1378,8 +1373,11 @@ class CudaBackend final : public Backend {
   /* One pool slot per AV1 reference slot plus the pictures still in flight: a
    * pipelined caller keeps one slot reserved per queued frame, and a deeper
    * queue is what lets the decoder run ahead of the renderer far enough to
-   * hide a keyframe's cost (see kPipeDepth in the decode core). */
-  static constexpr int kReferenceSlots = 9;
+   * hide a keyframe's cost (see kPipeDepth in the decode core). The pool needs
+   * headroom over 8 + kPipeDepth: a queued frame holds the slot it reserved and
+   * the slots it displaced until its job has run, and when the pool runs out
+   * the decode core drains the whole queue for one slot - a hitch. */
+  static constexpr int kReferenceSlots = 24;
   /* the smallest device allocation ensure() hands out; see ensure() */
   static constexpr size_t kMinAllocation = 1024;
 

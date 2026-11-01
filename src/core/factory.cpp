@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core/backend.hpp"
+#include "frontend/thread_pool.hpp"
 
 namespace av1gpu {
 
@@ -261,9 +262,18 @@ bool frame_to_nv12(const Frame& frame, size_t pitch, std::vector<uint8_t>* out) 
   job.ss_y = frame.ss_y;
   job.bitdepth = frame.bit_depth;
   out->assign(bytes, 0);
-  /* the same scalar kernel the device backends run, so the host and the device
-   * produce the same bytes - padding included */
-  av1g_nv12_block(&job, frame.plane(0), frame.plane(1), frame.plane(2), out->data());
+  /* The same row logic the device backends run (av1g_nv12_rows), so the host
+   * and the device produce the same bytes - padding included. Every row is
+   * independent, so the rows go out in bands on a few threads: at FHD the pack
+   * is several MB of reads and writes per shown frame. */
+  const int ch = (job.h + (1 << job.ss_y) - 1) >> job.ss_y;
+  const int total_rows = job.h + ch;
+  frontend::parallel_chunks(static_cast<size_t>(total_rows), 4,
+                            [&](size_t, size_t b0, size_t e0) {
+                              av1g_nv12_rows(&job, frame.plane(0), frame.plane(1),
+                                             frame.plane(2), out->data(),
+                                             static_cast<int>(b0), static_cast<int>(e0));
+                            });
   return true;
 }
 
