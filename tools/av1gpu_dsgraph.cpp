@@ -861,8 +861,9 @@ int main(int argc, char** argv) {
   }
 
   /* a flush plus NewSegment is the seek path: the decoder starts over, and
-   * the first units decode again from the key frame */
-  {
+   * the first units decode again from the key frame. Repeat several times to
+   * shake out any seek-path deadlock. */
+  for (int round = 0; round < 10; ++round) {
     in_pin->BeginFlush();
     in_pin->EndFlush();
     in_pin->NewSegment(0, 0, 1.0);
@@ -876,14 +877,16 @@ int main(int argc, char** argv) {
       hr = input->Receive(&sample);
       if (FAILED(hr)) {
         input->Release();
-        die("Receive after flush failed on unit " + std::to_string(i), hr);
+        die("Receive after flush failed on round " + std::to_string(round) +
+            " unit " + std::to_string(i), hr);
       }
     }
     /* drain the pipeline before counting, like the first pass does */
     hr = in_pin->EndOfStream();
     if (FAILED(hr)) die("EndOfStream after flush", hr);
     const size_t after = sink.frames() - before;
-    std::printf("  after flush+NewSegment: %zu more frame(s) from 3 unit(s)\n", after);
+    std::printf("  round %d: after flush+NewSegment: %zu frame(s) from 3 unit(s)\n",
+                round, after);
     if (after == 0) die("no frames after a flush and re-feed");
   }
 

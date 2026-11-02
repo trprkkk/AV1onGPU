@@ -583,19 +583,17 @@ void StreamDecoder::abort_pipe() {
     front_tasks_.clear();
     front_slots_.clear();
   }
-  {
-    std::unique_lock<std::mutex> lk(front_mutex_);
-    front_idle_.wait(lk, [&] { return !front_busy_; });
-  }
-  if (!worker_.joinable()) {
-    std::lock_guard<std::mutex> lk(pipe_mutex_);
-    for (int i = 0; i < 8; ++i) pipe_valid_[i] = false;
-    pipe_failed_ = false;
-    for (int slot : front_orphans) release_reserved(slot);
-    return;
-  }
+  ds_debug_log("abort_pipe: frontend queue cleared, %d front orphan slots",
+               (int)front_orphans.size());
+
+  /* Clear the pipeline queues and bump the generation *before* waiting for
+   * the frontend. A frontend task that is blocked in queue_job()'s back
+   * pressure holds front_busy_, so if we waited for it first we'd deadlock:
+   * it can only leave queue_job() once we've changed generation_ and woken
+   * pipe_cv_. Clearing the queues first lets it wake, see the generation
+   * mismatch, drop its job, and finish - which then releases front_busy_. */
   std::vector<int> orphan_slots;
-  {
+  if (worker_.joinable()) {
     std::unique_lock<std::mutex> lk(pipe_mutex_);
     /* Everything queued so far belongs to the old stream. */
     ++generation_;
@@ -607,6 +605,8 @@ void StreamDecoder::abort_pipe() {
     jobs_.clear();
     /* the planner may be mid-plan on a job it already popped; wait for it,
      * then drop what it queued */
+    ds_debug_log("abort_pipe: waiting for planner/worker idle (generation=%llu)",
+                 (unsigned long long)generation_);
     pipe_cv_.wait(lk, [&] { return !busy_ && !planner_busy_; });
     for (auto& job : ready_jobs_) {
       if (job.slot >= 0) orphan_slots.push_back(job.slot);
@@ -617,16 +617,38 @@ void StreamDecoder::abort_pipe() {
     /* The pictures that were decoded but not shown yet belong to the old
      * stream as well. */
     out_jobs_.clear();
+    ds_debug_log("abort_pipe: planner/worker idle, waiting for output idle");
     pipe_cv_.wait(lk, [&] { return !output_busy_; });
     for (int i = 0; i < 8; ++i) pipe_valid_[i] = false;
     pipe_failed_ = false;
+    ds_debug_log("abort_pipe: output idle, pipe_valid cleared");
   }
   pipe_cv_.notify_all();
   planner_cv_.notify_all();
   worker_cv_.notify_all();
+  front_cv_.notify_all(); /* wake any submit_frontend_task() waiting on space */
+
+  /* Now the in-flight frontend task can leave queue_job() (generation changed)
+   * and finish, which releases front_busy_. */
+  ds_debug_log("abort_pipe: waiting for frontend idle");
+  {
+    std::unique_lock<std::mutex> lk(front_mutex_);
+    front_idle_.wait(lk, [&] { return !front_busy_; });
+  }
+  ds_debug_log("abort_pipe: frontend idle");
+
+  if (!worker_.joinable()) {
+    for (int slot : front_orphans) release_reserved(slot);
+    ds_debug_log("abort_pipe: done (no worker), released %d front slots",
+                 (int)front_orphans.size());
+    return;
+  }
+
   /* slots reserved for frames that will now never be decoded */
   for (int slot : orphan_slots) release_reserved(slot);
   for (int slot : front_orphans) release_reserved(slot);
+  ds_debug_log("abort_pipe: done, released %d pipe + %d front slots",
+               (int)orphan_slots.size(), (int)front_orphans.size());
 }
 
 void StreamDecoder::reset_stream() {
