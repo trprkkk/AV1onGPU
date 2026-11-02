@@ -165,6 +165,11 @@ StreamDecoder::~StreamDecoder() {
     front_tasks_.clear();
     front_slots_.clear();
   }
+  {
+    std::lock_guard<std::mutex> lk(pipe_mutex_);
+    output_quit_ = true;
+    out_jobs_.clear();
+  }
   pipe_cv_.notify_all();
   planner_cv_.notify_all();
   worker_cv_.notify_all();
@@ -172,6 +177,7 @@ StreamDecoder::~StreamDecoder() {
   if (frontend_.joinable()) frontend_.join();
   if (planner_.joinable()) planner_.join();
   if (worker_.joinable()) worker_.join();
+  if (output_.joinable()) output_.join();
   delete static_cast<StreamState*>(state_);
 }
 
@@ -199,6 +205,7 @@ void StreamDecoder::ensure_threads() {
   if (!planner_.joinable()) planner_ = std::thread(&StreamDecoder::planner_loop, this);
   if (!worker_.joinable()) worker_ = std::thread(&StreamDecoder::worker_loop, this);
   if (!frontend_.joinable()) frontend_ = std::thread(&StreamDecoder::frontend_loop, this);
+  if (!output_.joinable()) output_ = std::thread(&StreamDecoder::output_loop, this);
 }
 
 void StreamDecoder::release_reserved(int slot) {
@@ -344,6 +351,42 @@ void StreamDecoder::planner_loop() {
   }
 }
 
+void StreamDecoder::queue_output(Frame picture, size_t pitch, const Sink& sink) {
+  OutputJob job;
+  job.picture = std::move(picture);
+  job.pitch = pitch;
+  job.sink = sink;
+  {
+    std::lock_guard<std::mutex> lk(pipe_mutex_);
+    out_jobs_.push_back(std::move(job));
+  }
+  worker_cv_.notify_all();
+}
+
+void StreamDecoder::output_loop() {
+  for (;;) {
+    OutputJob job;
+    {
+      std::unique_lock<std::mutex> lk(pipe_mutex_);
+      worker_cv_.wait(lk, [&] { return output_quit_ || !out_jobs_.empty(); });
+      if (out_jobs_.empty()) {
+        if (output_quit_) return;
+        continue;
+      }
+      job = std::move(out_jobs_.front());
+      out_jobs_.pop_front();
+      output_busy_ = true;
+    }
+    std::string err;
+    if (!emit(job.picture, job.pitch, job.sink, &err)) pipe_fail(err);
+    {
+      std::lock_guard<std::mutex> lk(pipe_mutex_);
+      output_busy_ = false;
+    }
+    pipe_cv_.notify_all();
+  }
+}
+
 void StreamDecoder::worker_loop() {
   std::unique_lock<std::mutex> lk(pipe_mutex_);
   LARGE_INTEGER i0{}, iff{};
@@ -397,7 +440,7 @@ void StreamDecoder::run_job(PipeJob* job) {
       return;
     }
     std::string err;
-    if (!emit(picture, job->pitch, job->sink, &err)) pipe_fail(err);
+    queue_output(std::move(picture), job->pitch, job->sink);
     return;
   }
 
@@ -451,12 +494,20 @@ void StreamDecoder::run_job(PipeJob* job) {
     }
   }
 
-  if (job->show_frame && !emit(picture, job->pitch, job->sink, &err)) {
-    pipe_fail(err);
-    return;
-  }
-
-  if (job->slot >= 0) {
+  if (job->show_frame) {
+    /* The picture goes to the output stage: the worker starts the next frame's
+     * kernels while this one is packed into NV12 and shown. The reference
+     * pool keeps its own copy below, so the picture can be moved. */
+    if (job->slot >= 0) {
+      std::lock_guard<std::mutex> lk(pipe_mutex_);
+      for (int i = 0; i < 8; ++i) {
+        if (!(job->refresh_flags & (1 << i))) continue;
+        pipe_picture_[i] = picture;
+        pipe_valid_[i] = true;
+      }
+    }
+    queue_output(std::move(picture), job->pitch, job->sink);
+  } else if (job->slot >= 0) {
     std::lock_guard<std::mutex> lk(pipe_mutex_);
     for (int i = 0; i < 8; ++i) {
       if (!(job->refresh_flags & (1 << i))) continue;
@@ -496,6 +547,9 @@ void StreamDecoder::finish() {
   pipe_cv_.wait(lk, [&] {
     return jobs_.empty() && ready_jobs_.empty() && !busy_ && !planner_busy_;
   });
+  /* The output stage comes last: the pictures that are already decoded still
+   * have to be packed and shown. */
+  pipe_cv_.wait(lk, [&] { return out_jobs_.empty() && !output_busy_; });
 }
 
 void StreamDecoder::abort_pipe() {
@@ -540,6 +594,10 @@ void StreamDecoder::abort_pipe() {
       job.frame_plan = nullptr;
     }
     ready_jobs_.clear();
+    /* The pictures that were decoded but not shown yet belong to the old
+     * stream as well. */
+    out_jobs_.clear();
+    pipe_cv_.wait(lk, [&] { return !output_busy_; });
     for (int i = 0; i < 8; ++i) pipe_valid_[i] = false;
     pipe_failed_ = false;
   }

@@ -121,6 +121,10 @@ class StreamDecoder {
   void planner_loop();
   void frontend_loop();
   void worker_loop();
+  void output_loop();
+  /* Hands a decoded picture to the output stage: the worker starts the next
+   * frame's kernels while this one is packed into NV12 and shown. */
+  void queue_output(Frame picture, size_t pitch, const Sink& sink);
   /* Hands a reserved backend slot back to the pool and counts it out. */
   void release_reserved(int slot);
   /* Hands a frame's frontend work (the per block syntax) to the frontend
@@ -172,6 +176,20 @@ class StreamDecoder {
   std::deque<int> front_slots_;
   bool front_busy_ = false;   /* the frontend thread is inside a task */
   bool front_quit_ = false;   /* the frontend thread must exit */
+  /* The output stage: packing a picture into NV12 and handing it to the
+   * filter costs 2.8 ms a frame at 1080p, and it is pure host work that does
+   * not need the GPU - the worker can start the next frame's kernels while it
+   * runs. The queue is FIFO and the thread is single, so the pictures are
+   * shown in coding order. */
+  struct OutputJob {
+    Frame picture;
+    size_t pitch = 0;
+    Sink sink;
+  };
+  std::thread output_;
+  std::deque<OutputJob> out_jobs_;
+  bool output_busy_ = false;  /* the output thread is inside a job */
+  bool output_quit_ = false;  /* the output thread must exit */
   /* Bumped by abort_pipe(): a task that was queued before the flush belongs
    * to the old stream and must not reach the worker. */
   uint64_t generation_ = 0;
