@@ -618,7 +618,15 @@ void StreamDecoder::abort_pipe() {
      * stream as well. */
     out_jobs_.clear();
     ds_debug_log("abort_pipe: planner/worker idle, waiting for output idle");
-    pipe_cv_.wait(lk, [&] { return !output_busy_; });
+    /* output_busy_ is true while output_loop() is inside emit(), which calls
+     * sink->Receive(). If the renderer blocks there (as MPC-HC's can), output
+     * never releases output_busy_ and we would wait forever. Time out and
+     * force it: the old stream's frames are discarded anyway. */
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    if (!pipe_cv_.wait_until(lk, deadline, [&] { return !output_busy_; })) {
+      ds_debug_log("abort_pipe: output busy timeout, forcing output_busy_=false");
+      output_busy_ = false;
+    }
     for (int i = 0; i < 8; ++i) pipe_valid_[i] = false;
     pipe_failed_ = false;
     ds_debug_log("abort_pipe: output idle, pipe_valid cleared");
@@ -633,7 +641,10 @@ void StreamDecoder::abort_pipe() {
   ds_debug_log("abort_pipe: waiting for frontend idle");
   {
     std::unique_lock<std::mutex> lk(front_mutex_);
-    front_idle_.wait(lk, [&] { return !front_busy_; });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    if (!front_idle_.wait_until(lk, deadline, [&] { return !front_busy_; })) {
+      ds_debug_log("abort_pipe: frontend busy timeout, front_busy_ stuck");
+    }
   }
   ds_debug_log("abort_pipe: frontend idle");
 
