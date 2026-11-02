@@ -159,9 +159,17 @@ StreamDecoder::~StreamDecoder() {
     std::lock_guard<std::mutex> lk(pipe_mutex_);
     quitting_ = true;
   }
+  {
+    std::lock_guard<std::mutex> lk(front_mutex_);
+    front_quit_ = true;
+    front_tasks_.clear();
+    front_slots_.clear();
+  }
   pipe_cv_.notify_all();
   planner_cv_.notify_all();
   worker_cv_.notify_all();
+  front_cv_.notify_all();
+  if (frontend_.joinable()) frontend_.join();
   if (planner_.joinable()) planner_.join();
   if (worker_.joinable()) worker_.join();
   delete static_cast<StreamState*>(state_);
@@ -181,10 +189,42 @@ void StreamDecoder::pipe_fail(const std::string& message) {
   }
 }
 
-void StreamDecoder::queue_job(PipeJob job, std::string* error) {
+void StreamDecoder::ensure_threads() {
+  /* The pipeline's threads are started from whichever thread hands the first
+   * frame over, and that is now two threads (the demuxer for a
+   * show_existing_frame, the frontend stage for a real frame). Starting a
+   * thread twice is a fatal error, so the check and the start happen under
+   * the pipe lock. */
+  std::lock_guard<std::mutex> lk(pipe_mutex_);
   if (!planner_.joinable()) planner_ = std::thread(&StreamDecoder::planner_loop, this);
   if (!worker_.joinable()) worker_ = std::thread(&StreamDecoder::worker_loop, this);
+  if (!frontend_.joinable()) frontend_ = std::thread(&StreamDecoder::frontend_loop, this);
+}
+
+void StreamDecoder::release_reserved(int slot) {
+  if (slot < 0) return;
+  decoder_->release_reference(slot);
+  {
+    std::lock_guard<std::mutex> lk(pipe_mutex_);
+    if (reserved_slots_) --reserved_slots_;
+  }
+  space_cv_.notify_all();
+}
+
+void StreamDecoder::queue_job(PipeJob job, std::string* error, uint64_t generation) {
+  ensure_threads();
   std::unique_lock<std::mutex> lk(pipe_mutex_);
+  /* A frame that was queued before a flush belongs to the old stream: the
+   * flush dropped it, so it must not be decoded now. */
+  if (generation != 0 && generation != generation_) {
+    const int slot = job.slot;
+    decoder_->discard_frame_plan(job.frame_plan);
+    job.frame_plan = nullptr;
+    lk.unlock();
+    release_reserved(slot);
+    if (error && error->empty()) *error = "the frame was dropped by a flush";
+    return;
+  }
   /* back pressure: a bounded queue keeps the decoder a few frames behind the
    * demuxer instead of planning the whole file into memory */
   /* Back pressure counts both queues: the planner moves a job from jobs_ to
@@ -199,12 +239,53 @@ void StreamDecoder::queue_job(PipeJob job, std::string* error) {
     const int slot = job.slot;
     decoder_->discard_frame_plan(job.frame_plan);
     lk.unlock();
-    if (slot >= 0) decoder_->release_reference(slot);
+    release_reserved(slot);
     if (error && error->empty()) *error = notice_;
     return;
   }
   jobs_.push_back(std::move(job));
   planner_cv_.notify_one();
+}
+
+void StreamDecoder::frontend_loop() {
+  for (;;) {
+    std::function<void()> task;
+    {
+      std::unique_lock<std::mutex> lk(front_mutex_);
+      front_cv_.wait(lk, [&] { return front_quit_ || !front_tasks_.empty(); });
+      if (front_tasks_.empty()) {
+        if (front_quit_) return;
+        continue;
+      }
+      task = std::move(front_tasks_.front());
+      front_tasks_.pop_front();
+      front_slots_.pop_front();
+      front_busy_ = true;
+      /* The queue has room again: wake a producer that is waiting for it. */
+      front_cv_.notify_all();
+    }
+    task();
+    {
+      std::lock_guard<std::mutex> lk(front_mutex_);
+      front_busy_ = false;
+    }
+    front_idle_.notify_all();
+  }
+}
+
+void StreamDecoder::submit_frontend_task(std::function<void()> task, int slot) {
+  ensure_threads();
+  {
+    std::unique_lock<std::mutex> lk(front_mutex_);
+    /* The queue is bounded like the pipe itself: a frame waiting here still
+     * holds a reserved reference slot, and the tile data of a queued frame is
+     * not small. */
+    front_cv_.wait(lk, [&] { return front_tasks_.size() < kPipeDepth || front_quit_; });
+    if (front_quit_) return;
+    front_tasks_.push_back(std::move(task));
+    front_slots_.push_back(slot);
+  }
+  front_cv_.notify_one();
 }
 
 void StreamDecoder::planner_loop() {
@@ -256,7 +337,7 @@ void StreamDecoder::planner_loop() {
       decoder_->discard_frame_plan(job.frame_plan);
       job.frame_plan = nullptr;
       lk.unlock();
-      if (slot >= 0) decoder_->release_reference(slot);
+      release_reserved(slot);
       lk.lock();
     }
     pipe_cv_.notify_all(); /* drain waiters (finish) */
@@ -386,7 +467,7 @@ void StreamDecoder::run_job(PipeJob* job) {
 
   /* every job queued before this one has finished, so slots dropped at plan
    * time are safe to hand back now */
-  for (int slot : job->release_slots) decoder_->release_reference(slot);
+  for (int slot : job->release_slots) release_reserved(slot);
   if (jtimed) {
     QueryPerformanceCounter(&j1);
     static double acc = 0, worst = 0;
@@ -405,6 +486,12 @@ void StreamDecoder::run_job(PipeJob* job) {
 
 void StreamDecoder::finish() {
   if (!worker_.joinable()) return;
+  /* The frontend stage comes first in the chain: a frame that is still being
+   * planned has not reached the pipe yet. */
+  {
+    std::unique_lock<std::mutex> lk(front_mutex_);
+    front_idle_.wait(lk, [&] { return front_tasks_.empty() && !front_busy_; });
+  }
   std::unique_lock<std::mutex> lk(pipe_mutex_);
   pipe_cv_.wait(lk, [&] {
     return jobs_.empty() && ready_jobs_.empty() && !busy_ && !planner_busy_;
@@ -412,15 +499,32 @@ void StreamDecoder::finish() {
 }
 
 void StreamDecoder::abort_pipe() {
+  /* The frontend stage first: a frame that is being planned right now would
+   * otherwise reach the worker after the flush. */
+  std::vector<int> front_orphans;
+  {
+    std::lock_guard<std::mutex> lk(front_mutex_);
+    for (int slot : front_slots_)
+      if (slot >= 0) front_orphans.push_back(slot);
+    front_tasks_.clear();
+    front_slots_.clear();
+  }
+  {
+    std::unique_lock<std::mutex> lk(front_mutex_);
+    front_idle_.wait(lk, [&] { return !front_busy_; });
+  }
   if (!worker_.joinable()) {
     std::lock_guard<std::mutex> lk(pipe_mutex_);
     for (int i = 0; i < 8; ++i) pipe_valid_[i] = false;
     pipe_failed_ = false;
+    for (int slot : front_orphans) release_reserved(slot);
     return;
   }
   std::vector<int> orphan_slots;
   {
     std::unique_lock<std::mutex> lk(pipe_mutex_);
+    /* Everything queued so far belongs to the old stream. */
+    ++generation_;
     for (auto& job : jobs_) {
       if (job.slot >= 0) orphan_slots.push_back(job.slot);
       decoder_->discard_frame_plan(job.frame_plan);
@@ -443,7 +547,8 @@ void StreamDecoder::abort_pipe() {
   planner_cv_.notify_all();
   worker_cv_.notify_all();
   /* slots reserved for frames that will now never be decoded */
-  for (int slot : orphan_slots) decoder_->release_reference(slot);
+  for (int slot : orphan_slots) release_reserved(slot);
+  for (int slot : front_orphans) release_reserved(slot);
 }
 
 void StreamDecoder::reset_stream() {
@@ -456,6 +561,12 @@ void StreamDecoder::reset_stream() {
   pending_.clear();
   static_cast<StreamState*>(state_)->clear();
   if (decoder_) decoder_->reset();
+  {
+    /* The backend's pool was reset with it, so every slot it held is gone. */
+    std::lock_guard<std::mutex> lk(pipe_mutex_);
+    reserved_slots_ = 0;
+  }
+  space_cv_.notify_all();
 }
 
 bool StreamDecoder::init(std::string* error) {
@@ -477,6 +588,11 @@ bool StreamDecoder::init(std::string* error) {
   plan_thread_ = pipelined_ && std::getenv("AV1GPU_DS_NOPLANNER") == nullptr;
   preplan_ = pipelined_ && decoder_->supports_preplanning() &&
              std::getenv("AV1GPU_DS_PREPLAN") != nullptr;
+  /* An invisible frame that refreshes no reference slot cannot affect the
+   * decoded output, so it does not have to be decoded at all (see
+   * decode_obu). AV1GPU_SKIP_INVISIBLE=0 turns the skip off. */
+  skip_invisible_ = true;
+  if (const char* e = std::getenv("AV1GPU_SKIP_INVISIBLE")) skip_invisible_ = e[0] != '0';
   return true;
 }
 
@@ -505,6 +621,8 @@ bool StreamDecoder::push(const uint8_t* data, size_t size, size_t pitch,
   /* A stream whose OBUs never complete would grow the buffer without bound;
    * 64 MiB is far past any real temporal unit. */
   constexpr size_t kPendingLimit = 64u << 20;
+  LARGE_INTEGER q0{}, q1{};
+  if (dtimed) QueryPerformanceCounter(&q0);
   {
     std::lock_guard<std::mutex> lk(pipe_mutex_);
     if (pipe_failed_) {
@@ -512,12 +630,14 @@ bool StreamDecoder::push(const uint8_t* data, size_t size, size_t pitch,
       return false;
     }
   }
+  if (dtimed) QueryPerformanceCounter(&q0);
   if (pending_.size() + size > kPendingLimit) {
     *error = "the stream's OBU framing is broken (no complete OBU in 64 MiB)";
     pending_.clear();
     return false;
   }
   pending_.insert(pending_.end(), data, data + size);
+  if (dtimed) QueryPerformanceCounter(&q0);
 
   size_t pos = 0;
   bool ok = true;
@@ -541,6 +661,7 @@ bool StreamDecoder::push(const uint8_t* data, size_t size, size_t pitch,
     pos += payload_size;
     if (!ok) break;
   }
+  if (dtimed) QueryPerformanceCounter(&q0);
   /* Consume everything decoded (and, on an error, the OBU that failed); keep
    * an incomplete tail for the next push. */
   pending_.erase(pending_.begin(),
@@ -621,6 +742,8 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
 
   frontend::FrameHeader frame;
   LARGE_INTEGER h0{}, h1{}, hf{};
+  double hdr_ms = 0, tg_ms = 0, res_ms = 0, destroy_ms = 0;
+  double tiles_ms = 0, deq_ms = 0, plan_ms = 0, queue_ms = 0;
   if (ds_debug_enabled()) {
     QueryPerformanceFrequency(&hf);
     QueryPerformanceCounter(&h0);
@@ -629,8 +752,8 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
       frontend::parse_frame_header(st->seq, data, size, &frame, error, &st->refs);
   if (ds_debug_enabled()) {
     QueryPerformanceCounter(&h1);
-    const double ms = double(h1.QuadPart - h0.QuadPart) * 1000.0 / double(hf.QuadPart);
-    if (ms > 60.0) ds_debug_log("SLOW stage frame_header: %.1f ms", ms);
+    hdr_ms = double(h1.QuadPart - h0.QuadPart) * 1000.0 / double(hf.QuadPart);
+    if (hdr_ms > 20.0) ds_debug_log("SLOW stage frame_header: %.1f ms", hdr_ms);
   }
   if (parsed == frontend::ParseStatus::Invalid) return false;
   if (parsed == frontend::ParseStatus::Unsupported) {
@@ -653,7 +776,40 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
     job.existing_idx = which;
     job.pitch = pitch;
     job.sink = sink;
-    queue_job(std::move(job), error);
+    /* It goes through the frontend queue like every other frame: the frames
+     * before it are still being planned there, and a re-show that overtakes
+     * them would name a slot whose picture is not decoded yet. */
+    uint64_t generation = 0;
+    {
+      std::lock_guard<std::mutex> lk(pipe_mutex_);
+      generation = generation_;
+    }
+    submit_frontend_task(
+        [this, job = std::move(job), generation]() mutable {
+          std::string err;
+          queue_job(std::move(job), &err, generation);
+        },
+        -1);
+    return true;
+  }
+
+  /* A frame that is neither shown nor stored in the reference pool cannot
+   * affect the decoded output: nothing displays it, and no later frame can
+   * reference it - show_existing_frame only re-shows a slot, and a frame that
+   * refreshes no slot is in none. Such frames are the invisible "scratch"
+   * frames of a temporal layered stream, and they are the largest units in
+   * it: decoding them was the demuxer thread's single biggest cost and the
+   * source of the visible hitches (a 50 kB invisible frame took the demuxer
+   * 150-220 ms, and the shown frame behind it waited).
+   *
+   * Nothing else in the decoder carries state across a frame: the reference
+   * pool is written by refresh_frame_flags only, the CDFs are per frame, and
+   * the segmentation, grain and motion vector grids live in the slots. */
+  if (skip_invisible_ && !frame.show_frame && frame.refresh_frame_flags == 0) {
+    skipped_invisible_.fetch_add(1, std::memory_order_relaxed);
+    if (ds_debug_enabled())
+      ds_debug_log("skip invisible non-reference %s frame (%d bytes)",
+                   frontend::frame_type_name(frame.type), static_cast<int>(size));
     return true;
   }
 
@@ -665,13 +821,14 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   }
   if (ds_debug_enabled()) {
     QueryPerformanceCounter(&h1);
-    const double ms = double(h1.QuadPart - h0.QuadPart) * 1000.0 / double(hf.QuadPart);
-    if (ms > 60.0) ds_debug_log("SLOW stage tile_group: %.1f ms", ms);
+    tg_ms = double(h1.QuadPart - h0.QuadPart) * 1000.0 / double(hf.QuadPart);
+    if (tg_ms > 20.0) ds_debug_log("SLOW stage tile_group: %.1f ms", tg_ms);
   }
   if (!frontend::tile_group_is_complete(frame, group)) {
     *error = "the tile group covers " + std::to_string(group.tiles.size()) +
              " of the frame's " + std::to_string(frame.tiles.cols) + "x" +
              std::to_string(frame.tiles.rows) + " tiles";
+    ds_debug_log("tile group incomplete: %s", error->c_str());
     return false;
   }
 
@@ -712,7 +869,8 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
       st->seq, frame, &st->refs, group.tiles.data(), group.tiles.size(), data, size,
       &decoded, error);
   QueryPerformanceCounter(&pc1);
-  st_tiles.add(perf.ms(pc0, pc1));
+  tiles_ms = perf.ms(pc0, pc1);
+  st_tiles.add(tiles_ms);
   if (tile_status != frontend::ParseStatus::Ok) {
     if (error->empty()) *error = decoded.stop_reason;
     return false;
@@ -722,7 +880,8 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   QueryPerformanceCounter(&pc0);
   frontend::dequantise_tile(frame, st->seq.bit_depth, decoded, &quant);
   QueryPerformanceCounter(&pc1);
-  st_deq.add(perf.ms(pc0, pc1));
+  deq_ms = perf.ms(pc0, pc1);
+  st_deq.add(deq_ms);
 
   frontend::ReferenceInfo reference_info;
   for (int i = 0; i < 7; ++i) {
@@ -748,13 +907,6 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   st_refresh.add(perf.ms(pc0, pc1));
 
   FrameSyntax syntax;
-  QueryPerformanceCounter(&pc0);
-  if (!frontend::plan_from_tile(st->seq, frame, decoded, std::move(quant), &syntax, error,
-                                &reference_info)) {
-    return false;
-  }
-  QueryPerformanceCounter(&pc1);
-  st_plan.add(perf.ms(pc0, pc1));
 
   /* Free the slots this frame refreshes but does not predict from before it is
    * decoded; the frame is allowed to refresh a slot it reads, so those stay.
@@ -803,7 +955,27 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   int reserved = -1;
   if (ds_debug_enabled()) QueryPerformanceCounter(&h0);
   if (pipelined && kept) {
+    /* Wait for a reserved slot to come back before asking for one: the
+     * pipeline has three queues in front of the worker, and every frame that
+     * waits in one of them holds a slot. Without this the pool ran dry and
+     * the pipeline deadlocked (the worker waited for a slot to decode into,
+     * the demuxer waited for queue space, the queue waited for the worker). */
+    {
+      std::unique_lock<std::mutex> lk(pipe_mutex_);
+      space_cv_.wait(lk, [&] {
+        return reserved_slots_ < kMaxReservedSlots || pipe_failed_ || quitting_ ||
+               fallback_used_;
+      });
+      if (pipe_failed_ || quitting_) {
+        *error = notice_.empty() ? "the decoder is shutting down" : notice_;
+        return false;
+      }
+    }
     reserved = decoder_->reserve_reference();
+    if (reserved >= 0) {
+      std::lock_guard<std::mutex> lk(pipe_mutex_);
+      ++reserved_slots_;
+    }
     if (reserved < 0) {
       /* every slot may be marked because queued frames still hold the ones
        * the pool dropped; drain the queue and try again before giving up */
@@ -827,7 +999,7 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
         pipelined = false;
         finish();
         /* slots dropped earlier in this frame's plan: no job will carry them */
-        for (int slot : deferred_release) decoder_->release_reference(slot);
+        for (int slot : deferred_release) release_reserved(slot);
         deferred_release.clear();
         ds_debug_log("reference reservation failed; falling back to the "
                      "synchronous decode path");
@@ -839,8 +1011,8 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   }
   if (ds_debug_enabled()) {
     QueryPerformanceCounter(&h1);
-    const double ms = double(h1.QuadPart - h0.QuadPart) * 1000.0 / double(hf.QuadPart);
-    if (ms > 60.0) ds_debug_log("SLOW stage reserve: %.1f ms", ms);
+    res_ms = double(h1.QuadPart - h0.QuadPart) * 1000.0 / double(hf.QuadPart);
+    if (res_ms > 20.0) ds_debug_log("SLOW stage reserve: %.1f ms", res_ms);
   }
 
   if (pipelined) {
@@ -851,30 +1023,73 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
       if (previous != reserved) defer_release(previous);
     }
 
-    /* Build the frame plan *here*, on the demuxer's thread, so it overlaps the
-     * kernels of the job still running on the worker. The worker then only has
-     * to submit the plan. */
+    /* The frontend plan - the per block syntax the engine reads - is the
+     * demuxer's single biggest cost (13 ms a frame) and it depends on nothing
+     * but this frame, so it runs on the frontend thread: the demuxer parses
+     * the next frame while this one is being planned, and the planner and the
+     * GPU pick the frame up when it is ready. The frames keep their order,
+     * because the frontend queue is FIFO. */
     PipeJob job;
-    if (preplan_) {
-      QueryPerformanceCounter(&pc0);
-      const bool planned = decoder_->plan_frame(syntax, &job.frame_plan, error);
-      QueryPerformanceCounter(&pc1);
-      st_preplan.add(perf.ms(pc0, pc1));
-      if (!planned) return false;
-    }
-    job.syntax = std::move(syntax);
     job.slot = reserved;
     job.refresh_flags = frame.refresh_frame_flags;
     job.show_frame = frame.show_frame;
     job.pitch = pitch;
     job.sink = sink;
     job.release_slots = std::move(deferred_release);
-    QueryPerformanceCounter(&pc0);
-    queue_job(std::move(job), error);
-    QueryPerformanceCounter(&pc1);
-    st_queue.add(perf.ms(pc0, pc1));
+
+    uint64_t generation = 0;
+    {
+      std::lock_guard<std::mutex> lk(pipe_mutex_);
+      generation = generation_;
+    }
+    frontend::SequenceHeader seq_copy = st->seq;
+    frontend::FrameHeader frame_copy = frame;
+    frontend::ReferenceInfo refs_copy = reference_info;
+    frontend::TileDecodeResult decoded_move = std::move(decoded);
+    frontend::DequantisedTile quant_move = std::move(quant);
+    const int job_slot = job.slot;
+    submit_frontend_task([this, seq_copy = std::move(seq_copy),
+                          frame_copy = std::move(frame_copy), refs_copy = std::move(refs_copy),
+                          decoded_move = std::move(decoded_move),
+                          quant_move = std::move(quant_move), job = std::move(job),
+                          generation]() mutable {
+      FrameSyntax syntax;
+      std::string err;
+      LARGE_INTEGER f0{}, f1{}, ff{};
+      QueryPerformanceFrequency(&ff);
+      QueryPerformanceCounter(&f0);
+      if (!frontend::plan_from_tile(seq_copy, frame_copy, decoded_move, std::move(quant_move),
+                                    &syntax, &err, &refs_copy)) {
+        pipe_fail(err.empty() ? "frontend: the frame could not be planned" : err);
+        return;
+      }
+      QueryPerformanceCounter(&f1);
+      st_plan.add(double(f1.QuadPart - f0.QuadPart) * 1000.0 / double(ff.QuadPart));
+      if (preplan_) {
+        QueryPerformanceCounter(&f0);
+        const bool planned = decoder_->plan_frame(syntax, &job.frame_plan, &err);
+        QueryPerformanceCounter(&f1);
+        st_preplan.add(double(f1.QuadPart - f0.QuadPart) * 1000.0 / double(ff.QuadPart));
+        if (!planned) {
+          pipe_fail(err.empty() ? "frontend: the frame plan could not be built" : err);
+          return;
+        }
+      }
+      job.syntax = std::move(syntax);
+      queue_job(std::move(job), &err, generation);
+    }, job_slot);
     return true;
   }
+
+  /* Synchronous path: the plan is built here, on the calling thread. */
+  QueryPerformanceCounter(&pc0);
+  if (!frontend::plan_from_tile(st->seq, frame, decoded, std::move(quant), &syntax, error,
+                                &reference_info)) {
+    return false;
+  }
+  QueryPerformanceCounter(&pc1);
+  plan_ms = perf.ms(pc0, pc1);
+  st_plan.add(plan_ms);
 
   /* Synchronous path: decode on the calling thread, then do the book keeping
    * that the pipelined path does at plan time. */
