@@ -118,6 +118,10 @@ class StreamDecoder {
   void queue_job(PipeJob job, std::string* error, uint64_t generation = 0);
   /* Starts the pipeline's threads if they are not running yet. */
   void ensure_threads();
+  /* Takes a picture buffer out of the pool (an empty one when the pool is
+   * empty) and hands one back when it is not needed any more. */
+  Frame take_frame();
+  void give_frame(Frame&& frame);
   void planner_loop();
   void frontend_loop();
   void worker_loop();
@@ -190,6 +194,12 @@ class StreamDecoder {
   std::deque<OutputJob> out_jobs_;
   bool output_busy_ = false;  /* the output thread is inside a job */
   bool output_quit_ = false;  /* the output thread must exit */
+  /* The decoded pictures are recycled. A frame's storage is several MB at
+   * 1080p, and allocating (and clearing) it for every frame costs more than
+   * the copy that fills it: the worker takes a frame from the pool, the
+   * output stage hands it back when it is done with it. */
+  std::mutex frame_pool_mutex_;
+  std::vector<Frame> frame_pool_;
   /* Bumped by abort_pipe(): a task that was queued before the flush belongs
    * to the old stream and must not reach the worker. */
   uint64_t generation_ = 0;

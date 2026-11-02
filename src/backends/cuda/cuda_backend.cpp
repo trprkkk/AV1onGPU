@@ -1102,14 +1102,44 @@ class CudaBackend final : public Backend {
       }
     }
     const double t2 = now_ms();
+    if (out) {
+      if (!out->matches(g.frame.width, g.frame.height, g.frame.bit_depth, g.frame.ss_x,
+                        g.frame.ss_y))
+        out->allocate(g.frame.width, g.frame.height, g.frame.bit_depth, g.frame.ss_x,
+                      g.frame.ss_y);
+      /* The read back goes into the page locked buffer: a pageable device to
+       * host copy of the whole picture runs at a third of the speed, and this
+       * is several MB for every frame of the stream. */
+      const size_t bytes = g.buffer_size * sizeof(uint16_t);
+      uint16_t* staging = nullptr;
+      if (ensure_pinned(&pinned_rb_, &pinned_rb_cap_, bytes)) {
+        staging = static_cast<uint16_t*>(pinned_rb_);
+      } else {
+        if (staging_.size() < g.buffer_size) staging_.resize(g.buffer_size);
+        staging = staging_.data();
+      }
+      if (driver_.MemcpyDtoH(staging, frame_, bytes) != cuda::CUDA_SUCCESS)
+        return fail(error, "frame read back failed");
+      for (int p = 0; p < 3; ++p) {
+        const int w = g.out_w[p];
+        const int h = g.out_h[p];
+        for (int y = 0; y < h; ++y)
+          std::memcpy(out->plane(p) + static_cast<size_t>(y) * out->stride[p],
+                      staging + g.plane_off[p] + static_cast<size_t>(y) * g.stride[p],
+                      static_cast<size_t>(w) * sizeof(uint16_t));
+      }
+    }
+    const double t3 = now_ms();
+
     /* temporary profiling: how much of reconstruct was CPU prep vs GPU wait */
     {
-      static double acc_sync = 0.0, acc_filter = 0.0, acc_rec = 0.0;
+      static double acc_sync = 0.0, acc_filter = 0.0, acc_rec = 0.0, acc_rb = 0.0;
       static long long acc_bytes = 0;
       static long n = 0;
       acc_sync += double(qf.QuadPart ? 0 : 0); /* no-op keeps qf referenced */
       acc_filter += t2 - t1;
       acc_rec += t1 - t0;
+      acc_rb += t3 - t2;
       size_t waves = plan.waves.size();
       acc_bytes += static_cast<long long>(plan.coefficients.size() * 4) +
                    static_cast<long long>(plan.residual.size() * 4);
@@ -1123,9 +1153,9 @@ class CudaBackend final : public Backend {
         std::snprintf(msg, sizeof(msg),
                       "perf backend: reconstruct %.1f, "
                       "waves %zu, filter(sync incl) %.1f, "
-                      "jobs %zu, uploads %lld KB, %ld frames",
+                      "readback %.1f, jobs %zu, uploads %lld KB, %ld frames",
                       acc_rec / n, waves,
-                      acc_filter / n, job_count, acc_bytes / 1024, n);
+                      acc_filter / n, acc_rb / n, job_count, acc_bytes / 1024, n);
         OutputDebugStringA("av1gpu: ");
         OutputDebugStringA(msg);
         OutputDebugStringA("\n");
@@ -1144,26 +1174,6 @@ class CudaBackend final : public Backend {
       }
     }
 
-    if (out) {
-      if (!out->matches(g.frame.width, g.frame.height, g.frame.bit_depth, g.frame.ss_x,
-                        g.frame.ss_y))
-        out->allocate(g.frame.width, g.frame.height, g.frame.bit_depth, g.frame.ss_x,
-                      g.frame.ss_y);
-      if (staging_.size() < g.buffer_size) staging_.resize(g.buffer_size);
-      if (driver_.MemcpyDtoH(staging_.data(), frame_, g.buffer_size * sizeof(uint16_t)) !=
-          cuda::CUDA_SUCCESS)
-        return fail(error, "frame read back failed");
-      for (int p = 0; p < 3; ++p) {
-        const int w = g.out_w[p];
-        const int h = g.out_h[p];
-        for (int y = 0; y < h; ++y)
-          std::memcpy(out->plane(p) + static_cast<size_t>(y) * out->stride[p],
-                      staging_.data() + g.plane_off[p] +
-                          static_cast<size_t>(y) * g.stride[p],
-                      static_cast<size_t>(w) * sizeof(uint16_t));
-      }
-    }
-    const double t3 = now_ms();
 
     if (out_slot) *out_slot = slot;
     {
@@ -1571,21 +1581,29 @@ class CudaBackend final : public Backend {
   /* Large host to device copies go through one page-locked staging buffer:
    * pageable cuMemcpyHtoD runs at a fraction of the bus speed, and the job
    * arrays alone are tens of megabytes per 1080p frame. */
+  /* Grows a page locked staging buffer so it holds `bytes`. */
+  bool ensure_pinned(void** buffer, size_t* capacity, size_t bytes) {
+    if (!driver_.MemAllocHost || !driver_.MemFreeHost) return false;
+    if (*capacity >= bytes && *buffer) return true;
+    if (*buffer) driver_.MemFreeHost(*buffer);
+    *buffer = nullptr;
+    *capacity = 0;
+    const size_t want = bytes + bytes / 2; /* headroom for the next frames */
+    if (driver_.MemAllocHost(buffer, want) != cuda::CUDA_SUCCESS || !*buffer) {
+      *buffer = nullptr;
+      *capacity = 0;
+      return false;
+    }
+    *capacity = want;
+    return true;
+  }
+
   bool upload_h2d(CUdeviceptr dst, const void* src, size_t bytes) {
     if (bytes == 0) return true;
     if (!driver_.MemAllocHost || !driver_.MemFreeHost)
       return driver_.MemcpyHtoD(dst, src, bytes) == cuda::CUDA_SUCCESS;
-    if (pinned_cap_ < bytes) {
-      if (pinned_) driver_.MemFreeHost(pinned_);
-      pinned_ = nullptr;
-      size_t want = bytes + bytes / 2; /* headroom for the next frames */
-      if (driver_.MemAllocHost(&pinned_, want) != cuda::CUDA_SUCCESS || !pinned_) {
-        pinned_ = nullptr;
-        pinned_cap_ = 0;
-        return driver_.MemcpyHtoD(dst, src, bytes) == cuda::CUDA_SUCCESS;
-      }
-      pinned_cap_ = want;
-    }
+    if (!ensure_pinned(&pinned_, &pinned_cap_, bytes))
+      return driver_.MemcpyHtoD(dst, src, bytes) == cuda::CUDA_SUCCESS;
     std::memcpy(pinned_, src, bytes);
     return driver_.MemcpyHtoD(dst, pinned_, bytes) == cuda::CUDA_SUCCESS;
   }
@@ -1684,6 +1702,11 @@ class CudaBackend final : public Backend {
   /* page-locked host staging for the large per frame uploads */
   void* pinned_ = nullptr;
   size_t pinned_cap_ = 0;
+  /* The read back has its own page-locked buffer: a host to device copy out
+   * of page-locked memory is asynchronous, so the driver may still be reading
+   * the coefficients out of `pinned_` when the read back would overwrite it. */
+  void* pinned_rb_ = nullptr;
+  size_t pinned_rb_cap_ = 0;
   /* per frame arenas the parallel wave prep fills at fixed offsets */
   CUdeviceptr job_arena_ = 0;
   size_t job_arena_cap_ = 0;

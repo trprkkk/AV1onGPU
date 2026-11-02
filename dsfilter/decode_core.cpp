@@ -208,6 +208,23 @@ void StreamDecoder::ensure_threads() {
   if (!output_.joinable()) output_ = std::thread(&StreamDecoder::output_loop, this);
 }
 
+Frame StreamDecoder::take_frame() {
+  std::lock_guard<std::mutex> lk(frame_pool_mutex_);
+  if (frame_pool_.empty()) return Frame();
+  Frame frame = std::move(frame_pool_.back());
+  frame_pool_.pop_back();
+  return frame;
+}
+
+void StreamDecoder::give_frame(Frame&& frame) {
+  if (frame.empty()) return;
+  std::lock_guard<std::mutex> lk(frame_pool_mutex_);
+  /* Two frames are enough: the worker decodes into one while the output stage
+   * packs the other. */
+  if (frame_pool_.size() >= 2) return;
+  frame_pool_.push_back(std::move(frame));
+}
+
 void StreamDecoder::release_reserved(int slot) {
   if (slot < 0) return;
   decoder_->release_reference(slot);
@@ -379,6 +396,9 @@ void StreamDecoder::output_loop() {
     }
     std::string err;
     if (!emit(job.picture, job.pitch, job.sink, &err)) pipe_fail(err);
+    /* The picture goes back to the pool: the worker decodes the next frame
+     * into a buffer that is already allocated. */
+    give_frame(std::move(job.picture));
     {
       std::lock_guard<std::mutex> lk(pipe_mutex_);
       output_busy_ = false;
@@ -425,7 +445,7 @@ void StreamDecoder::run_job(PipeJob* job) {
     QueryPerformanceCounter(&j0);
   }
   if (job->show_existing) {
-    Frame picture;
+    Frame picture = take_frame();
     bool valid = false;
     {
       std::lock_guard<std::mutex> lk(pipe_mutex_);
@@ -444,7 +464,7 @@ void StreamDecoder::run_job(PipeJob* job) {
     return;
   }
 
-  Frame picture;
+  Frame picture = take_frame();
   std::string err;
   LARGE_INTEGER b0{}, b1{};
   if (jtimed) QueryPerformanceCounter(&b0);
