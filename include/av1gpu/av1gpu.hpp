@@ -739,8 +739,7 @@ class Decoder {
   virtual bool to_rgb(int slot, ColorMatrix matrix, ColorRange range,
                       std::vector<uint8_t>* rgb, std::string* error = nullptr) = 0;
 
-  /* The same picture as NV12, packed *on the device*, into rows `pitch` bytes
-   * wide - the last step of a zero copy path, so the planes never come back to
+  /* The same picture as NV12, packed *on the device*, into rows `pitch` bytes   * wide - the last step of a zero copy path, so the planes never come back to
    * the host. Same buffer size and padding rules as frame_to_nv12, and the same
    * refusal for a frame that is not 4:2:0. */
   virtual bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
@@ -771,6 +770,15 @@ class Decoder {
 
   /* Hands a handle from nv12_pack_begin back. */
   virtual void nv12_pack_release(int handle) { (void)handle; }
+
+  /* Holds the output stage: while held, frames are decoded (their pictures are
+   * references for the frames that follow) but not packed or delivered - the
+   * sink is called with an empty buffer so the caller's timing stays in step.
+   * A filter seeking into the middle of a long GOP holds it for the frames
+   * between the keyframe and the seek point: they would be delivered with
+   * timestamps in the past, which a renderer either drops (wasted work) or
+   * displays in a burst (the fast-forward a seek looks like). */
+  virtual void hold_output(bool hold) { (void)hold; }
 
   virtual void reset() = 0;
 

@@ -760,6 +760,17 @@ class Av1GpuFilter : public IBaseFilter {
     Hold hold(lock_);
     return core_.get();
   }
+  /* Where the current segment starts (a seek's target): frames that end before
+   * it are ones the renderer would drop, so the decoder packs nothing for
+   * them. A negative value means "no gate" (nothing has been seeked yet). */
+  void set_segment_start(REFERENCE_TIME t) {
+    Hold hold(lock_);
+    segment_start_ = t;
+  }
+  REFERENCE_TIME segment_start() {
+    Hold hold(lock_);
+    return segment_start_;
+  }
 
  private:
   ULONG refs_ = 1;
@@ -771,6 +782,7 @@ class Av1GpuFilter : public IBaseFilter {
   /* false while stopped: a job the worker still holds must not deliver into a
    * graph that is going down */
   std::atomic<bool> deliver_enabled_{false};
+  REFERENCE_TIME segment_start_ = -1;
 
   InputPin input_;
   OutputPin output_;
@@ -971,7 +983,6 @@ HRESULT InputPin::EndFlush() {
 
 HRESULT InputPin::NewSegment(REFERENCE_TIME start, REFERENCE_TIME stop, double rate) {
   (void)stop;
-  (void)start;
   (void)rate;
   StreamDecoder* core = nullptr;
   {
@@ -983,6 +994,11 @@ HRESULT InputPin::NewSegment(REFERENCE_TIME start, REFERENCE_TIME stop, double r
      * arrives again with the next key frame. Outside the lock for the same
      * reason as EndFlush. */
     core->reset_stream();
+    /* The splitter resumes at the keyframe *before* the seek point, so the
+     * frames between it and here are ones the renderer would drop. Remember
+     * where the segment starts: the decoder packs nothing for a frame that
+     * ends before it, which is most of a long GOP's catch-up. */
+    filter_->set_segment_start(start);
   }
   return S_OK;
 }
@@ -1048,7 +1064,8 @@ HRESULT InputPin::Receive(IMediaSample* sample) {
   };
   auto keep = std::make_shared<PinKeep>(out);
   Av1GpuFilter* filter = filter_;
-  StreamDecoder::Sink sink = [out, timing, keep, filter](const std::vector<uint8_t>& nv12,
+  StreamDecoder* core_shared = core;
+  StreamDecoder::Sink sink = [out, timing, keep, filter, core_shared](const std::vector<uint8_t>& nv12,
                                                          int w, int h,
                                                          std::string* sink_error) -> bool {
     (void)sink_error;
@@ -1058,6 +1075,18 @@ HRESULT InputPin::Receive(IMediaSample* sample) {
        * into a renderer that is not there any more */
       return true;
     }
+    if (nv12.empty()) {
+      /* held by the decoder (a seek's catch-up frames): nothing to deliver,
+       * but the timing advances in step so the later frames keep theirs */
+      timing->start += timing->dur;
+      return true;
+    }
+    /* A frame that ends before the segment starts is one the renderer would
+     * drop: the splitter resumed at the keyframe before the seek point. Tell
+     * the decoder to hold the next ones too, so the catch-up neither spends
+     * the pack on them nor shows up as a burst of out-of-order frames. */
+    const bool past = timing->start + timing->dur <= filter->segment_start();
+    if (core_shared) core_shared->hold_output(past);
     const HRESULT hr = out->deliver(nv12, w, h, timing->start,
                                     timing->start + timing->dur,
                                     timing->discontinuity);

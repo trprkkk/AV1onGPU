@@ -458,6 +458,13 @@ class EngineDecoder final : public av1gpu::Decoder {
     backend_->nv12_pack_release(handle);
   }
 
+  /* The output gate: while held the frames are decoded but not packed, and the
+   * sink is called with an empty buffer. A seek into the middle of a long GOP
+   * holds it for the catch-up frames. */
+  void hold_output(bool hold) override {
+    hold_output_.store(hold, std::memory_order_relaxed);
+  }
+
  private:
   std::unique_ptr<Backend> backend_;
   BackendOptions options_;
@@ -466,6 +473,9 @@ class EngineDecoder final : public av1gpu::Decoder {
    * the device: the host then leaves the raster pool empty (see
    * build_frame_plan's host_fills_pools). */
   bool device_dequant_ = false;
+  /* The output gate: while held the frames are decoded but not packed (see
+   * Decoder::hold_output). */
+  std::atomic<bool> hold_output_{false};
   /* The layout each reference slot's picture was decoded with, for a device
    * side pack (to_nv12) that runs after another frame has been prepared.
    * kTrackedSlots covers every backend's reference pool (the CUDA one has 32)

@@ -92,6 +92,13 @@ class StreamDecoder {
   /* Drops the buffered bytes and every reference. Call on a discontinuity. */
   void reset_stream();
 
+  /* Holds the output stage (see Decoder::hold_output): while held, emit drops
+   * the frames without packing or delivering them. A seek into the middle of a
+   * long GOP holds it for the catch-up frames. */
+  void hold_output(bool hold) {
+    hold_output_.store(hold, std::memory_order_relaxed);
+  }
+
   /* Waits for the worker to drain every queued frame. Call at end of stream so
    * the last frames are shown before EOS is delivered downstream. */
   void finish();
@@ -116,7 +123,6 @@ class StreamDecoder {
   bool emit(const Frame& picture, size_t pitch, const Sink& sink,
             std::string* error, const std::vector<uint8_t>* pre_packed,
             int pack_handle);
-
   void queue_job(PipeJob job, std::string* error, uint64_t generation = 0);
   /* Starts the pipeline's threads if they are not running yet. */
   void ensure_threads();
@@ -257,6 +263,9 @@ class StreamDecoder {
    * picture there - the worker's read back is skipped, which at 4K is ~38 MB
    * of PCIe traffic a frame. */
   int device_pack_ = 0;
+  /* The output gate (see Decoder::hold_output): while held, emit drops the
+   * frame without packing or delivering it. */
+  std::atomic<bool> hold_output_{false};
   bool fallback_used_ = false; /* a failed reservation switched us to sync */
   bool quitting_ = false;    /* threads must exit once the queues are empty */
   bool busy_ = false;        /* the worker is inside a job */

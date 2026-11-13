@@ -989,6 +989,14 @@ bool StreamDecoder::emit(const Frame& picture, size_t pitch, const Sink& sink,
     ++dropped_;
     return true;
   }
+  /* The output gate: while held, the frame is dropped without being packed or
+   * delivered. The sink is still called (with an empty buffer) so the caller's
+   * frame timing advances in step - a frame that is not accounted for would
+   * leave every later one with a stale timestamp. */
+  if (hold_output_.load(std::memory_order_relaxed)) {
+    ++dropped_;
+    return sink(std::vector<uint8_t>(), picture.width, picture.height, error);
+  }
   std::vector<uint8_t> nv12;
   const auto pc0 = std::chrono::steady_clock::now();
   if (pack_handle >= 0) {
