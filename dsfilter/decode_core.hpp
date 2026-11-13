@@ -1,4 +1,4 @@
-﻿/*
+/*
  * AV1onGPU - DirectShow decode core
  *
  * The part of the DirectShow filter that is worth testing without DirectShow:
@@ -113,7 +113,9 @@ class StreamDecoder {
  private:
   bool decode_obu(frontend::ObuType type, const uint8_t* payload, size_t size,
                   size_t pitch, const Sink& sink, std::string* error);
-  bool emit(const Frame& picture, size_t pitch, const Sink& sink, std::string* error);
+  bool emit(const Frame& picture, size_t pitch, const Sink& sink,
+            std::string* error, const std::vector<uint8_t>* pre_packed,
+            int pack_handle);
 
   void queue_job(PipeJob job, std::string* error, uint64_t generation = 0);
   /* Starts the pipeline's threads if they are not running yet. */
@@ -128,7 +130,8 @@ class StreamDecoder {
   void output_loop();
   /* Hands a decoded picture to the output stage: the worker starts the next
    * frame's kernels while this one is packed into NV12 and shown. */
-  void queue_output(Frame picture, size_t pitch, const Sink& sink);
+  void queue_output(Frame picture, size_t pitch, const Sink& sink,
+                    std::vector<uint8_t> nv12 = {}, int pack_handle = -1);
   /* Hands a reserved backend slot back to the pool and counts it out. */
   void release_reserved(int slot);
   /* Hands a frame's frontend work (the per block syntax) to the frontend
@@ -187,6 +190,12 @@ class StreamDecoder {
    * shown in coding order. */
   struct OutputJob {
     Frame picture;
+    /* The packed NV12 bytes, when the pack already ran on the worker (the
+     * device path). Empty means emit packs the host picture itself. */
+    std::vector<uint8_t> nv12;
+    /* A streamed pack: the kernel and the copy were started on the worker and
+     * the bytes come back when this job calls nv12_pack_finish. */
+    int pack_handle = -1;
     size_t pitch = 0;
     Sink sink;
   };
@@ -203,6 +212,16 @@ class StreamDecoder {
   /* Bumped by abort_pipe(): a task that was queued before the flush belongs
    * to the old stream and must not reach the worker. */
   uint64_t generation_ = 0;
+  /* Set while a flush is in flight, so the planner abandons the plan it is
+   * building instead of spending the rest of a keyframe's 40-80 ms on a plan
+   * the seek is about to throw away. Cleared once the flush is done. */
+  std::atomic<bool> flush_cancel_{false};
+  /* The generation the worker's current ready_jobs_ belong to. When a flush
+   * bumps generation_, the worker stops pulling jobs out of ready_jobs_ (they
+   * are the old stream's and would be decoded only to be thrown away) and
+   * sleeps until abort_pipe() has discarded them - a seek used to wait for
+   * every already-planned frame to finish decoding, seconds of drain on 4K. */
+  uint64_t worker_generation_ = 0;
   mutable std::mutex pipe_mutex_;
   std::condition_variable pipe_cv_;     /* queue space or drain */
   std::condition_variable planner_cv_;  /* wake the planner */
@@ -216,7 +235,7 @@ class StreamDecoder {
    * it also has to stay under kReferenceSlots - 8: each in-flight kept frame
    * holds one reserved backend slot on top of the eight the reference pool can
    * name, and running out is what triggers the reserve-fail drain. */
-  static constexpr size_t kPipeDepth = 12;
+  static constexpr size_t kPipeDepth = 16;
   /* The backend's slot pool is the hard limit on how far the decoder may run
    * ahead of the GPU: every frame that is parsed but not decoded yet holds a
    * reserved slot, and the reference pool holds eight more. The pipeline has
@@ -226,12 +245,18 @@ class StreamDecoder {
    * and the pool ran dry, which deadlocked the pipeline (the worker waited for
    * a slot, the demuxer waited for the queue, the queue waited for the
    * worker). */
-  static constexpr size_t kMaxReservedSlots = 12;
+  static constexpr size_t kMaxReservedSlots = 16;
   size_t reserved_slots_ = 0;  /* slots reserved and not handed back yet */
   bool pipelined_ = false;   /* frames go through the queue */
   bool plan_thread_ = true;  /* the planner thread builds the plans */
   bool skip_invisible_ = true; /* frames nobody shows or references are skipped */
   bool preplan_ = false;     /* the decoder can pre-build frame plans */
+  /* How a shown frame reaches the output stage: 0 packs the host picture (the
+   * worker reads every frame back), 1 packs the picture on the device *and*
+   * reads it back (the A/B for the pack), 2 packs on the device and leaves the
+   * picture there - the worker's read back is skipped, which at 4K is ~38 MB
+   * of PCIe traffic a frame. */
+  int device_pack_ = 0;
   bool fallback_used_ = false; /* a failed reservation switched us to sync */
   bool quitting_ = false;    /* threads must exit once the queues are empty */
   bool busy_ = false;        /* the worker is inside a job */
@@ -240,6 +265,15 @@ class StreamDecoder {
   Frame pipe_picture_[8];
   bool pipe_valid_[8] = {false, false, false, false, false,
                          false, false, false};
+  /* Parallel to pipe_valid_: the packed NV12 bytes of each decoded picture, for
+   * a stream whose frames are packed on the device. A show_existing_frame then
+   * re-emits them and no host picture is needed. Empty when the frame was not
+   * packed. */
+  std::vector<uint8_t> pipe_nv12_[8];
+  /* Parallel to pipe_nv12_: a streamed pack's handle, when the bytes are still
+   * in flight. A show_existing_frame waits for it and keeps the bytes, so the
+   * handle is single-use and the entry stays owned here until then. */
+  int pipe_pack_handle_[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 
   std::string notice_; /* a one shot message worth surfacing once */
 

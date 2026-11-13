@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "av1gpu/av1gpu.hpp"
@@ -340,7 +341,8 @@ inline CompoundType to_compound_type(int compound) {
  * caller that still needs the pool (a test that plans the same tile twice)
  * gets the copying overload instead. */
 inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& frame,
-                                const TileDecodeResult& tile, DequantisedTile& quant,
+                                const TileDecodeResult& tile, TileDecodeResult* levels_from,
+                                DequantisedTile& quant,
                                 FrameSyntax* out, std::string* error,
                                 const ReferenceInfo* refs) {
   std::string local;
@@ -445,9 +447,48 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
   };
 
   /* The dequantised pool becomes the syntax's coefficient pool outright: it is
-   * a per-frame temporary, so moving it saves a full pool copy per frame. */
+   * a per-frame temporary, so moving it saves a full pool copy per frame. The
+   * coded levels ride along (moved when the caller handed the tile result
+   * over): they are what a backend needs to dequantise on the device, and
+   * they are the coded size of the frame rather than the raster one. */
   out->coefficients = std::move(quant.coefficients);
+  if (levels_from) out->levels = std::move(levels_from->levels);
+  else out->levels = tile.levels;
+  out->qm_pool = std::move(quant.qm_pool);
   out->blocks.reserve(tile.blocks.size());
+
+  /* The tail - the loop filter's edges, the CDEF block list and the loop
+   * restoration units - is planned from the tile syntax, exactly like the
+   * block loop below: it reads no block the loop produces and writes only
+   * fields the loop does not touch (deblock, cdef, restoration, sharpness
+   * against blocks and palette_map). The two halves are about equally
+   * expensive, so the tail runs beside the block loop on its own thread: the
+   * pool chunks inside it then run without queueing behind anything the loop
+   * does, and the caller keeps its cores for the blocks. A frame this size has
+   * thousands of blocks, so one thread spawn a frame is nothing next to the
+   * work it overlaps. */
+  std::string tail_error;
+  bool tail_ok = false;
+  const auto tail_start = std::chrono::steady_clock::now();
+  /* The overlap is worth its thread only on a big frame: with a thousand
+   * blocks (1080p) the tail's pool chunks otherwise queue behind the block
+   * loop for no gain, and the extra thread costs more than it hides. Measured
+   * back to back: 4K 75.0 vs 79.4 ms with the tail inline, 1080p 19.0 vs
+   * 22.3 ms. AV1GPU_PLAN_TAIL_INLINE=1 forces the inline path (the A/B). */
+  static const bool tail_inline = std::getenv("AV1GPU_PLAN_TAIL_INLINE") != nullptr;
+  const bool overlap = !tail_inline && tile.blocks.size() >= 2048;
+  std::thread tail_thread;
+  if (!overlap) {
+    tail_ok = plan_deblock(seq, frame, tile, out, &tail_error) &&
+              plan_cdef(seq, frame, tile, out, &tail_error) &&
+              plan_restoration(seq, frame, tile, out, &tail_error);
+  } else {
+    tail_thread = std::thread([&]() {
+      tail_ok = plan_deblock(seq, frame, tile, out, &tail_error) &&
+                plan_cdef(seq, frame, tile, out, &tail_error) &&
+                plan_restoration(seq, frame, tile, out, &tail_error);
+    });
+  }
 
   const bool lossless = frame.coded_lossless;
   size_t next_offset = 0;
@@ -923,6 +964,17 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
       tb.h = tx.height();
       tb.eob = transform.eob;
       tb.tx_type = to_transform_type(transform.tx_type);
+      /* what a device side dequant reads: the coded levels, the block's
+       * quantiser, and the precomputed dequantiser for this transform */
+      tb.level_offset = static_cast<int>(transform.level_offset);
+      tb.qindex = transform.qindex;
+      if (next_offset < quant.params.size()) {
+        const DequantParam& param = quant.params[next_offset];
+        tb.dc_step = param.dc_step;
+        tb.ac_step = param.ac_step;
+        tb.denominator = param.denominator;
+        tb.qm_off = param.qm_off;
+      }
       if (next_offset < quant.offsets.size()) {
         tb.coef_offset = static_cast<int>(quant.offsets[next_offset]);
       }
@@ -952,28 +1004,19 @@ inline bool plan_from_tile_impl(const SequenceHeader& seq, const FrameHeader& fr
   }
   const auto t2 = std::chrono::steady_clock::now();
 
-  /* The loop filter's edges come from the block grid, not from the transform
-   * blocks: whether an edge is filtered depends on the transform sizes on both
-   * sides of it and on the block that owns it. */
-  if (!plan_deblock(seq, frame, tile, out, error)) return false;
-
-  /* CDEF works on the deblocked picture and on nothing the bitstream says about
-   * the direction, so all this stage decides is which blocks filter and with
-   * which of the header's parameter sets. */
-  if (!plan_cdef(seq, frame, tile, out, error)) return false;
-
-  /* Loop restoration runs last, on the CDEF output and (outside the stripe it
-   * is filtering) on the deblocked picture, so it only needs the frame level
-   * parameters and the unit table the tile decoder read. */
-  if (!plan_restoration(seq, frame, tile, out, error)) return false;
+  if (tail_thread.joinable()) tail_thread.join();
+  const auto t3 = std::chrono::steady_clock::now();
+  if (!tail_ok) {
+    if (error) *error = tail_error;
+    return false;
+  }
 
   if (pstage) {
-    const auto t3 = std::chrono::steady_clock::now();
     const auto ms = [](auto a, auto b) {
       return std::chrono::duration<double, std::milli>(b - a).count();
     };
     std::fprintf(stderr, "[plan-stage] owner %.2f blocks %.2f tail %.2f (nblocks %zu)\n",
-                 ms(t0, t1), ms(t1, t2), ms(t2, t3), tile.blocks.size());
+                 ms(t0, t1), ms(t1, t2), ms(tail_start, t3), tile.blocks.size());
   }
   return true;
 }
@@ -983,7 +1026,17 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
                            const TileDecodeResult& tile, DequantisedTile&& quant,
                            FrameSyntax* out, std::string* error,
                            const ReferenceInfo* refs = nullptr) {
-  return plan_from_tile_impl(seq, frame, tile, quant, out, error, refs);
+  return plan_from_tile_impl(seq, frame, tile, nullptr, std::move(quant), out, error, refs);
+}
+
+/* The caller is done with the tile result too: its coded levels move into the
+ * syntax (the pipeline's path, so a backend can dequantise on the device
+ * without another copy). */
+inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
+                           TileDecodeResult&& tile, DequantisedTile&& quant,
+                           FrameSyntax* out, std::string* error,
+                           const ReferenceInfo* refs = nullptr) {
+  return plan_from_tile_impl(seq, frame, tile, &tile, std::move(quant), out, error, refs);
 }
 
 /* Keeps the caller's pool: copies it in first. */
@@ -995,7 +1048,7 @@ inline bool plan_from_tile(const SequenceHeader& seq, const FrameHeader& frame,
   copy.bit_depth = quant.bit_depth;
   copy.coefficients = quant.coefficients;
   copy.offsets = quant.offsets;
-  return plan_from_tile_impl(seq, frame, tile, copy, out, error, refs);
+  return plan_from_tile_impl(seq, frame, tile, nullptr, copy, out, error, refs);
 }
 
 } /* namespace frontend */

@@ -647,7 +647,8 @@ class OpenCLBackend final : public Backend {
   }
 
   bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
-               std::string* error) override {
+               std::string* error, const PlanLayout* layout) override {
+    (void)layout; /* this backend keeps one geometry at a time */
     error->clear();
     if (layout_.buffer_size == 0) {
       *error = "prepare() has not been called";

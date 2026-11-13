@@ -595,7 +595,8 @@ class CpuBackend final : public Backend {
   }
 
   bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
-               std::string* error) override {
+               std::string* error, const PlanLayout* layout) override {
+    (void)layout; /* the host holds one copy of every picture anyway */
     Frame frame;
     if (!gather(slot, &frame, error)) return false;
     if (!frame_to_nv12(frame, pitch, nv12)) {

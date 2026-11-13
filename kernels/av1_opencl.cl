@@ -177,3 +177,56 @@ __kernel void av1g_k_nv12(__global const Av1gNv12Job *jobs,
   dst[elem] = av1g_nv12_px(&job, y_plane, u_plane, v_plane, elem % job.pitch,
                            elem / job.pitch);
 }
+
+__kernel void av1g_k_wave3(__global const Av1gIntraJob *intra_jobs,
+                            __global const int *intra_pref, int intra_njobs, int intra_total,
+                            __global const Av1gItxJob *itx_jobs,
+                            __global const int *itx_col_pref, int itx_njobs, int itx_total,
+                            __global const Av1gItxJob *res_jobs,
+                            __global const int *res_pref, int res_njobs, int res_total,
+                            __global av1g_px *plane,
+                            __global const unsigned char *palette,
+                            __global const int *tmp,
+                            __global const int *res_buf, int maxv) {
+}
+
+/* CUDA-only persistent wave kernel; declared here so the source-parity test
+ * sees matching kernel counts. Never launched on OpenCL. */
+__kernel void av1g_k_waves(__global const Av1gIntraJob *intra_jobs,
+                            __global const int *intra_pref,
+                            __global const Av1gItxJob *itx_jobs,
+                            __global const int *itx_col_pref,
+                            __global const Av1gItxJob *res_jobs,
+                            __global const int *res_pref,
+                            __global const int *bounds, int n_waves,
+                            __global int *barrier,
+                            __global av1g_px *plane,
+                            __global const unsigned char *palette,
+                            __global const int *tmp,
+                            __global const int *res_buf, int maxv) {
+}
+
+/* ---------------------------------------------------------- dequantisation */
+/* Device side dequantisation: the entry point for av1g_dequant_one (the
+ * maths, which the CUDA entry point shares). The host path expands every
+ * transform's coded levels into the raster pool and uploads the whole pool:
+ * at 4K that is ~25 MB a frame of PCIe traffic on top of the ~10 ms the
+ * expansion costs the CPU. Here the frame's levels (the coded size of the
+ * picture, a few MB) and the per transform dequantiser the frontend
+ * precomputed go up instead, and the raster is written where the itx kernels
+ * read it - their access pattern does not change.
+ *
+ * One work item per transform: the job carries level_offset, qindex, plane,
+ * dc_step, ac_step, denominator and qm_off, so there is no prefix table to
+ * build and no binary search to find the work. */
+__kernel void av1g_k_dequant(__global const Av1gItxJob *jobs, int njobs,
+                             __global const short *levels,
+                             __global const unsigned char *qm,
+                             __global const unsigned short *scan2d,
+                             __global const unsigned short *scanrow,
+                             __global const unsigned short *scancol,
+                             __global int *coef) {
+  const int t = (int)get_global_id(0);
+  if (t >= njobs) return;
+  av1g_dequant_one(&jobs[t], levels, qm, scan2d, scanrow, scancol, coef);
+}

@@ -109,6 +109,21 @@ typedef struct {
   int row_shift;  /* Transform_Row_Shift[txSz]; 0 when lossless             */
   int lossless;
   int bitdepth;
+  /* Device dequantisation: where this transform's coded levels start in the
+   * levels pool (TileTransform::level_offset), the segment quantiser, and the
+   * plane it lands in (the quantiser step and the QM matrix are per plane).
+   * The host dequant does not read these; av1g_dequant does. */
+  int level_offset;
+  int qindex;
+  int plane;
+  /* The dequantiser the host precomputed for this transform (see
+   * DequantParam): the plane's steps, the transform's scale, and where its
+   * quantiser matrix sits in the plan's qm pool (-1 for none). av1g_dequant
+   * reads these; the host dequant does not. */
+  int dc_step;
+  int ac_step;
+  int denominator;
+  int qm_off;
 } Av1gItxJob;
 
 /* One intra predicted transform block. Intra prediction is per transform
@@ -922,6 +937,154 @@ AV1G_FN void av1g_add_residual_px(const Av1gItxJob *job, AV1G_GLOBAL const int *
 }
 
 /* ------------------------------------------------------------------ */
+/* device dequantisation                                               */
+/*                                                                    */
+/* The host path expands every transform's coded levels into the       */
+/* raster pool and uploads the whole pool: at 4K that is ~25 MB a      */
+/* frame of PCIe traffic on top of the ~10 ms the expansion costs the  */
+/* CPU. The levels (the coded size of the picture, a few MB) and the   */
+/* per transform dequantiser the frontend precomputed go up instead,   */
+/* and the raster is written where the itx kernels read it - their     */
+/* access pattern does not change.                                     */
+/*                                                                    */
+/* This is a port of the host's fill loop (frontend/dequant.hpp): the  */
+/* same scan selection (coef_scan's table offsets, and Transform_Class),*/
+/* the same quantiser matrix application and the same dequantise_level */
+/* arithmetic, so the pool it writes is byte for byte the pool the     */
+/* host would have sent.                                               */
+/* ------------------------------------------------------------------ */
+
+/* The scan table offsets of coef_tables.hpp, for the clamped (lw, lh):
+ * the row and column orders exist for nine sizes only, everything else
+ * falls back to the diagonal order (which covers every size). */
+AV1G_FN int av1g_scan_offset(int cls, int lw, int lh) {
+  switch (cls) {
+    case 2: /* vertical: the row order */
+      switch ((lw << 4) | lh) {
+        case 0x0: return 0;
+        case 0x1: return 16;
+        case 0x10: return 48;
+        case 0x11: return 80;
+        case 0x12: return 144;
+        case 0x21: return 272;
+        case 0x22: return 400;
+        case 0x2: return 656;
+        case 0x20: return 720;
+        default: return -1;
+      }
+    case 1: /* horizontal: the column order */
+      switch ((lw << 4) | lh) {
+        case 0x0: return 0;
+        case 0x1: return 16;
+        case 0x10: return 48;
+        case 0x11: return 80;
+        case 0x12: return 144;
+        case 0x21: return 272;
+        case 0x22: return 400;
+        case 0x2: return 656;
+        case 0x20: return 720;
+        default: return -1;
+      }
+    default: break;
+  }
+  /* the diagonal order: every size */
+  switch ((lw << 4) | lh) {
+    case 0x0: return 0;
+    case 0x1: return 16;
+    case 0x10: return 48;
+    case 0x11: return 80;
+    case 0x12: return 144;
+    case 0x21: return 272;
+    case 0x22: return 400;
+    case 0x23: return 656;
+    case 0x32: return 1168;
+    case 0x2: return 1680;
+    case 0x20: return 1744;
+    case 0x13: return 1808;
+    case 0x31: return 2064;
+    case 0x33: return 2320;
+    default: return 0;
+  }
+}
+
+AV1G_FN void av1g_dequant_one(const Av1gItxJob *job,
+                              AV1G_GLOBAL const short *levels,
+                              AV1G_GLOBAL const unsigned char *qm,
+                              AV1G_GLOBAL const unsigned short *scan2d,
+                              AV1G_GLOBAL const unsigned short *scanrow,
+                              AV1G_GLOBAL const unsigned short *scancol,
+                              AV1G_GLOBAL int *coef) {
+  /* The raster of one transform: Min(32, side) per side, row major, exactly
+   * what av1g_itx_row's coef_stride reads back (a 64 point transform codes
+   * only its low quarter). */
+  const int stride = job->w < 32 ? job->w : 32;
+  const int rows = job->h < 32 ? job->h : 32;
+  const int area = stride * rows;
+  AV1G_GLOBAL int *raster = coef + job->coef_off;
+
+  /* the pool is reused from frame to frame: the whole raster has to read as
+   * zero where no coefficient was coded */
+  for (int p = 0; p < area; ++p) raster[p] = 0;
+  if (job->eob <= 0 || levels == 0) return;
+
+  /* the size in 4x4 units, clamped - the host's adjusted size, whose log2 is
+   * at most 3 (32 samples) */
+  int cw = stride >> 2, ch = rows >> 2;
+  int lw = 0, lh = 0;
+  while (cw > 1) { cw >>= 1; ++lw; }
+  while (ch > 1) { ch >>= 1; ++lh; }
+
+  /* Transform_Class: the scan depends on the type, not the size */
+  int cls = 0;
+  if (job->tx_type == AV1G_TX_V_DCT || job->tx_type == AV1G_TX_V_ADST ||
+      job->tx_type == AV1G_TX_V_FLIPADST) {
+    cls = 2;
+  } else if (job->tx_type == AV1G_TX_H_DCT || job->tx_type == AV1G_TX_H_ADST ||
+             job->tx_type == AV1G_TX_H_FLIPADST) {
+    cls = 1;
+  }
+
+  const int off = av1g_scan_offset(cls, lw, lh);
+  const unsigned short *scan;
+  if (cls == 2) {
+    scan = off >= 0 && scanrow ? scanrow + off : scan2d;
+  } else if (cls == 1) {
+    scan = off >= 0 && scancol ? scancol + off : scan2d;
+  } else {
+    scan = scan2d ? scan2d + off : scan2d;
+  }
+
+  /* the host's count is min(eob, scan.count), and scan.count is the area */
+  const int count = job->eob < area ? job->eob : area;
+  const short *lv = levels + job->level_offset;
+  const unsigned char *matrix =
+      (job->qm_off >= 0 && qm) ? qm + job->qm_off : 0;
+  const int denominator = job->denominator;
+  const int bit = job->bitdepth;
+  for (int i = 0; i < count; ++i) {
+    const int pos = scan[i];
+    if (pos >= 0 && pos < area) {
+      const int level = lv[i];
+      if (level != 0) {
+        int step = pos == 0 ? job->dc_step : job->ac_step;
+        if (matrix) step = (step * matrix[pos] + 16) >> 5;
+        /* dequantise_level: |level * step| truncated to 24 bits, scaled by the
+         * transform's denominator, clipped to what this bit depth can hold */
+        const long long product = (long long)level * step;
+        long long magnitude = product < 0 ? -product : product;
+        magnitude &= 0xFFFFFF;
+        const long long scaled = magnitude / denominator;
+        long long value = product < 0 ? -scaled : scaled;
+        const long long limit = 1LL << (7 + bit);
+        if (value > limit - 1) value = limit - 1;
+        if (value < -limit) value = -limit;
+        raster[pos] = (int)value;
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* intra prediction                                                   */
 /*                                                                    */
 /* Intra prediction reads the reconstructed samples above and to the  */
@@ -1328,17 +1491,66 @@ AV1G_FN void av1g_intra_dir_prep(const Av1gIntraJob *job, int *above, int *left,
 AV1G_FN void av1g_intra_block(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plane,
                               AV1G_GLOBAL const unsigned char *palette, int maxv);
 
+/* One row of the palette prediction: a table lookup per sample, no edge. */
+AV1G_FN void av1g_intra_palette_row(const Av1gIntraJob *job,
+                                     AV1G_GLOBAL av1g_px *plane,
+                                     AV1G_GLOBAL const unsigned char *palette, int r) {
+  AV1G_GLOBAL const unsigned char *map = palette + job->palette_off;
+  AV1G_GLOBAL av1g_px *out = plane + job->dst_off;
+  for (int j = 0; j < job->w; ++j)
+    out[r * job->dst_stride + j] =
+        (av1g_px)job->palette_color[map[r * job->palette_stride + j]];
+}
+
+/* Gather the edges and prepare them for the predictors: the directional modes
+ * filter, upsample and fix the corner, the others use the edges as they are.
+ * The result is the same for every row of the block, so the GPU path does it
+ * once per block and shares it between the rows. */
+AV1G_FN void av1g_intra_prep(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plane,
+                              int *above, int *left, int maxv, int *pangle,
+                              int *upsample_above, int *upsample_left) {
+  av1g_intra_edges(job, plane, above, left);
+  *pangle = 0;
+  *upsample_above = 0;
+  *upsample_left = 0;
+  if (av1g_is_directional(job->mode))
+    av1g_intra_dir_prep(job, above, left, pangle, upsample_above, upsample_left, maxv);
+}
+
+/* One row of the prediction with the edges already prepared. */
+AV1G_FN void av1g_intra_row_prep(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plane,
+                                  int maxv, int r, const int *above, const int *left,
+                                  int pangle, int upsample_above, int upsample_left) {
+  if (av1g_is_directional(job->mode)) {
+    av1g_intra_directional_row(job, above, left, pangle, upsample_above, upsample_left,
+                               plane, maxv, r);
+    return;
+  }
+  if (job->mode == AV1G_PRED_SMOOTH || job->mode == AV1G_PRED_SMOOTH_V ||
+      job->mode == AV1G_PRED_SMOOTH_H) {
+    av1g_intra_smooth_row(job, above, left, job->mode, plane, maxv, r);
+    return;
+  }
+  if (job->mode == AV1G_PRED_PAETH) {
+    av1g_intra_paeth_row(job, above, left, plane, maxv, r);
+    return;
+  }
+  /* DC: the same flat predictor for every row (the value is the same). */
+  {
+    const int dc = av1g_intra_dc(job, above, left);
+    AV1G_GLOBAL av1g_px *out = plane + job->dst_off;
+    for (int j = 0; j < job->w; ++j)
+      out[r * job->dst_stride + j] = (av1g_px)av1g_clip_px(dc, maxv);
+  }
+}
+
 AV1G_FN void av1g_intra_row(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plane,
                             AV1G_GLOBAL const unsigned char *palette, int maxv,
                             int r) {
   const int w = job->w;
   if (job->palette) {
     /* Palette prediction: a table lookup per sample, no edge at all. */
-    AV1G_GLOBAL const unsigned char *map = palette + job->palette_off;
-    AV1G_GLOBAL av1g_px *out = plane + job->dst_off;
-    for (int j = 0; j < w; ++j)
-      out[r * job->dst_stride + j] =
-          (av1g_px)job->palette_color[map[r * job->palette_stride + j]];
+    av1g_intra_palette_row(job, plane, palette, r);
     return;
   }
   if (job->mode == AV1G_PRED_CFL ||
@@ -1352,32 +1564,11 @@ AV1G_FN void av1g_intra_row(const Av1gIntraJob *job, AV1G_GLOBAL av1g_px *plane,
   int left_buf[AV1G_INTRA_EDGE];
   int *above = above_buf + AV1G_INTRA_EDGE_OFF;
   int *left = left_buf + AV1G_INTRA_EDGE_OFF;
-  av1g_intra_edges(job, plane, above, left);
-
-  if (av1g_is_directional(job->mode)) {
-    int pangle, upsample_above, upsample_left;
-    av1g_intra_dir_prep(job, above, left, &pangle, &upsample_above,
-                        &upsample_left, maxv);
-    av1g_intra_directional_row(job, above, left, pangle, upsample_above,
-                               upsample_left, plane, maxv, r);
-    return;
-  }
-  if (job->mode == AV1G_PRED_SMOOTH || job->mode == AV1G_PRED_SMOOTH_V ||
-      job->mode == AV1G_PRED_SMOOTH_H) {
-    av1g_intra_smooth_row(job, above, left, job->mode, plane, maxv, r);
-    return;
-  }
-  if (job->mode == AV1G_PRED_PAETH) {
-    av1g_intra_paeth_row(job, above, left, plane, maxv, r);
-    return;
-  }
-  /* DC: the same flat predictor, recomputed per row (the value is the same). */
-  {
-    const int dc = av1g_intra_dc(job, above, left);
-    AV1G_GLOBAL av1g_px *out = plane + job->dst_off;
-    for (int j = 0; j < w; ++j)
-      out[r * job->dst_stride + j] = (av1g_px)av1g_clip_px(dc, maxv);
-  }
+  int pangle, upsample_above, upsample_left;
+  av1g_intra_prep(job, plane, above, left, maxv, &pangle, &upsample_above,
+                  &upsample_left);
+  av1g_intra_row_prep(job, plane, maxv, r, above, left, pangle, upsample_above,
+                      upsample_left);
 }
 
 /* The whole prediction of one transform block. Called once per block on the

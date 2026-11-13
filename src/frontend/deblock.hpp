@@ -292,10 +292,16 @@ inline bool plan_deblock(const SequenceHeader& seq, const FrameHeader& frame,
           } else {
             const int block_w = block_width4(plane_size) * 4;
             const int block_h = block_height4(plane_size) * 4;
-            is_block_edge = vertical ? (x_p % block_w == 0) : (y_p % block_h == 0);
+            /* The block and transform sizes are powers of two, so the edge
+             * test is a mask and not a division.  This loop runs once per cell
+             * of the frame's grid - hundreds of thousands of times - and a
+             * division there is the whole cost of the stage. */
+            is_block_edge = vertical ? ((x_p & (block_w - 1)) == 0)
+                                     : ((y_p & (block_h - 1)) == 0);
           }
           const int tx_w = tx.width(), tx_h = tx.height();
-          const bool is_tx_edge = vertical ? (x_p % tx_w == 0) : (y_p % tx_h == 0);
+          const bool is_tx_edge = vertical ? ((x_p & (tx_w - 1)) == 0)
+                                           : ((y_p & (tx_h - 1)) == 0);
           if (!is_tx_edge) continue;
           /* applyFilter: a transform edge, and either a prediction block edge,
            * a block without residual, or an intra block. A skipped inter block

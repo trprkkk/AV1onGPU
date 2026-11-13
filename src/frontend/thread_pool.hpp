@@ -35,17 +35,22 @@ class ThreadPool {
     return pool;
   }
 
-  /* Runs fn(chunk_index, begin, end) over [0, n) split into contiguous chunks,
-   * one per worker, and blocks until every chunk is done. Contiguous chunks
-   * keep each chunk's output in place, so a merge that walks the chunks in
-   * order sees exactly the sequential order. Ranges too small to be worth it
-   * run on the calling thread. fn must not throw and must not call run(). */
+  /* Two queues by urgency. The stages on the frame's critical path (the
+   * planner's job building, the worker's wave prep) submit as urgent: a chunk
+   * of theirs overtakes queued bulk work (the tile decode's chunks, the
+   * frontend plan's tail). Measured on 4K, each of those stages sat ~25 ms a
+   * frame waiting in the queue. Urgent work is finite per frame, so the bulk
+   * queue cannot starve. */
   template <typename F>
-  void run(size_t n, unsigned max_workers, F&& fn) {
+  void run(size_t n, unsigned max_workers, F&& fn, bool force = false, bool urgent = false) {
     const unsigned hw = std::thread::hardware_concurrency();
-    unsigned k = n >= 256 && hw > 1 ? std::min<unsigned>(max_workers, hw) : 1;
+    unsigned k = (force || n >= 256) && hw > 1 ? std::min<unsigned>(max_workers, hw) : 1;
     const unsigned pool_n = static_cast<unsigned>(workers_.size());
-    if (pool_n > 0 && k > pool_n) k = pool_n;
+    if (pool_n == 0) {
+      fn(0, 0, n);
+      return;
+    }
+    if (k > pool_n) k = pool_n;
     if (k <= 1) {
       fn(0, 0, n);
       return;
@@ -57,10 +62,11 @@ class ThreadPool {
     std::atomic<int> done{0};
     {
       std::lock_guard<std::mutex> lk(m_);
+      std::deque<std::function<void()>>& queue = urgent ? tasks_urgent_ : tasks_;
       for (unsigned t = 0; t < k; ++t) {
         const size_t b = static_cast<size_t>(t) * chunk;
         const size_t e = std::min(b + chunk, n);
-        tasks_.emplace_back([this, &fn, &pushed, &done, t, b, e] {
+        queue.emplace_back([this, &fn, &pushed, &done, t, b, e] {
           if (b < e) fn(t, b, e);
           if (done.fetch_add(1, std::memory_order_acq_rel) + 1 == static_cast<int>(pushed)) {
             std::lock_guard<std::mutex> lk(m_);
@@ -105,10 +111,13 @@ class ThreadPool {
       std::function<void()> task;
       {
         std::unique_lock<std::mutex> lk(m_);
-        cv_work_.wait(lk, [&] { return stop_ || !tasks_.empty(); });
-        if (stop_ && tasks_.empty()) return;
-        task = std::move(tasks_.front());
-        tasks_.pop_front();
+        cv_work_.wait(lk, [&] { return stop_ || !tasks_.empty() || !tasks_urgent_.empty(); });
+        if (stop_ && tasks_.empty() && tasks_urgent_.empty()) return;
+        /* the urgent queue first: see run()'s comment */
+        std::deque<std::function<void()>>& queue =
+            tasks_urgent_.empty() ? tasks_ : tasks_urgent_;
+        task = std::move(queue.front());
+        queue.pop_front();
       }
       task();
     }
@@ -119,16 +128,28 @@ class ThreadPool {
   std::condition_variable cv_work_;
   std::condition_variable cv_done_;
   std::deque<std::function<void()>> tasks_;
+  std::deque<std::function<void()>> tasks_urgent_;
   bool stop_ = false;
 };
 
 /* Runs fn(chunk_index, begin, end) over [0, n) in contiguous chunks on the
  * shared pool, joining before returning. Small ranges stay on the calling
- * thread. */
+ * thread. `urgent` puts the chunks on the pool's priority queue (see
+ * ThreadPool::run); AV1GPU_POOL_FIFO=1 forces the old first-in-first-out
+ * behaviour for the A/B. */
 template <typename F>
-void parallel_chunks(size_t n, unsigned max_workers, F&& fn) {
+void parallel_chunks(size_t n, unsigned max_workers, F&& fn, bool urgent = false) {
+  static const bool fifo = std::getenv("AV1GPU_POOL_FIFO") != nullptr;
   ThreadPool::instance().run(n, max_workers,
-                             [&fn](size_t t, size_t b, size_t e) { fn(t, b, e); });
+                             [&fn](size_t t, size_t b, size_t e) { fn(t, b, e); },
+                             /*force=*/false, urgent && !fifo);
+}
+
+/* parallel_chunks on the priority queue: for the stages on the frame's
+ * critical path (the planner's sections, the worker's wave prep). */
+template <typename F>
+void parallel_chunks_urgent(size_t n, unsigned max_workers, F&& fn) {
+  parallel_chunks(n, max_workers, std::forward<F>(fn), /*urgent=*/true);
 }
 
 } /* namespace frontend */

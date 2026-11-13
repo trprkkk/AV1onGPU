@@ -143,9 +143,30 @@ struct FramePlan {
   int maxv = 255;
   int blocks = 0;
 
-  /* Coefficient pool, indexed by Av1gItxJob::coef_off. */
+  /* Coefficient pool, indexed by Av1gItxJob::coef_off. Empty when a device
+   * side dequantisation produces it (see Decoder::dequantises_on_device). */
   std::vector<int32_t> coefficients;
   std::vector<int32_t> residual;
+  /* True when the host left `coefficients` empty on purpose, because the device
+   * expands `levels` into it (the CUDA backend's av1g_k_dequant). It is a
+   * decision the *plan* carries, because the backend must not re-derive it: a
+   * syntax that does not describe its pool as levels (the synthetic encoder
+   * hands over a finished raster) keeps the host path, and a backend that
+   * guessed from its own idea of the capability would read a pool nobody
+   * filled. */
+  bool raster_from_levels = false;
+  /* The size the device buffers need, in elements, independent of whether the
+   * host's vectors carry them. */
+  size_t coef_pool_size = 0;
+  size_t residual_pool_size = 0;
+  /* The coded coefficient levels the pool was dequantised from, in scan
+   * order, indexed by TileTransform::level_offset. The raster pool above is
+   * what the kernels read today; the levels travel with the plan so a backend
+   * can dequantise on the device instead (see build_frame_plan's `movable`). */
+  std::vector<int16_t> levels;
+  /* The quantiser matrices the levels' transforms index (qm_off), moved from
+   * the syntax with them. */
+  std::vector<uint8_t> qm_pool;
   /* Palette colour maps of the frame's palette blocks, indexed by
    * Av1gIntraJob::palette_off. Empty unless the frame codes a palette. */
   std::vector<uint8_t> palette_map;
@@ -202,6 +223,12 @@ class Backend {
   virtual void release_reference(int slot) = 0;
   virtual int reference_capacity() const = 0;
 
+  /* True when this backend turns the coded levels into the coefficient pool
+   * on the device (see the CUDA backend's av1g_k_dequant). The host then
+   * skips building the raster pool: at 4K that is ~29 MB of work a frame it
+   * would only hand to the device. */
+  virtual bool dequantises_on_device() const { return false; }
+
   /* Reserves a slot for a frame that will be decoded later; see
    * Decoder::reserve_reference. -1 = not supported by this backend. */
   virtual int reserve_reference() { return -1; }
@@ -229,8 +256,50 @@ class Backend {
   virtual bool to_rgb(int slot, ColorMatrix matrix, ColorRange range,
                       std::vector<uint8_t>* rgb, std::string* error) = 0;
 
+  /* True when this backend can pack the picture of a reference slot into NV12
+   * on the device (to_nv12), with the *display* picture: grain belongs to the
+   * output, so a backend that stores the pre-grain reference in the slot
+   * answers false. A pipeline then keeps reading the picture back to the host
+   * instead of leaving it on the device. */
+  virtual bool packs_nv12_on_device() const { return false; }
+
+  /* Packs the picture of `slot` into NV12 on the device. `layout` names the
+   * geometry that slot's picture was decoded with: a backend that keeps several
+   * layouts in flight (a pipeline decodes frame N while its output stage packs
+   * frame N-1) needs it to read the right offsets, and nullptr means "the last
+   * prepared one", which is what a synchronous caller has. */
   virtual bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
-                       std::string* error) = 0;
+                       std::string* error, const PlanLayout* layout = nullptr) = 0;
+
+  /* Starts an NV12 pack that another thread finishes: the pack kernel runs on
+   * the decode stream and the copy into page locked memory on a side stream, so
+   * the thread that decoded the frame does not wait for the copy. Returns a
+   * handle for nv12_pack_finish, or -1 when this backend cannot stream one (the
+   * caller then calls to_nv12). */
+  virtual int nv12_pack_begin(int slot, size_t pitch, std::string* error,
+                             const PlanLayout* layout = nullptr) {
+    (void)slot;
+    (void)pitch;
+    (void)error;
+    (void)layout;
+    return -1;
+  }
+
+  /* Waits for the copy of a handle from nv12_pack_begin and fills `nv12`. A
+   * null `nv12` waits without copying. The entry stays busy until
+   * nv12_pack_release, so a caller that keeps the bytes for a later re-show can
+   * wait once and release after. */
+  virtual bool nv12_pack_wait(int handle, std::vector<uint8_t>* nv12,
+                              std::string* error) {
+    (void)handle;
+    (void)nv12;
+    (void)error;
+    return false;
+  }
+
+  /* Hands a handle from nv12_pack_begin back, waiting for its copy first (the
+   * copy reads the entry's page locked buffer). */
+  virtual void nv12_pack_release(int handle) { (void)handle; }
 
   virtual void reset() = 0;
 };
@@ -254,10 +323,18 @@ std::vector<DeviceInfo> list_cuda_devices();
 
 /* Turns decode syntax into the flat job plan a backend executes. `layout`
  * comes from Backend::prepare() for the frame geometry, so the job offsets
- * match the buffers that backend allocated. */
+ * match the buffers that backend allocated. When `movable` is not null the
+ * caller hands its syntax over and the pools are moved into the plan instead
+ * of copied; the syntax must not be decoded from afterwards.
+ * `host_fills_pools` is false when a device side dequantisation produces the
+ * coefficient pool: the host then leaves the raster vectors empty and reports
+ * only the sizes (FramePlan::coef_pool_size). */
 bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
                       const BackendOptions& options, int reference_capacity,
-                      FramePlan* plan, std::string* error);
+                      FramePlan* plan, std::string* error,
+                      FrameSyntax* movable = nullptr,
+                      bool host_fills_pools = true,
+                      std::atomic<bool>* cancel = nullptr);
 
 /* Runs deblock / CDEF (and, by default, film grain) on a host frame, exactly as
  * the decoder does. Used by encoders (including the synthetic one) so that their

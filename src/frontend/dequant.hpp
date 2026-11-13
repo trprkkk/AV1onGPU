@@ -165,9 +165,26 @@ inline const uint8_t* qm_matrix(const FrameHeader& frame, int plane, TxSize tx) 
  * decoder coded (a 64x64 transform owns 32x32 of them). `offsets` holds the
  * start of each block's run, in the same order as the TileTransform records
  * the tile produced, and `transforms` is how many there are. */
+/* What a device side dequantiser needs for one transform beyond the raster
+ * pool: the plane's steps, the transform's scale, and where its quantiser
+ * matrix sits in DequantisedTile::qm_pool (-1 for none). The host computes
+ * these once per transform here, so the kernel is the same arithmetic and
+ * nothing else. */
+struct DequantParam {
+  int32_t dc_step = 0;
+  int32_t ac_step = 0;
+  int32_t denominator = 1;
+  int32_t qm_off = -1;
+};
+
 struct DequantisedTile {
   std::vector<int32_t> coefficients;
   std::vector<uint32_t> offsets;
+  /* Parallel to `offsets`: one entry per transform, in the same order. */
+  std::vector<DequantParam> params;
+  /* The distinct 256 byte quantiser matrices this tile's transforms use,
+   * concatenated; DequantParam::qm_off indexes it. */
+  std::vector<uint8_t> qm_pool;
   int bit_depth = 8;
 
   /* The raster of transform block `index`, or nullptr when it had none. */
@@ -181,9 +198,16 @@ struct DequantisedTile {
  * dequantised raster order. The levels of one block are contiguous in
  * TileDecodeResult::levels (TileTransform::level_offset, `eob` of them), and
  * they are in scan order, so the scan of the block's transform type decides
- * where each one lands. */
+ * where each one lands.
+ *
+ * `levels_only` stops after the per transform bookkeeping (the pool offsets
+ * and the dequantiser parameters): the raster itself is left unbuilt. It is for
+ * the caller whose backend expands the levels on the device, where the fill is
+ * ~10 ms a frame of work whose result travels over the bus to be read by one
+ * kernel. Everything the plan still needs - the offsets, the steps, the QM
+ * pool and the levels - is produced either way. */
 inline void dequantise_tile(const FrameHeader& frame, int bit_depth, const TileDecodeResult& tile,
-                            DequantisedTile* out) {
+                            DequantisedTile* out, bool levels_only = false) {
   if (!out) return;
   *out = DequantisedTile();
   out->bit_depth = bit_depth;
@@ -197,22 +221,81 @@ inline void dequantise_tile(const FrameHeader& frame, int bit_depth, const TileD
     size_t area;
     size_t offset;
   };
-  std::vector<Entry> entries;
-  entries.reserve(static_cast<size_t>(tile.transform_blocks) + 16);
+  /* The QM matrices are shared between the transforms that use the same one
+   * (a frame usually has one per plane): dedup by the table address, which is
+   * exact because qm_matrix returns pointers into static tables, and by the
+   * byte count (a 4x4 matrix and the head of an 8x8 one can hold the same
+   * bytes). */
+  struct QmEntry {
+    const uint8_t* ptr;
+    size_t size;
+    int32_t off;
+  };
+  std::vector<QmEntry> qm_seen;
+  /* The QM matrix a transform uses is a function of the plane and the adjusted
+   * size alone (the level comes from the frame header), so the pool offset it
+   * dedups to is too: build one 3 x 16 table per call and the per transform
+   * work becomes an array read. The scan it replaces walked every matrix the
+   * tile had already seen, once for each of a 4K frame's ~230k transforms. */
+  int32_t qm_tab[3][16];
+  for (int p = 0; p < 3; ++p)
+    for (int i = 0; i < 16; ++i) qm_tab[p][i] = -1;
   size_t total = 0;
+  out->offsets.reserve(static_cast<size_t>(tile.transform_blocks) + 16);
+  /* levels_only: no raster is built, and nothing needs the entry list (the
+   * offsets are just the running prefix sum), so the loop writes the offsets
+   * and the parameters straight out instead of staging entries first. */
+  const bool scan_entries = !levels_only;
+  std::vector<Entry> entries;
+  if (scan_entries) entries.reserve(static_cast<size_t>(tile.transform_blocks) + 16);
   for (const TileBlock& block : tile.blocks) {
     for (const TileTransform& transform : block.transforms) {
       const TxSize adjusted = adjusted_tx_size(transform.size);
       if (adjusted.lw < 0) continue;
       const size_t area =
           static_cast<size_t>(4 << adjusted.lw) * static_cast<size_t>(4 << adjusted.lh);
-      entries.push_back({&transform, area, total});
+      if (scan_entries) entries.push_back({&transform, area, total});
+      out->offsets.push_back(static_cast<uint32_t>(total));
       total += area;
+      /* The per transform dequantiser, computed once here rather than in the
+       * per coefficient loop below: a device side dequant reads these from
+       * the job instead of recomputing them. */
+      const PlaneQuant quant = plane_quant(frame, transform.plane, transform.qindex,
+                                           transform.size, bit_depth);
+      DequantParam param;
+      param.dc_step = quant.dc_step;
+      param.ac_step = quant.ac_step;
+      param.denominator = quant.denominator;
+      const uint8_t* qm = transform.tx_type < coef_tables::kIdtx
+                              ? qm_matrix(frame, transform.plane, adjusted)
+                              : nullptr;
+      if (qm) {
+        int32_t& cell = qm_tab[transform.plane][(adjusted.lw << 2) | adjusted.lh];
+        if (cell >= 0) {
+          param.qm_off = cell;
+        } else {
+          /* first use of this (plane, size): dedup it into the pool once */
+          int32_t found = -1;
+          for (const QmEntry& seen : qm_seen) {
+            if (seen.ptr == qm && seen.size == area) {
+              found = seen.off;
+              break;
+            }
+          }
+          if (found < 0) {
+            found = static_cast<int32_t>(out->qm_pool.size());
+            out->qm_pool.insert(out->qm_pool.end(), qm, qm + area);
+            qm_seen.push_back({qm, area, found});
+          }
+          cell = found;
+          param.qm_off = found;
+        }
+      }
+      out->params.push_back(param);
     }
   }
-  out->coefficients.assign(total, 0);
-  out->offsets.reserve(entries.size());
-  for (const Entry& e : entries) out->offsets.push_back(static_cast<uint32_t>(e.offset));
+  if (!levels_only) out->coefficients.assign(total, 0);
+  out->offsets.resize(out->params.size());
 
   /* AV1GPU_DQDBG=x,y: print the steps of the transform at that position. The
    * variable is read once: getenv walks the environment block, which is not
@@ -228,8 +311,7 @@ inline void dequantise_tile(const FrameHeader& frame, int bit_depth, const TileD
       const int area = width * height;
       const size_t offset = entries[i].offset;
 
-      const PlaneQuant quant = plane_quant(frame, transform.plane, transform.qindex,
-                                           transform.size, bit_depth);
+      const DequantParam& param = out->params[i];
       if (dqdbg && transform.plane == 0) {
         int qx = -1, qy = -1;
         if (std::sscanf(dqdbg, "%d,%d", &qx, &qy) == 2 &&
@@ -238,15 +320,14 @@ inline void dequantise_tile(const FrameHeader& frame, int bit_depth, const TileD
           std::fprintf(stderr, "DQDBG x=%d y=%d w=%d h=%d qindex=%d dc=%d ac=%d den=%d "
                                "eob=%d tx_type=%d off=%zu\n",
                        transform.x, transform.y, width, height,
-                       transform.qindex, quant.dc_step, quant.ac_step, quant.denominator,
+                       transform.qindex, param.dc_step, param.ac_step, param.denominator,
                        transform.eob, transform.tx_type, offset);
       }
       const ScanOrder scan = coef_scan(adjusted, transform.tx_type);
       /* The matrix applies only to the 2-D transform types, and never to
        * the identity (kIdtx and the 1-D types come after it). */
-      const uint8_t* qm = transform.tx_type < coef_tables::kIdtx
-                              ? qm_matrix(frame, transform.plane, adjusted)
-                              : nullptr;
+      const uint8_t* qm =
+          param.qm_off >= 0 ? out->qm_pool.data() + param.qm_off : nullptr;
       int32_t* raster = out->coefficients.data() + offset;
       const int count = transform.eob < scan.count ? transform.eob : scan.count;
       for (int i = 0; i < count; ++i) {
@@ -254,17 +335,22 @@ inline void dequantise_tile(const FrameHeader& frame, int bit_depth, const TileD
         if (pos < 0 || pos >= area) continue;
         const int level = tile.levels[transform.level_offset + static_cast<size_t>(i)];
         if (level == 0) continue;
-        int step = pos == 0 ? quant.dc_step : quant.ac_step;
+        int step = pos == 0 ? param.dc_step : param.ac_step;
         if (qm) step = (step * qm[pos] + 16) >> 5;
-        raster[pos] = dequantise_level(level, step, quant.denominator, out->bit_depth);
+        raster[pos] = dequantise_level(level, step, param.denominator, out->bit_depth);
       }
     }
   };
 
   /* The fill is the frame's dequantisation cost, and every entry writes its
    * own run of the pool, so it splits across the shared worker pool without
-   * any lock. Small frames stay on the calling thread. */
-  parallel_chunks(entries.size(), 8, [&](size_t, size_t b0, size_t e0) { fill(b0, e0); });
+   * any lock. Small frames stay on the calling thread. A backend that expands
+   * the levels on the device skips it entirely: that kernel reads the same
+   * levels and writes the same raster, on the device. */
+  if (!levels_only) {
+    out->coefficients.assign(total, 0);
+    parallel_chunks(entries.size(), 8, [&](size_t, size_t b0, size_t e0) { fill(b0, e0); });
+  }
 }
 
 } /* namespace frontend */

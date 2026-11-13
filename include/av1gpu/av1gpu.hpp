@@ -24,6 +24,7 @@
 #ifndef AV1GPU_AV1GPU_HPP
 #define AV1GPU_AV1GPU_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -191,6 +192,19 @@ struct TransformBlock {
   int coef_offset = 0;
   int eob = 0; /* 0 = the whole block is zero, skip the transform */
   TransformType tx_type = TransformType::DctDct;
+  /* What a device side dequant needs beyond the raster pool: where this
+   * transform's coded levels start in FrameSyntax::levels, and the block's
+   * quantiser (the step also depends on the plane, which the owning block
+   * carries). */
+  int level_offset = 0;
+  int qindex = 0;
+  /* The dequantiser itself, precomputed by the frontend (dequant.hpp): the
+   * plane's steps, the transform's scale, and the index of this transform's
+   * quantiser matrix in FrameSyntax::qm_pool (-1 for none). */
+  int dc_step = 0;
+  int ac_step = 0;
+  int denominator = 1;
+  int qm_off = -1;
 };
 
 /* One overlapped block motion compensation strip of an inter block: the top
@@ -492,6 +506,15 @@ struct FrameSyntax {
   /* Shared pools indexed by TransformBlock::coef_offset. */
   std::vector<int32_t> coefficients;
   std::vector<int32_t> residual;
+  /* The coded levels the coefficient pool was dequantised from, in scan order,
+   * indexed by TileTransform::level_offset. Kept for a backend that wants to
+   * dequantise on the device: the raster pool is the frame's largest per
+   * frame transfer (tens of MB at 4K) while the levels are the coded size of
+   * the frame. */
+  std::vector<int16_t> levels;
+  /* The distinct quantiser matrices the frame's transforms use, concatenated;
+   * TransformBlock::qm_off indexes it. Empty when the frame uses none. */
+  std::vector<uint8_t> qm_pool;
   /* Palette colour maps of every palette block in the frame, one byte per
    * sample, indexed by BlockSyntax::palette_off. Empty unless the frame uses
    * screen content tools. */
@@ -614,9 +637,15 @@ class Decoder {
 
   /* Like decode_reference, but stores the picture into `slot`, which a
    * pipelined caller reserved earlier through reserve_reference. A negative
-   * `slot` decodes and drops the device copy; -1 is returned either way. */
+   * `slot` decodes and drops the device copy; -1 is returned either way.
+   *
+   * `read_back` false asks for the geometry only, exactly as
+   * decode_reference_planned documents: the picture stays in the slot and the
+   * caller packs it there. */
   virtual int decode_reference_reserved(const FrameSyntax& syntax, int slot, Frame* out,
-                                        std::string* error = nullptr) {
+                                        std::string* error = nullptr,
+                                        bool read_back = true) {
+    (void)read_back;
     (void)syntax;
     (void)slot;
     (void)out;
@@ -639,20 +668,42 @@ class Decoder {
    * N+1 overlaps the kernels of frame N. Returns false and fills `error` on
    * failure; backends that do not support it leave the default, which fails. */
   virtual bool plan_frame(const FrameSyntax& syntax, void** plan,
-                          std::string* error = nullptr) {
+                          std::string* error = nullptr,
+                          std::atomic<bool>* cancel = nullptr) {
     (void)syntax;
     (void)plan;
+    (void)cancel;
     if (error) *error = "pre-planning is not supported";
     return false;
   }
 
+  /* The same, for a caller that will not use the syntax again: the plan may
+   * take the syntax's coefficient and residual pools over instead of copying
+   * them. At 4K that copy is ~16 ms a frame, so the pipeline plans through
+   * this overload. A backend that cannot move leaves the default, which is
+   * the copy path. */
+  virtual bool plan_frame(FrameSyntax&& syntax, void** plan,
+                          std::string* error = nullptr,
+                          std::atomic<bool>* cancel = nullptr) {
+    return plan_frame(static_cast<const FrameSyntax&>(syntax), plan, error, cancel);
+  }
+
   /* Decodes a plan built by plan_frame into `slot` (a reserved reference, or a
-   * negative slot to decode and drop). The plan is consumed either way. */
+   * negative slot to decode and drop). The plan is consumed either way.
+   *
+   * `read_back` false asks for the picture's geometry only: the device keeps
+   * the picture in the reference slot and `out` is left with its header and
+   * no fresh pixels. It is for a pipeline that hands the slot to
+   * to_nv12 (or to_rgb) on its output stage, where reading the whole picture
+   * back to the host first would be several MB a frame of PCIe traffic for a
+   * copy the device could make itself. */
   virtual int decode_reference_planned(void* plan, int slot, Frame* out,
-                                       std::string* error = nullptr) {
+                                       std::string* error = nullptr,
+                                       bool read_back = true) {
     (void)plan;
     (void)slot;
     (void)out;
+    (void)read_back;
     if (error) *error = "pre-planned decode is not supported";
     return -1;
   }
@@ -664,6 +715,19 @@ class Decoder {
    * is; a backend wrapper that decodes directly is not). A pipeline only
    * pre-plans against a decoder that says yes. */
   virtual bool supports_preplanning() const { return false; }
+
+  /* True when the device turns the frame's coded levels into the coefficient
+   * pool (the CUDA backend's av1g_k_dequant). The pipeline then hands the
+   * backend the levels and the per transform dequantiser instead of building
+   * the raster pool on the host: at 4K that is ~29 MB of work a frame and the
+   * pool's upload, both of which move onto the device. */
+  virtual bool dequantises_on_device() const { return false; }
+
+  /* True when to_nv12 packs a reference slot's picture on the device, with the
+   * grain of the output process included. A pipeline that gets true leaves the
+   * picture on the device and packs it on its output stage; with false it reads
+   * the planes back and packs on the host. */
+  virtual bool packs_nv12_on_device() const { return false; }
 
   /* Convenience wrapper: decode and drop the device copy. */
   virtual bool decode(const FrameSyntax& syntax, Frame* out,
@@ -681,6 +745,32 @@ class Decoder {
    * refusal for a frame that is not 4:2:0. */
   virtual bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
                        std::string* error = nullptr) = 0;
+
+  /* The pack, split in two so the copy leaves the decoding thread: the caller
+   * decodes into `slot`, hands the returned handle to whatever thread shows the
+   * frame, and that thread calls nv12_pack_finish. The copy runs on a side
+   * stream into page locked memory, so the decode of the next frame overlaps
+   * it. -1 means the backend packs synchronously (call to_nv12). */
+  virtual int nv12_pack_begin(int slot, size_t pitch, std::string* error = nullptr) {
+    (void)slot;
+    (void)pitch;
+    (void)error;
+    return -1;
+  }
+
+  /* Waits for a handle from nv12_pack_begin and fills `nv12` with the packed
+   * bytes (a null `nv12` waits without copying). The entry stays busy until
+   * nv12_pack_release, so bytes kept for a later re-show are waited for once. */
+  virtual bool nv12_pack_wait(int handle, std::vector<uint8_t>* nv12,
+                              std::string* error = nullptr) {
+    (void)handle;
+    (void)nv12;
+    (void)error;
+    return false;
+  }
+
+  /* Hands a handle from nv12_pack_begin back. */
+  virtual void nv12_pack_release(int handle) { (void)handle; }
 
   virtual void reset() = 0;
 

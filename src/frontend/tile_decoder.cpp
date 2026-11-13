@@ -5,10 +5,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <vector>
 
 #include "frontend/coef_model.hpp"
 #include "frontend/coef_tables.hpp"
 #include "frontend/range_decoder.hpp"
+#include "frontend/thread_pool.hpp"
 #include "frontend/warp.hpp"
 
 namespace av1gpu {
@@ -292,12 +295,88 @@ constexpr int kPaletteNumNeighbours = 3;
 constexpr int kPaletteColorHashMultipliers[kPaletteNumNeighbours] = {1, 2, 2};
 constexpr int kPaletteColorContext[9] = {-1, -1, 0, -1, -1, 4, 3, 2, 1};
 
+/* The frame state the tiles of one frame share: the maps a tile writes only
+ * its own region of (block sizes, references, segmentation ids, transform
+ * sizes and types, the CDEF index), the temporal motion vector projection,
+ * the restoration grid and the CDF tables the frame starts from. Everything
+ * in here is either written to disjoint regions or read only, which is what
+ * lets several parsers decode one frame's tiles at once: a tile never reads a
+ * neighbour across its boundary, so as long as each parser keeps its own
+ * entropy contexts (see TileParser::init_worker_state) the decode of a tile
+ * is independent of the others. */
+
+/* Everything the syntax keeps about one block, as the maps store it: this is
+ * what a later block's neighbour scan reads (the mode, the references, the
+ * vectors, the filters, the blend). Everything here is a property of the whole
+ * block, so the block's area is filled with the same entry. */
+struct MiRef {
+  uint8_t intra = 1;                 /* 1: intra predicted (or intrabc)   */
+  /* 1: inter/intra compound. Both it and a single reference block keep
+   * kRefIntra in ref[1], so this flag is what tells them apart - the
+   * candidate scans compare against "no second reference" (-1 in the
+   * specification) and an inter/intra neighbour is not that. */
+  uint8_t interintra = 0;
+  uint8_t ref[2] = {kRefIntra, kRefIntra};
+  uint8_t inter_mode = kModeNearestMv;
+  int16_t mv[2][2] = {{0, 0}, {0, 0}};
+  /* dav1d's `mf` bit 0: a global motion vector that should be used in place
+   * of `mv` when this block is matched as a candidate. */
+  uint8_t global_subpel = 0;
+  /* dav1d's `mf` bit 1: the block coded a new motion vector. */
+  uint8_t coded_newmv = 0;
+  /* the interpolation filter this block used, per direction, for the filter
+   * context */
+  uint8_t filter[2] = {0, 0};
+  /* how this block blended its two predictions, which several of the
+   * compound contexts read from their neighbours */
+  uint8_t comp_type = kCompoundNone;
+};
+
+struct FrameShared {
+  std::vector<MiRef> mi_ref_;
+  std::vector<uint8_t> mi_size_;
+  std::vector<uint8_t> seg_map_;
+  std::vector<uint8_t> skip_map_;
+  std::vector<uint8_t> skip_mode_map_;
+  std::vector<int8_t> cdef_idx_;
+  std::vector<uint8_t> y_mode_map_;
+  std::vector<uint8_t> tx_cell_lw_;
+  std::vector<uint8_t> tx_cell_lh_;
+  std::vector<uint8_t> tx_type_map_;
+  std::vector<RestorationUnit> restoration[3];
+  int cdef_cols = 0, cdef_rows = 0;
+
+  /* Projected motion vectors: this frame's 8x8 grid, the distances the
+   * projection scales by, and the frames that contributed to it. Read only
+   * once a tile starts. */
+  std::vector<TemporalMv> proj_;
+  int proj_cols_ = 0;
+  int pocdiff_[7] = {0, 0, 0, 0, 0, 0, 0};
+  bool mfmv_sign_[7] = {false, false, false, false, false, false, false};
+  bool sign_bias_[7] = {false, false, false, false, false, false, false};
+  int mfmv_ref_[3] = {0, 0, 0};
+  int mfmv_ref2cur_[3] = {0, 0, 0};
+  uint8_t mfmv_ref2ref_[3][7] = {};
+  const RefMvs* mfmv_stored_[3] = {nullptr, nullptr, nullptr};
+  int mfmv_count_ = 0;
+
+  /* The map a temporal segment prediction reads: the primary reference's,
+   * only when it has the same geometry. */
+  const SegmentationMap* prev_seg_map_ = nullptr;
+
+  /* The tables the frame started from; every tile resets its own cdf_ to
+   * these. */
+  CdfContext start_cdf_;
+};
+
 class TileParser {
  public:
   TileParser(const SequenceHeader& seq, const FrameHeader& frame, const RefPool* refs,
-             const uint8_t* data, size_t size, TileDecodeResult* out, std::string* error)
+             const uint8_t* data, size_t size, TileDecodeResult* out, std::string* error,
+             FrameShared* shared = nullptr)
       : seq_(seq), frame_(frame), refs_(refs), data_(data), size_(size), out_(out),
-        error_(error), trace_(std::getenv("AV1GPU_TRACE") != nullptr) {}
+        error_(error), trace_(std::getenv("AV1GPU_TRACE") != nullptr),
+        fm_(shared ? *shared : owned_fm_), owns_fm_(shared == nullptr) {}
 
   /* Reads one tile of the frame. The frame's maps - block sizes, references,
    * segmentation ids, the CDEF index, the motion field - live in this parser
@@ -363,14 +442,14 @@ class TileParser {
       auto map = std::make_shared<SegmentationMap>();
       map->mi_cols = mi_cols();
       map->mi_rows = mi_rows();
-      map->ids = seg_map_;
+      map->ids = fm_.seg_map_;
       out_->seg_map = std::move(map);
     }
     auto published = std::make_shared<CdfContext>(
-        frame_.refresh_frame_context ? (have_saved_cdf_ ? saved_cdf_ : cdf_) : start_cdf_);
+        frame_.refresh_frame_context ? (have_saved_cdf_ ? saved_cdf_ : cdf_) : fm_.start_cdf_);
     if (frame_.refresh_frame_context) {
-      std::memcpy(published->mode.kfym, start_cdf_.mode.kfym, sizeof(published->mode.kfym));
-      std::memcpy(published->mode.intrabc, start_cdf_.mode.intrabc,
+      std::memcpy(published->mode.kfym, fm_.start_cdf_.mode.kfym, sizeof(published->mode.kfym));
+      std::memcpy(published->mode.intrabc, fm_.start_cdf_.mode.intrabc,
                   sizeof(published->mode.intrabc));
       reset_cdf_counts(published.get());
     }
@@ -388,7 +467,34 @@ class TileParser {
   size_t bytes_used() const { return decoder_.bytes_used(); }
   bool overrun() const { return decoder_.overrun(); }
   bool failed() const { return decoder_.failed(); }
-  const std::vector<int8_t>& cdef_index() const { return cdef_idx_; }
+  const std::vector<int8_t>& cdef_index() const { return fm_.cdef_idx_; }
+
+  /* Moves the frame level state the shared maps hold into the result: the CDEF
+   * index and the restoration unit table. The single tile entry points call
+   * this after run(); decode_tiles() calls it once every tile is in. */
+  void copy_frame_outputs(TileDecodeResult* out) {
+    out->cdef_cols = fm_.cdef_cols;
+    out->cdef_rows = fm_.cdef_rows;
+    out->cdef_idx = fm_.cdef_idx_;
+    for (int plane = 0; plane < 3; ++plane) out->restoration[plane] = fm_.restoration[plane];
+  }
+
+  /* The tables a frame hands on are the ones of the tile the frame names. A
+   * parallel decode runs that tile on whichever parser owns it, so before
+   * publish() the owner copies them across. */
+  void adopt_cdf_state(const TileParser& src) {
+    cdf_ = src.cdf_;
+    saved_cdf_ = src.saved_cdf_;
+    have_saved_cdf_ = src.have_saved_cdf_;
+  }
+
+  /* Whether this parser decoded the tile the frame takes its handed-on tables
+   * from (a no-op when the frame does not refresh the context). */
+  bool have_saved_cdf() const { return have_saved_cdf_; }
+
+  /* The frame state this parser uses: decode_tiles() hands it to the other
+   * parsers when it splits a frame's tiles. */
+  FrameShared& frame_state() { return fm_; }
 
  private:
   int mi_cols() const { return mi_dim(frame_.width); }
@@ -484,15 +590,15 @@ class TileParser {
    * previous frame's map. A frame whose reference is not the same size as this
    * one has no usable map, and the prediction is then 0. */
   int temporal_segment_id(int row, int col, int bw4, int bh4) const {
-    if (!prev_seg_map_) return 0;
+    if (!fm_.prev_seg_map_) return 0;
     const int cols = mi_cols(), rows = mi_rows();
-    if (prev_seg_map_->mi_cols != cols || prev_seg_map_->mi_rows != rows) return 0;
+    if (fm_.prev_seg_map_->mi_cols != cols || fm_.prev_seg_map_->mi_rows != rows) return 0;
     const int xmis = std::min(bw4, cols - col);
     const int ymis = std::min(bh4, rows - row);
     int seg = kMaxSegments - 1;
     for (int y = 0; y < ymis && seg; ++y) {
       const uint8_t* line =
-          prev_seg_map_->ids.data() + static_cast<size_t>(row + y) * cols + col;
+          fm_.prev_seg_map_->ids.data() + static_cast<size_t>(row + y) * cols + col;
       for (int x = 0; x < xmis; ++x) seg = std::min<int>(seg, line[x]);
     }
     return seg;
@@ -505,7 +611,7 @@ class TileParser {
     const int cols = mi_cols();
     const bool top = have_top(row), left = have_left(col);
     if (top && left) {
-      const uint8_t* cell = seg_map_.data() + static_cast<size_t>(row) * cols + col;
+      const uint8_t* cell = fm_.seg_map_.data() + static_cast<size_t>(row) * cols + col;
       const int l = cell[-1];
       const int a = cell[-cols];
       const int al = cell[-(cols + 1)];
@@ -519,8 +625,8 @@ class TileParser {
       return a == al ? a : l;
     }
     *ctx = 0;
-    if (left) return seg_map_[static_cast<size_t>(row) * cols + col - 1];
-    if (top) return seg_map_[static_cast<size_t>(row - 1) * cols + col];
+    if (left) return fm_.seg_map_[static_cast<size_t>(row) * cols + col - 1];
+    if (top) return fm_.seg_map_[static_cast<size_t>(row - 1) * cols + col];
     return 0;
   }
 
@@ -549,10 +655,9 @@ class TileParser {
       const int sub_y = plane > 0 && seq_.ss_y ? 1 : 0;
       const int cols = count_units_in_frame(unit_size, round_up_even(frame_.upscaled_width, sub_x));
       const int rows = count_units_in_frame(unit_size, round_up_even(frame_.height, sub_y));
-      out_->restoration[plane].assign(static_cast<size_t>(cols) * rows, RestorationUnit());
+      fm_.restoration[plane].assign(static_cast<size_t>(cols) * rows, RestorationUnit());
     }
   }
-
   /* count_units_in_frame(): the number of units a frame of `size` samples
    * holds, rounding to the nearest unit so that a sliver of less than half a
    * unit at the far edge is not coded (5.11.46). */
@@ -602,7 +707,7 @@ class TileParser {
   void read_lr_unit(int plane, int unit_row, int unit_col) {
     const int cols = out_restoration_cols(plane);
     RestorationUnit& unit =
-        out_->restoration[plane][static_cast<size_t>(unit_row) * cols + unit_col];
+        fm_.restoration[plane][static_cast<size_t>(unit_row) * cols + unit_col];
     const int frame_type = frame_.restoration_type[plane];
     if (frame_type == kRestoreSwitchable) {
       /* The switchable table codes RESTORE_NONE / RESTORE_WIENER /
@@ -760,7 +865,7 @@ class TileParser {
     const int cols = mi_cols(), rows = mi_rows();
     const uint8_t value = static_cast<uint8_t>(segment_id);
     for (int y = row; y < row + bh4 && y < rows; ++y) {
-      uint8_t* line = seg_map_.data() + static_cast<size_t>(y) * cols;
+      uint8_t* line = fm_.seg_map_.data() + static_cast<size_t>(y) * cols;
       for (int x = col; x < col + bw4 && x < cols; ++x) line[x] = value;
     }
   }
@@ -772,11 +877,11 @@ class TileParser {
     int above = 0, left = 0;
     int above_sz = -1, left_sz = -1;
     if (have_top(row)) {
-      above_sz = mi_size_[index(row - 1, col)];
+      above_sz = fm_.mi_size_[index(row - 1, col)];
       above = kBlockWidthLog2[above_sz] < bsl;
     }
     if (have_left(col)) {
-      left_sz = mi_size_[index(row, col - 1)];
+      left_sz = fm_.mi_size_[index(row, col - 1)];
       left = kBlockHeightLog2[left_sz] < bsl;
     }
     if (cdf_trace_enabled())
@@ -787,17 +892,17 @@ class TileParser {
 
   /* skip: how many of the two neighbours were skipped. */
   /* skip mode of the neighbours, as the skip mode context counts it */
-  int mi_skip_mode(int row, int col) const { return skip_mode_map_[index(row, col)]; }
+  int mi_skip_mode(int row, int col) const { return fm_.skip_mode_map_[index(row, col)]; }
   void mi_skip_mode_set(int row, int col, int bw4, int bh4) {
     for (int y = 0; y < bh4 && row + y < mi_rows(); ++y)
       for (int x = 0; x < bw4 && col + x < mi_cols(); ++x)
-        skip_mode_map_[index(row + y, col + x)] = 1;
+        fm_.skip_mode_map_[index(row + y, col + x)] = 1;
   }
 
   int skip_context(int row, int col) {
     int ctx = 0;
-    if (have_top(row)) ctx += skip_map_[index(row - 1, col)];
-    if (have_left(col)) ctx += skip_map_[index(row, col - 1)];
+    if (have_top(row)) ctx += fm_.skip_map_[index(row - 1, col)];
+    if (have_left(col)) ctx += fm_.skip_map_[index(row, col - 1)];
     return ctx;
   }
 
@@ -805,10 +910,10 @@ class TileParser {
                   int y_mode) {
     for (int y = 0; y < h4 && row + y < mi_rows(); ++y) {
       for (int x = 0; x < w4 && col + x < mi_cols(); ++x) {
-        mi_size_[index(row + y, col + x)] = static_cast<uint8_t>(size);
-        y_mode_map_[index(row + y, col + x)] = static_cast<uint8_t>(y_mode);
+        fm_.mi_size_[index(row + y, col + x)] = static_cast<uint8_t>(size);
+        fm_.y_mode_map_[index(row + y, col + x)] = static_cast<uint8_t>(y_mode);
         if (skip) {
-          skip_map_[index(row + y, col + x)] = 1;
+          fm_.skip_map_[index(row + y, col + x)] = 1;
         }
       }
     }
@@ -823,20 +928,20 @@ class TileParser {
    *
    * The values are log2 of the side in 4x4 units, uncapped: a 128x128 block
    * that does not split stores 5, so that "the neighbour above is at least as
-   * wide as this transform" can still answer no against a 64x64 transform. */
-  std::vector<uint8_t> tx_cell_lw_;
-  std::vector<uint8_t> tx_cell_lh_;
+   * wide as this transform" can still answer no against a 64x64 transform.
+   * The arrays live in FrameShared: the cells of one tile are written by that
+   * tile only. */
   void set_cell_tx(int row, int col, int w4, int h4, int lw, int lh) {
     for (int y = 0; y < h4 && row + y < mi_rows(); ++y)
       for (int x = 0; x < w4 && col + x < mi_cols(); ++x)
-        tx_cell_lw_[index(row + y, col + x)] = static_cast<uint8_t>(lw),
-        tx_cell_lh_[index(row + y, col + x)] = static_cast<uint8_t>(lh);
+        fm_.tx_cell_lw_[index(row + y, col + x)] = static_cast<uint8_t>(lw),
+        fm_.tx_cell_lh_[index(row + y, col + x)] = static_cast<uint8_t>(lh);
   }
   int cell_tx_width(int row, int col) const {
-    return 4 << tx_cell_lw_[index(row, col)];
+    return 4 << fm_.tx_cell_lw_[index(row, col)];
   }
   int cell_tx_height(int row, int col) const {
-    return 4 << tx_cell_lh_[index(row, col)];
+    return 4 << fm_.tx_cell_lh_[index(row, col)];
   }
 
   /* The transform the block uses, which the next block's tx_depth context
@@ -857,30 +962,7 @@ class TileParser {
 
   /* One 4x4 cell of the motion reference map: what the specification writes
    * into its RefMv map, and what the candidate scan of the *next* block reads.
-   * Everything here is a property of the whole block, so the block's area is
-   * filled with the same entry. */
-  struct MiRef {
-    uint8_t intra = 1;                 /* 1: intra predicted (or intrabc)   */
-    /* 1: inter/intra compound. Both it and a single reference block keep
-     * kRefIntra in ref[1], so this flag is what tells them apart - the
-     * candidate scans compare against "no second reference" (-1 in the
-     * specification) and an inter/intra neighbour is not that. */
-    uint8_t interintra = 0;
-    uint8_t ref[2] = {kRefIntra, kRefIntra};
-    uint8_t inter_mode = kModeNearestMv;
-    int16_t mv[2][2] = {{0, 0}, {0, 0}};
-    /* dav1d's `mf` bit 0: a global motion vector that should be used in place
-     * of `mv` when this block is matched as a candidate. */
-    uint8_t global_subpel = 0;
-    /* dav1d's `mf` bit 1: the block coded a new motion vector. */
-    uint8_t coded_newmv = 0;
-    /* the interpolation filter this block used, per direction, for the filter
-     * context */
-    uint8_t filter[2] = {0, 0};
-    /* how this block blended its two predictions, which several of the
-     * compound contexts read from their neighbours */
-    uint8_t comp_type = kCompoundNone;
-  };
+   * The entry type is MiRef, defined with the frame state it lives in. */
 
   /* One candidate in the mv stack: a vector (or, for a compound block, a vector
    * pair) and the weight the scan accumulated for it. */
@@ -889,9 +971,9 @@ class TileParser {
     int weight = 0;
   };
 
-  const MiRef& mi_at(int row, int col) const { return mi_ref_[index(row, col)]; }
+  const MiRef& mi_at(int row, int col) const { return fm_.mi_ref_[index(row, col)]; }
   BlockSize block_size_at(int row, int col) const {
-    return static_cast<BlockSize>(mi_size_[index(row, col)]);
+    return static_cast<BlockSize>(fm_.mi_size_[index(row, col)]);
   }
 
   /* Above-right availability as BlockDecoded reports it: blocks are coded in
@@ -980,28 +1062,28 @@ class TileParser {
   }
 
   /* The frame's temporal candidate setup: which reference frames contribute
-   * (`mfmv_ref_`), how far each is from this frame (`mfmv_ref2cur_`) and, for
+   * (`fm_.mfmv_ref_`), how far each is from this frame (`fm_.mfmv_ref2cur_`) and, for
    * the vectors they stored, how far the frame *they* stored them from is
-   * (`mfmv_ref2ref_`). `pocdiff_` is this frame's distance to each of its own
+   * (`fm_.mfmv_ref2ref_`). `fm_.pocdiff_` is this frame's distance to each of its own
    * seven references, which is the numerator of every projection. */
   void setup_temporal_mvs() {
     const int iw8 = (frame_.width + 7) >> 3;
     const int ih8 = (frame_.height + 7) >> 3;
-    proj_cols_ = iw8;
-    proj_.assign(static_cast<size_t>(iw8) * ih8, TemporalMv());
-    mfmv_count_ = 0;
+    fm_.proj_cols_ = iw8;
+    fm_.proj_.assign(static_cast<size_t>(iw8) * ih8, TemporalMv());
+    fm_.mfmv_count_ = 0;
     if (!refs_) return;
 
     for (int i = 0; i < 7; ++i) {
       const int to_ref = order_hint_delta(seq_, frame_.order_hint, frame_.ref_order_hint[i]);
-      pocdiff_[i] = std::max(-31, std::min(31, to_ref));
+      fm_.pocdiff_[i] = std::max(-31, std::min(31, to_ref));
       /* a vector that points at a frame before this one can be projected onto a
        * frame after it; the other direction is not usable */
       const int from_ref = order_hint_delta(seq_, frame_.ref_order_hint[i], frame_.order_hint);
-      mfmv_sign_[i] = from_ref < 0;
+      fm_.mfmv_sign_[i] = from_ref < 0;
       /* and a reference *after* this frame flips the sign of the vectors a
        * neighbour stored for it, which the extended candidate scan does */
-      sign_bias_[i] = from_ref > 0;
+      fm_.sign_bias_[i] = from_ref > 0;
     }
     if (!frame_.use_ref_frame_mvs || !seq_.enable_order_hint) return;
 
@@ -1019,7 +1101,7 @@ class TileParser {
       }
     }
 
-    for (int n = 0; n < 3; ++n) mfmv_stored_[n] = nullptr;
+    for (int n = 0; n < 3; ++n) fm_.mfmv_stored_[n] = nullptr;
     const auto relative = [this](int a, int b) { return order_hint_delta(seq_, a, b); };
 
     int total = 2;
@@ -1028,51 +1110,51 @@ class TileParser {
       /* the last frame was predicted from something other than the frame this
        * one calls golden, so the two are distinct points in time: it is worth a
        * candidate of its own */
-      mfmv_ref_[mfmv_count_++] = kRefIdxLast;
+      fm_.mfmv_ref_[fm_.mfmv_count_++] = kRefIdxLast;
       total = 3;
     }
     if (stored[kRefIdxBwdref] &&
         relative(frame_.ref_order_hint[kRefIdxBwdref], frame_.order_hint) > 0)
-      mfmv_ref_[mfmv_count_++] = kRefIdxBwdref;
+      fm_.mfmv_ref_[fm_.mfmv_count_++] = kRefIdxBwdref;
     if (stored[kRefIdxAltref2] &&
         relative(frame_.ref_order_hint[kRefIdxAltref2], frame_.order_hint) > 0)
-      mfmv_ref_[mfmv_count_++] = kRefIdxAltref2;
-    if (mfmv_count_ < total && stored[kRefIdxAltref] &&
+      fm_.mfmv_ref_[fm_.mfmv_count_++] = kRefIdxAltref2;
+    if (fm_.mfmv_count_ < total && stored[kRefIdxAltref] &&
         relative(frame_.ref_order_hint[kRefIdxAltref], frame_.order_hint) > 0)
-      mfmv_ref_[mfmv_count_++] = kRefIdxAltref;
-    if (mfmv_count_ < total && stored[kRefIdxLast2]) mfmv_ref_[mfmv_count_++] = kRefIdxLast2;
+      fm_.mfmv_ref_[fm_.mfmv_count_++] = kRefIdxAltref;
+    if (fm_.mfmv_count_ < total && stored[kRefIdxLast2]) fm_.mfmv_ref_[fm_.mfmv_count_++] = kRefIdxLast2;
 
     if (trace_tmvs()) {
-      std::fprintf(stderr, "TS per=%d n=%d hint=%d refs=", pocdiff_[0], mfmv_count_,
+      std::fprintf(stderr, "TS per=%d n=%d hint=%d refs=", fm_.pocdiff_[0], fm_.mfmv_count_,
                    frame_.order_hint);
       for (int i = 0; i < 7; ++i) std::fprintf(stderr, " %d", frame_.ref_order_hint[i]);
       std::fprintf(stderr, "\n");
     }
-    for (int n = 0; n < mfmv_count_; ++n) {
-      const int ref = mfmv_ref_[n];
-      mfmv_stored_[n] = stored[ref];
+    for (int n = 0; n < fm_.mfmv_count_; ++n) {
+      const int ref = fm_.mfmv_ref_[n];
+      fm_.mfmv_stored_[n] = stored[ref];
       const int ref_hint = frame_.ref_order_hint[ref];
       const int distance = relative(ref_hint, frame_.order_hint);
       if (std::abs(distance) > 31) {
-        mfmv_ref2cur_[n] = kInvalidRef2Cur;
+        fm_.mfmv_ref2cur_[n] = kInvalidRef2Cur;
         continue;
       }
       /* A backward reference (bwd, altref2, altref) is stored with the sign the
        * specification gives it; the forward ones are negated. */
-      mfmv_ref2cur_[n] = ref < kRefIdxBwdref ? -distance : distance;
+      fm_.mfmv_ref2cur_[n] = ref < kRefIdxBwdref ? -distance : distance;
       for (int m = 0; m < 7; ++m) {
         const int their_distance = relative(ref_hint, stored_poc[ref][m]);
         /* a distance the wrong way round, or too large to be representable, is
          * stored as zero, which means "this vector cannot be projected" */
-        mfmv_ref2ref_[n][m] =
+        fm_.mfmv_ref2ref_[n][m] =
             static_cast<uint8_t>(their_distance <= 0 || their_distance > 31 ? 0 : their_distance);
       }
     }
     if (trace_tmvs()) {
-      for (int n = 0; n < mfmv_count_; ++n) {
-        std::fprintf(stderr, "TA n=%d ref=%d ref2cur=%d ref2ref=", n, mfmv_ref_[n],
-                     mfmv_ref2cur_[n]);
-        for (int m = 0; m < 7; ++m) std::fprintf(stderr, " %d", mfmv_ref2ref_[n][m]);
+      for (int n = 0; n < fm_.mfmv_count_; ++n) {
+        std::fprintf(stderr, "TA n=%d ref=%d ref2cur=%d ref2ref=", n, fm_.mfmv_ref_[n],
+                     fm_.mfmv_ref2cur_[n]);
+        for (int m = 0; m < 7; ++m) std::fprintf(stderr, " %d", fm_.mfmv_ref2ref_[n][m]);
         std::fprintf(stderr, "\n");
       }
     }
@@ -1082,14 +1164,14 @@ class TileParser {
   /* load_tmvs: project every stored vector of the contributing reference frames
    * onto this frame's grid. Later contributors overwrite earlier ones, which is
    * the specification's way of preferring the closer frames (they come later in
-   * `mfmv_ref_`). */
+   * `fm_.mfmv_ref_`). */
   void project_temporal_mvs(int iw8, int ih8) {
-    for (int n = 0; n < mfmv_count_; ++n) {
-      const RefMvs* stored = mfmv_stored_[n];
-      if (!stored || mfmv_ref2cur_[n] == kInvalidRef2Cur) continue;
+    for (int n = 0; n < fm_.mfmv_count_; ++n) {
+      const RefMvs* stored = fm_.mfmv_stored_[n];
+      if (!stored || fm_.mfmv_ref2cur_[n] == kInvalidRef2Cur) continue;
       /* the reference type the stored vector points at is inverted for the
        * forward references, and the projection follows the same sign */
-      const int ref_sign = mfmv_ref_[n] - kRefIdxBwdref;
+      const int ref_sign = fm_.mfmv_ref_[n] - kRefIdxBwdref;
       for (int y = 0; y < ih8; ++y) {
         /* a vector only reaches the same 8x8 band of rows it started in */
         const int band = y & ~7;
@@ -1097,10 +1179,10 @@ class TileParser {
         for (int x = 0; x < iw8; ++x) {
           const TemporalMv& cell = stored->at(x, y);
           if (!cell.valid()) continue;
-          const int ref2ref = mfmv_ref2ref_[n][cell.ref - 1];
+          const int ref2ref = fm_.mfmv_ref2ref_[n][cell.ref - 1];
           if (!ref2ref) continue;
-          const int offset_x = project_mv_component(cell.x, mfmv_ref2cur_[n], ref2ref);
-          const int offset_y = project_mv_component(cell.y, mfmv_ref2cur_[n], ref2ref);
+          const int offset_x = project_mv_component(cell.x, fm_.mfmv_ref2cur_[n], ref2ref);
+          const int offset_y = project_mv_component(cell.y, fm_.mfmv_ref2cur_[n], ref2ref);
           /* 8x8 cells: the stored vector is in 1/8 sample units, the projection
            * divides by 64 to land on one */
           const int pos_x = x + apply_sign(std::abs(offset_x) >> 6, offset_x ^ ref_sign);
@@ -1109,7 +1191,7 @@ class TileParser {
           /* and it only spreads one cell to either side of its own band */
           const int x_band = x & ~7;
           if (pos_x < std::max(x_band - 8, 0) || pos_x >= std::min(x_band + 16, iw8)) continue;
-          TemporalMv& dst = proj_[static_cast<size_t>(pos_y) * proj_cols_ + pos_x];
+          TemporalMv& dst = fm_.proj_[static_cast<size_t>(pos_y) * fm_.proj_cols_ + pos_x];
           dst.x = cell.x;
           dst.y = cell.y;
           dst.ref = static_cast<uint8_t>(ref2ref);
@@ -1130,9 +1212,9 @@ class TileParser {
 
   const TemporalMv& projected_at(int col, int row) const {
     static const TemporalMv kEmpty;
-    if (col < 0 || row < 0 || col >= proj_cols_) return kEmpty;
-    if (static_cast<size_t>(row) * proj_cols_ + col >= proj_.size()) return kEmpty;
-    return proj_[static_cast<size_t>(row) * proj_cols_ + col];
+    if (col < 0 || row < 0 || col >= fm_.proj_cols_) return kEmpty;
+    if (static_cast<size_t>(row) * fm_.proj_cols_ + col >= fm_.proj_.size()) return kEmpty;
+    return fm_.proj_[static_cast<size_t>(row) * fm_.proj_cols_ + col];
   }
 
   /* Two cells belong to the same "run" when they would contribute the same
@@ -1160,8 +1242,8 @@ class TileParser {
     if (!cell.valid()) return;
     MvCand entry;
     entry.weight = weight;
-    entry.mv[0][0] = project_mv_component(cell.x, pocdiff_[ref0 - 1], cell.ref);
-    entry.mv[0][1] = project_mv_component(cell.y, pocdiff_[ref0 - 1], cell.ref);
+    entry.mv[0][0] = project_mv_component(cell.x, fm_.pocdiff_[ref0 - 1], cell.ref);
+    entry.mv[0][1] = project_mv_component(cell.y, fm_.pocdiff_[ref0 - 1], cell.ref);
     lower_mv_precision(&entry.mv[0][0], &entry.mv[0][1]);
     if (ref1 == kRefIntra) {
       if (globalmv_ctx) {
@@ -1171,11 +1253,11 @@ class TileParser {
                        "GMV fo=%d %d %d mv=%d,%d gmv=%d,%d res=%d raw=%d,%d rr=%d pd=%d,%d\n",
                        g_frame_ordinal, origin_col, origin_row, entry.mv[0][1], entry.mv[0][0],
                        gmv_y, gmv_x, *globalmv_ctx, cell.y, cell.x, cell.ref,
-                       pocdiff_[ref0 - 1], pocdiff_[cell.ref - 1]);
+                       fm_.pocdiff_[ref0 - 1], fm_.pocdiff_[cell.ref - 1]);
       }
     } else {
-      entry.mv[1][0] = project_mv_component(cell.x, pocdiff_[ref1 - 1], cell.ref);
-      entry.mv[1][1] = project_mv_component(cell.y, pocdiff_[ref1 - 1], cell.ref);
+      entry.mv[1][0] = project_mv_component(cell.x, fm_.pocdiff_[ref1 - 1], cell.ref);
+      entry.mv[1][1] = project_mv_component(cell.y, fm_.pocdiff_[ref1 - 1], cell.ref);
       lower_mv_precision(&entry.mv[1][0], &entry.mv[1][1]);
     }
     const int last = *count;
@@ -1200,7 +1282,7 @@ class TileParser {
     int globalmv_ctx = frame_.use_ref_frame_mvs ? 1 : 0;
     /* use_ref_frame_mvs is 0 on an intra frame, and an intra block copy block
      * asks for the INTRA reference: neither has anything to project. */
-    if (mfmv_count_ == 0 || ref0 <= kRefIntra) return globalmv_ctx;
+    if (fm_.mfmv_count_ == 0 || ref0 <= kRefIntra) return globalmv_ctx;
 
     const int bx8 = mi_col >> 1, by8 = mi_row >> 1;
     const int step_h = bw4 >= 16 ? 2 : 1, step_v = bh4 >= 16 ? 2 : 1;
@@ -1274,7 +1356,7 @@ class TileParser {
         if (!mi.intra) {
           for (int n = 1; n >= 0; --n) {
             const int ref = mi.ref[n];
-            if (ref <= kRefIntra || !mfmv_sign_[ref - 1]) continue;
+            if (ref <= kRefIntra || !fm_.mfmv_sign_[ref - 1]) continue;
             if ((std::abs(mi.mv[n][0]) | std::abs(mi.mv[n][1])) >= 4096) continue;
             cell.x = mi.mv[n][0];
             cell.y = mi.mv[n][1];
@@ -1432,7 +1514,7 @@ class TileParser {
       const int cand_ref = cand.ref[n];
       if (cand_ref <= kRefIntra) break;
       int cx = cand.mv[n][0], cy = cand.mv[n][1];
-      if (sign_bias_[ref0 - 1] != sign_bias_[cand_ref - 1]) {
+      if (fm_.sign_bias_[ref0 - 1] != fm_.sign_bias_[cand_ref - 1]) {
         cx = -cx;
         cy = -cy;
       }
@@ -1466,7 +1548,7 @@ class TileParser {
       const int cand_ref = cand.ref[n];
       if (cand_ref <= kRefIntra) break;
       int cx = cand.mv[n][0], cy = cand.mv[n][1];
-      const bool flip = sign_bias_[cand_ref - 1];
+      const bool flip = fm_.sign_bias_[cand_ref - 1];
       if (cand_ref == ref0) {
         if (same_count[0] < 2) {
           same[same_count[0]].mv[0][0] = cx;
@@ -1474,7 +1556,7 @@ class TileParser {
           ++same_count[0];
         }
         if (diff_count[1] < 2) {
-          if (flip != (sign_bias_[ref1 - 1] != 0)) {
+          if (flip != (fm_.sign_bias_[ref1 - 1] != 0)) {
             cx = -cx;
             cy = -cy;
           }
@@ -1489,7 +1571,7 @@ class TileParser {
           ++same_count[1];
         }
         if (diff_count[0] < 2) {
-          if (flip != (sign_bias_[ref0 - 1] != 0)) {
+          if (flip != (fm_.sign_bias_[ref0 - 1] != 0)) {
             cx = -cx;
             cy = -cy;
           }
@@ -1500,13 +1582,13 @@ class TileParser {
       } else {
         int ix = -cx, iy = -cy;
         if (diff_count[0] < 2) {
-          const bool mirror = flip != (sign_bias_[ref0 - 1] != 0);
+          const bool mirror = flip != (fm_.sign_bias_[ref0 - 1] != 0);
           diff[diff_count[0]].mv[0][0] = mirror ? ix : cx;
           diff[diff_count[0]].mv[0][1] = mirror ? iy : cy;
           ++diff_count[0];
         }
         if (diff_count[1] < 2) {
-          const bool mirror = flip != (sign_bias_[ref1 - 1] != 0);
+          const bool mirror = flip != (fm_.sign_bias_[ref1 - 1] != 0);
           diff[diff_count[1]].mv[1][0] = mirror ? ix : cx;
           diff[diff_count[1]].mv[1][1] = mirror ? iy : cy;
           ++diff_count[1];
@@ -2376,9 +2458,9 @@ class TileParser {
                                     bool intra_only) {
     if (intra_only) {
       const int above_mode =
-          have_top(row) ? y_mode_map_[index(row - 1, col)] : static_cast<int>(kModeDc);
+          have_top(row) ? fm_.y_mode_map_[index(row - 1, col)] : static_cast<int>(kModeDc);
       const int left_mode =
-          have_left(col) ? y_mode_map_[index(row, col - 1)] : static_cast<int>(kModeDc);
+          have_left(col) ? fm_.y_mode_map_[index(row, col - 1)] : static_cast<int>(kModeDc);
       block->y_mode = static_cast<int>(decoder_.read_symbol(
           cdf_.mode.kfym[kIntraModeContext[above_mode]][kIntraModeContext[left_mode]],
           kModeLumaCount - 1));
@@ -3043,7 +3125,7 @@ class TileParser {
     entry.filter[1] = static_cast<uint8_t>(filter1);
     entry.comp_type = static_cast<uint8_t>(block.is_inter ? block.compound_type : kCompoundNone);
     for (int y = 0; y < bh4 && row + y < mi_rows(); ++y)
-      for (int x = 0; x < bw4 && col + x < mi_cols(); ++x) mi_ref_[index(row + y, col + x)] = entry;
+      for (int x = 0; x < bw4 && col + x < mi_cols(); ++x) fm_.mi_ref_[index(row + y, col + x)] = entry;
   }
 
   /* read_var_tx_size: the transform split tree an inter block codes instead of
@@ -3290,7 +3372,7 @@ class TileParser {
       const int cdef_cols = (mi_cols() + cdef_unit - 1) / cdef_unit;
       const int cdef_rows = (mi_rows() + cdef_unit - 1) / cdef_unit;
       if (cr < cdef_rows && cc < cdef_cols &&
-          cdef_idx_[static_cast<size_t>(cr) * cdef_cols + cc] < 0) {
+          fm_.cdef_idx_[static_cast<size_t>(cr) * cdef_cols + cc] < 0) {
         const int idx = static_cast<int>(decoder_.read_literal(frame_.cdef.bits));
         const int w4 = block_width4(size), h4 = block_height4(size);
         /* a 128x128 superblock covers four 64x64 cells; every cell it reaches
@@ -3302,7 +3384,7 @@ class TileParser {
             const int cell_r = i / cdef_unit;
             const int cell_c = j / cdef_unit;
             if (cell_r < cdef_rows && cell_c < cdef_cols)
-              cdef_idx_[static_cast<size_t>(cell_r) * cdef_cols + cell_c] =
+              fm_.cdef_idx_[static_cast<size_t>(cell_r) * cdef_cols + cell_c] =
                   static_cast<int8_t>(idx);
           }
         }
@@ -3970,14 +4052,14 @@ class TileParser {
   void set_tx_type(int x4, int y4, TxSize tx, int tx_type) {
     for (int y = 0; y < tx.h4() && y4 + y < mi_rows(); ++y) {
       for (int x = 0; x < tx.w4() && x4 + x < mi_cols(); ++x) {
-        tx_type_map_[index(y4 + y, x4 + x)] = static_cast<uint8_t>(tx_type);
+        fm_.tx_type_map_[index(y4 + y, x4 + x)] = static_cast<uint8_t>(tx_type);
       }
     }
   }
 
   int tx_type_at(int x4, int y4) const {
     if (x4 < 0 || y4 < 0 || x4 >= mi_cols() || y4 >= mi_rows()) return coef_tables::kDctDct;
-    return tx_type_map_[index(y4, x4)];
+    return fm_.tx_type_map_[index(y4, x4)];
   }
 
   /* transform_type: the luma transform type, when the size allows a choice and
@@ -4045,7 +4127,7 @@ class TileParser {
      * specification clamps to the block origin for exactly that reason. */
     const int lx = std::max(block.mi_col, x4 << sub_x());
     const int ly = std::max(block.mi_row, y4 << sub_y());
-    const int luma_type = tx_type_map_[index(ly, lx)];
+    const int luma_type = fm_.tx_type_map_[index(ly, lx)];
     if (tx_square_class(tx) == 3) {
       return luma_type == coef_tables::kIdtx ? coef_tables::kIdtx : coef_tables::kDctDct;
     }
@@ -4177,7 +4259,7 @@ class TileParser {
   ParseStatus read_luma_transform_tree(TileBlock* block, int x4, int y4, int w4, int h4,
                                        bool read_coefficients) {
     if (x4 >= mi_cols() || y4 >= mi_rows()) return ParseStatus::Ok;
-    const int lw = tx_cell_lw_[index(y4, x4)], lh = tx_cell_lh_[index(y4, x4)];
+    const int lw = fm_.tx_cell_lw_[index(y4, x4)], lh = fm_.tx_cell_lh_[index(y4, x4)];
     if (w4 <= (1 << lw) && h4 <= (1 << lh)) {
       const TxSize tx = find_tx_size(w4, h4);
       if (read_coefficients) return read_transform_block(block, 0, x4, y4, tx, false);
@@ -4401,8 +4483,6 @@ class TileParser {
   CdfContext saved_cdf_;
   bool have_saved_cdf_ = false;
   int tile_col_ = 0, tile_row_ = 0;
-  /* the tables the frame started from, see run() */
-  CdfContext start_cdf_;
 
   int tile_col_start_ = 0, tile_col_end_ = 0, tile_row_start_ = 0, tile_row_end_ = 0;
   int current_q_ = 0;
@@ -4411,28 +4491,6 @@ class TileParser {
   int delta_lf_[4] = {0, 0, 0, 0};
   bool read_deltas_ = false;
 
-  /* Projected motion vectors: this frame's 8x8 grid, the distances the
-   * projection scales by, and the frames that contributed to it. */
-  std::vector<TemporalMv> proj_;
-  int proj_cols_ = 0;
-  int pocdiff_[7] = {0, 0, 0, 0, 0, 0, 0};
-  bool mfmv_sign_[7] = {false, false, false, false, false, false, false};
-  /* sign_bias: whether a reference frame is *after* this one, which inverts the
-   * sign of the vectors neighbours stored that point at it */
-  bool sign_bias_[7] = {false, false, false, false, false, false, false};
-  int mfmv_ref_[3] = {0, 0, 0};
-  int mfmv_ref2cur_[3] = {0, 0, 0};
-  uint8_t mfmv_ref2ref_[3][7] = {};
-  const RefMvs* mfmv_stored_[3] = {nullptr, nullptr, nullptr};
-  int mfmv_count_ = 0;
-
-  std::vector<MiRef> mi_ref_;
-  std::vector<uint8_t> mi_size_;
-  /* The segmentation map being built, the previous frame's map when this frame
-   * predicts from it, and the per 4x4 contexts the temporal prediction symbol
-   * is coded with. */
-  std::vector<uint8_t> seg_map_;
-  const SegmentationMap* prev_seg_map_ = nullptr;
   /* One entry per 4x4 column / row, plus kMiPad: a block whose top row is a
    * few rows above the frame's last one still spans its full coded height, so
    * set_segment_prediction_contexts writes past MiCols / MiRows exactly as
@@ -4440,11 +4498,6 @@ class TileParser {
    * read them does not exist), but the write has to land inside the array. */
   std::vector<uint8_t> above_seg_pred_;
   std::vector<uint8_t> left_seg_pred_;
-  std::vector<uint8_t> skip_map_;
-  std::vector<uint8_t> skip_mode_map_;
-  /* cdef_idx per 64x64, -1 until a block that is not skipped reads it */
-  std::vector<int8_t> cdef_idx_;
-  std::vector<uint8_t> y_mode_map_;
   /* PaletteSizes / PaletteColors of the rows and columns already coded, per
    * plane (0 = luma, 1 = the U colours of the chroma palette). The palette
    * cache of a block reads the cell above and the cell to the left of its top
@@ -4455,21 +4508,34 @@ class TileParser {
   std::vector<std::array<PaletteColor, kPaletteColors>> pal_left_col_[2];
   std::vector<int8_t> above_tx_lw_;
   std::vector<int8_t> left_tx_lh_;
-  /* luma transform type per 4x4 unit, as transform_type() writes it */
-  std::vector<uint8_t> tx_type_map_;
   /* coefficient level and DC statistics, per plane */
   CoefPlaneContext coef_[3];
   /* AV1GPU_TRACE: one line per transform block on stderr, for debugging */
   bool trace_ = false;
 
+  /* The frame state this parser uses: its own when it is the only one, the
+   * owner's when several parsers split the frame's tiles. `owns_fm_` says
+   * which, and decides whether the maps are this parser's to allocate. */
+  FrameShared owned_fm_;
+  FrameShared& fm_;
+  bool owns_fm_ = true;
+
  public:
+  /* Full init: allocates the frame's shared state (when this parser owns it)
+   * and then this parser's own tile state. A parser constructed with a shared
+   * FrameShared only runs the second half; the owner must have run the first. */
   void init_state() {
+    if (owns_fm_) init_frame_state();
+    init_worker_state();
+  }
+
+  /* This parser's own state, the part every parser needs no matter who owns
+   * the frame maps: the entropy contexts (above and left, per column and per
+   * row), the coefficient contexts and the CDF tables a tile starts from.
+   * None of it is read or written by another parser's tiles, which is what
+   * makes parallel tile decode possible. */
+  void init_worker_state() {
     const int cols = mi_cols(), rows = mi_rows();
-    mi_size_.assign(static_cast<size_t>(cols) * rows, kBlock4x4);
-    mi_ref_.assign(static_cast<size_t>(cols) * rows, MiRef());
-    skip_map_.assign(static_cast<size_t>(cols) * rows, 0);
-    skip_mode_map_.assign(static_cast<size_t>(cols) * rows, 0);
-    y_mode_map_.assign(static_cast<size_t>(cols) * rows, kModeDc);
     for (int plane = 0; plane < 2; ++plane) {
       const std::array<PaletteColor, kPaletteColors> no_colors = {0, 0, 0, 0, 0, 0, 0, 0};
       pal_above_sz_[plane].assign(static_cast<size_t>(cols), 0);
@@ -4479,17 +4545,8 @@ class TileParser {
     }
     above_tx_lw_.assign(static_cast<size_t>(cols), 0);
     left_tx_lh_.assign(static_cast<size_t>(rows), 0);
-    seg_map_.assign(static_cast<size_t>(cols) * rows, 0);
     above_seg_pred_.assign(static_cast<size_t>(cols) + kMiPad, 0);
     left_seg_pred_.assign(static_cast<size_t>(rows) + kMiPad, 0);
-    tx_cell_lw_.assign(static_cast<size_t>(cols) * rows, 0);
-    tx_cell_lh_.assign(static_cast<size_t>(cols) * rows, 0);
-    tx_type_map_.assign(static_cast<size_t>(cols) * rows, coef_tables::kDctDct);
-    const int cdef_cols = (cols + 15) >> 4;
-    const int cdef_rows = (rows + 15) >> 4;
-    cdef_idx_.assign(static_cast<size_t>(cdef_cols) * cdef_rows, -1);
-    out_->cdef_cols = cdef_cols;
-    out_->cdef_rows = cdef_rows;
     for (int plane = 0; plane < 3; ++plane) {
       const size_t plane_cols = static_cast<size_t>(plane_cols4(plane));
       const size_t plane_rows = static_cast<size_t>(plane_rows4(plane));
@@ -4498,6 +4555,30 @@ class TileParser {
       coef_[plane].left_level.assign(plane_rows, 0);
       coef_[plane].left_dc.assign(plane_rows, 0);
     }
+    cdf_ = fm_.start_cdf_;
+    have_saved_cdf_ = false;
+    current_q_ = frame_.base_q_idx;
+    for (int i = 0; i < 4; ++i) delta_lf_[i] = 0;
+  }
+
+  /* The frame's shared state, once per frame: the maps every tile writes its
+   * own region of, the temporal motion vector projection (which depends on
+   * nothing but the reference frames) and the CDF tables the frame starts
+   * from. */
+  void init_frame_state() {
+    const int cols = mi_cols(), rows = mi_rows();
+    fm_.mi_size_.assign(static_cast<size_t>(cols) * rows, kBlock4x4);
+    fm_.mi_ref_.assign(static_cast<size_t>(cols) * rows, MiRef());
+    fm_.skip_map_.assign(static_cast<size_t>(cols) * rows, 0);
+    fm_.skip_mode_map_.assign(static_cast<size_t>(cols) * rows, 0);
+    fm_.y_mode_map_.assign(static_cast<size_t>(cols) * rows, kModeDc);
+    fm_.seg_map_.assign(static_cast<size_t>(cols) * rows, 0);
+    fm_.tx_cell_lw_.assign(static_cast<size_t>(cols) * rows, 0);
+    fm_.tx_cell_lh_.assign(static_cast<size_t>(cols) * rows, 0);
+    fm_.tx_type_map_.assign(static_cast<size_t>(cols) * rows, coef_tables::kDctDct);
+    fm_.cdef_cols = (cols + 15) >> 4;
+    fm_.cdef_rows = (rows + 15) >> 4;
+    fm_.cdef_idx_.assign(static_cast<size_t>(fm_.cdef_cols) * fm_.cdef_rows, -1);
     setup_temporal_mvs();
     /* The restoration grid, allocated once for the whole frame: which unit a
      * superblock codes is decided by the tile that owns it. */
@@ -4515,15 +4596,10 @@ class TileParser {
       }
     }
     if (inherited) {
-      cdf_ = *inherited;
+      fm_.start_cdf_ = *inherited;
     } else {
-      init_default_cdf(&cdf_, frame_.base_q_idx);
+      init_default_cdf(&fm_.start_cdf_, frame_.base_q_idx);
     }
-    /* the tables the frame started from: a frame that may not update the
-     * context at its end hands these on instead of the adapted ones */
-    start_cdf_ = cdf_;
-    current_q_ = frame_.base_q_idx;
-    for (int i = 0; i < 4; ++i) delta_lf_[i] = 0;
     /* The map a temporal segment prediction reads: the primary reference's, and
      * only when it has the same geometry - a segmentation map of another size
      * says nothing about this frame's blocks. */
@@ -4532,7 +4608,7 @@ class TileParser {
       const int slot_index = frame_.ref_frame_idx[frame_.primary_ref_frame];
       if (slot_index >= 0 && slot_index < 8) {
         const SegmentationMap* map = refs_->slots[slot_index].seg_map.get();
-        if (map && map->mi_cols == cols && map->mi_rows == rows) prev_seg_map_ = map;
+        if (map && map->mi_cols == cols && map->mi_rows == rows) fm_.prev_seg_map_ = map;
       }
     }
   }
@@ -4599,7 +4675,7 @@ class TileParser {
    * The restoration unit predictors go back to their midpoint values too, which
    * 5.11.3 does per tile. */
   void reset_tile_state(const uint8_t* data, size_t size) {
-    cdf_ = start_cdf_;
+    cdf_ = fm_.start_cdf_;
     current_q_ = frame_.base_q_idx;
     for (int i = 0; i < 4; ++i) delta_lf_[i] = 0;
     read_deltas_ = frame_.delta_q_present;
@@ -4647,6 +4723,12 @@ ParseStatus decode_tiles(const SequenceHeader& seq, const FrameHeader& frame,
       *error = "tile: a tile group that covers only part of the frame is not decoded so far";
     return ParseStatus::Unsupported;
   }
+  for (const TileExtent* tile = tiles; tile != tiles + tile_count; ++tile) {
+    if (tile->index < 0 || tile->index >= total)
+      return fail(error, "tile: tile index out of range");
+    if (tile->size == 0 || tile->offset >= size || tile->size > size - tile->offset)
+      return fail(error, "tile: tile bytes outside the payload");
+  }
 
   ++g_frame_ordinal;
   if (trace_enabled()) {
@@ -4656,25 +4738,165 @@ ParseStatus decode_tiles(const SequenceHeader& seq, const FrameHeader& frame,
   if (std::getenv("AV1GPU_TILEINFO"))
     std::fprintf(stderr, "TILES %d x %d (group %zu)\n", frame.tiles.cols, frame.tiles.rows,
                  tile_count);
+
+  /* The tiles of a frame are coded independently - each resets the entropy
+   * state (5.11.3) and writes only its own region of the frame maps - so with
+   * more than one tile the frame is split over a few parsers. The tiles are
+   * spread by size (a 4K frame's tiles are very uneven), each parser keeps its
+   * own above/left contexts and coefficient contexts, and the per-tile outputs
+   * are merged in tile group order, which is exactly the order one parser
+   * would have produced them in. The single parser below stays for one tile
+   * frames and for a pool that is not there. */
+  unsigned threads = 1;
+  if (tile_count > 1) {
+    threads = static_cast<unsigned>(std::min<size_t>(tile_count, 6));
+    if (const char* e = std::getenv("AV1GPU_TILE_THREADS")) {
+      const long v = std::atol(e);
+      if (v >= 1 && v <= 16) threads = static_cast<unsigned>(std::min<size_t>(tile_count, static_cast<size_t>(v)));
+    }
+  }
+
   TileDecodeResult frame_out;
-  TileParser parser(seq, frame, refs, data, size, &frame_out, error);
-  parser.init_state();
+  TileParser owner(seq, frame, refs, data, size, &frame_out, error);
+  owner.init_state();
+
   size_t used = 0;
   bool overrun = false;
-  for (const TileExtent* tile = tiles; tile != tiles + tile_count; ++tile) {
-    if (tile->index < 0 || tile->index >= total)
-      return fail(error, "tile: tile index out of range");
-    if (tile->size == 0 || tile->offset >= size || tile->size > size - tile->offset)
-      return fail(error, "tile: tile bytes outside the payload");
-    const ParseStatus status = parser.run_tile(tile->col, tile->row, data + tile->offset,
-                                               tile->size);
-    if (status != ParseStatus::Ok) return status;
-    if (parser.failed()) return fail(error, "tile: the range coder lost synchronisation");
-    used += parser.bytes_used();
-    overrun = overrun || parser.overrun();
+
+  if (threads <= 1) {
+    for (const TileExtent* tile = tiles; tile != tiles + tile_count; ++tile) {
+      const ParseStatus status = owner.run_tile(tile->col, tile->row, data + tile->offset,
+                                                tile->size);
+      if (status != ParseStatus::Ok) return status;
+      if (owner.failed()) return fail(error, "tile: the range coder lost synchronisation");
+      used += owner.bytes_used();
+      overrun = overrun || owner.overrun();
+    }
+  } else {
+    /* One parser per worker, all sharing the owner's frame state. Each parser
+     * gets its own error string: only the tile the merge finds broken first
+     * reports, and it reports through the parser that decoded it. */
+    struct Slice {
+      int worker = -1;
+      size_t block_begin = 0, block_end = 0;
+      size_t level_begin = 0, level_end = 0;
+      size_t bytes_used = 0;
+      bool overrun = false;
+      bool failed = false;
+      ParseStatus status = ParseStatus::Ok;
+    };
+    std::vector<std::unique_ptr<TileParser>> workers;
+    std::vector<TileDecodeResult> results(threads);
+    std::vector<std::string> errors(threads);
+    workers.reserve(threads);
+    for (unsigned t = 0; t < threads; ++t) {
+      workers.push_back(std::make_unique<TileParser>(seq, frame, refs, data, size, &results[t],
+                                                     &errors[t], &owner.frame_state()));
+      workers[t]->init_state();
+    }
+
+    /* Spread the tiles by size: largest first into the least loaded worker.
+     * Sizes are byte counts, which track the entropy work well enough that a
+     * 4K frame's uneven tiles stay balanced within a few percent. */
+    std::vector<std::vector<size_t>> buckets(threads);
+    std::vector<size_t> load(threads, 0);
+    std::vector<size_t> order(tile_count);
+    for (size_t i = 0; i < tile_count; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+      return tiles[a].size > tiles[b].size;
+    });
+    for (size_t idx : order) {
+      size_t best = 0;
+      for (unsigned t = 1; t < threads; ++t)
+        if (load[t] < load[best]) best = t;
+      buckets[best].push_back(idx);
+      load[best] += tiles[idx].size;
+    }
+
+    std::vector<Slice> slices(tile_count);
+    ThreadPool::instance().run(
+        threads, threads,
+        [&](size_t, size_t begin, size_t end) {
+          for (size_t w = begin; w < end; ++w) {
+            TileParser& parser = *workers[w];
+            for (size_t idx : buckets[w]) {
+              const TileExtent& tile = tiles[idx];
+              Slice& slice = slices[idx];
+              slice.worker = static_cast<int>(w);
+              slice.block_begin = results[w].blocks.size();
+              slice.level_begin = results[w].levels.size();
+              slice.status = parser.run_tile(tile.col, tile.row, data + tile.offset, tile.size);
+              slice.block_end = results[w].blocks.size();
+              slice.level_end = results[w].levels.size();
+              slice.failed = parser.failed();
+              slice.bytes_used = parser.bytes_used();
+              slice.overrun = parser.overrun();
+            }
+          }
+        },
+        /*force=*/true);
+
+    /* The first broken tile in group order reports, exactly as the sequential
+     * loop would have stopped at it. */
+    for (size_t idx = 0; idx < tile_count; ++idx) {
+      const Slice& slice = slices[idx];
+      if (slice.status != ParseStatus::Ok) {
+        if (error && error->empty() && slice.worker >= 0) *error = errors[slice.worker];
+        return slice.status;
+      }
+      if (slice.failed) return fail(error, "tile: the range coder lost synchronisation");
+      used += slice.bytes_used;
+      overrun = overrun || slice.overrun;
+    }
+
+    /* Merge in tile group order: each tile's levels move into the frame pool
+     * and its blocks follow, with the coefficients' offsets rebased by the
+     * levels contributed before them. */
+    size_t level_base = 0;
+    for (size_t idx = 0; idx < tile_count; ++idx) {
+      const Slice& slice = slices[idx];
+      TileDecodeResult& src = results[static_cast<size_t>(slice.worker)];
+      for (size_t b = slice.block_begin; b < slice.block_end; ++b) {
+        TileBlock& block = src.blocks[b];
+        /* The offsets are into the *worker's* pool, so a tile rebases from
+         * where its own levels started in it. */
+        for (TileTransform& transform : block.transforms)
+          transform.level_offset = transform.level_offset - slice.level_begin + level_base;
+        frame_out.blocks.push_back(std::move(block));
+      }
+      frame_out.levels.insert(frame_out.levels.end(),
+                              std::make_move_iterator(src.levels.begin() + static_cast<ptrdiff_t>(slice.level_begin)),
+                              std::make_move_iterator(src.levels.begin() + static_cast<ptrdiff_t>(slice.level_end)));
+      level_base += slice.level_end - slice.level_begin;
+    }
+    for (unsigned t = 0; t < threads; ++t) {
+      frame_out.transform_blocks += results[t].transform_blocks;
+      frame_out.coefficients += results[t].coefficients;
+      frame_out.blocks_needing_residuals += results[t].blocks_needing_residuals;
+      frame_out.obmc_blocks += results[t].obmc_blocks;
+      frame_out.warped_blocks += results[t].warped_blocks;
+    }
+
+    /* The tables the frame hands on come from one named tile; publish() runs
+     * on the owner, so the parser that decoded that tile hands them over. */
+    if (frame.refresh_frame_context) {
+      bool adopted = false;
+      for (size_t idx = 0; idx < tile_count && !adopted; ++idx) {
+        const Slice& slice = slices[idx];
+        if (slice.worker >= 0 && workers[static_cast<size_t>(slice.worker)]->have_saved_cdf()) {
+          owner.adopt_cdf_state(*workers[static_cast<size_t>(slice.worker)]);
+          adopted = true;
+        }
+      }
+      if (!adopted) {
+        const Slice& last = slices[tile_count - 1];
+        if (last.worker >= 0) owner.adopt_cdf_state(*workers[static_cast<size_t>(last.worker)]);
+      }
+    }
   }
-  parser.publish();
-  frame_out.cdef_idx = parser.cdef_index();
+
+  owner.publish();
+  owner.copy_frame_outputs(&frame_out);
   frame_out.bytes_used = used;
   frame_out.overrun = overrun;
   *out = std::move(frame_out);
@@ -4702,7 +4924,7 @@ ParseStatus decode_intra_tile(const SequenceHeader& seq, const FrameHeader& fram
   const ParseStatus status = parser.run();
   /* the index grid is only read once the tile is done: it is per 64x64, not per
    * block, and a tile that failed half way through has no plans to feed */
-  out->cdef_idx = parser.cdef_index();
+  parser.copy_frame_outputs(out);
   out->bytes_used = parser.bytes_used();
   out->overrun = parser.overrun();
   if (status == ParseStatus::Ok && parser.failed()) {
@@ -4738,7 +4960,7 @@ ParseStatus decode_tile(const SequenceHeader& seq, const FrameHeader& frame,
   TileParser parser(seq, frame, refs, data, size, out, error);
   parser.init_state();
   const ParseStatus status = parser.run();
-  out->cdef_idx = parser.cdef_index();
+  parser.copy_frame_outputs(out);
   out->bytes_used = parser.bytes_used();
   out->overrun = parser.overrun();
   if (status == ParseStatus::Ok && parser.failed()) {

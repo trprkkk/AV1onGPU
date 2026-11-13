@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -49,7 +50,8 @@ namespace {
 class EngineDecoder final : public av1gpu::Decoder {
  public:
   EngineDecoder(std::unique_ptr<Backend> backend, const BackendOptions& options)
-      : backend_(std::move(backend)), options_(options) {}
+      : backend_(std::move(backend)), options_(options),
+        device_dequant_(backend_->dequantises_on_device()) {}
 
   ~EngineDecoder() override {
     std::lock_guard<std::mutex> lk(slot_mutex_);
@@ -72,6 +74,10 @@ class EngineDecoder final : public av1gpu::Decoder {
     std::lock_guard<std::mutex> lk(slot_mutex_);
     auto it = std::find(held_slots_.begin(), held_slots_.end(), slot);
     if (it != held_slots_.end()) held_slots_.erase(it);
+    /* the layout recording goes with the slot: a pack after the release has no
+     * picture to read anyway, and a reused slot gets its own layout when it is
+     * decoded into again */
+    if (slot >= 0 && slot < kTrackedSlots) slot_known_[slot] = false;
     backend_->release_reference(slot);
   }
 
@@ -94,15 +100,20 @@ class EngineDecoder final : public av1gpu::Decoder {
       QueryPerformanceFrequency(&ef);
       QueryPerformanceCounter(&e0);
     }
+    int slot = -1;
     FramePlan plan;
-    if (!plan_for(syntax, &plan, error)) return -1;
+    PlanLayout used;
+    if (!plan_for(syntax, &plan, error, nullptr, &used)) return -1;
     if (t_on) QueryPerformanceCounter(&e1);
 
-    int slot = -1;
     if (!backend_->decode(plan, true, out, &slot, &stats_, error)) return -1;
     if (slot >= 0) {
       std::lock_guard<std::mutex> lk(slot_mutex_);
       held_slots_.push_back(slot);
+      if (slot < kTrackedSlots) {
+        slot_layouts_[slot] = used;
+        slot_known_[slot] = true;
+      }
     }
     if (t_on) {
       QueryPerformanceCounter(&e2);
@@ -121,71 +132,221 @@ class EngineDecoder final : public av1gpu::Decoder {
   }
 
   int decode_reference_reserved(const FrameSyntax& syntax, int slot, Frame* out,
-                                std::string* error) override {
+                                std::string* error, bool read_back = true) override {
     if (slot < 0) {
       /* no reserved slot: decode and drop the device copy */
       decode(syntax, out, error);
       return -1;
     }
     FramePlan plan;
-    if (!plan_for(syntax, &plan, error)) return -1;
+    PlanLayout used;
+    if (!plan_for(syntax, &plan, error, nullptr, &used)) return -1;
 
+    /* The same rule as decode_reference_planned: the picture is left on the
+     * device only when the caller can pack it from the slot. */
+    const bool metadata_only =
+        out && !read_back && backend_->packs_nv12_on_device();
     int got = -1;
-    if (!backend_->decode_reserved(plan, slot, out, &got, &stats_, error)) return -1;
+    if (!backend_->decode_reserved(plan, slot, metadata_only ? nullptr : out, &got,
+                                   &stats_, error))
+      return -1;
     if (got >= 0) {
       std::lock_guard<std::mutex> lk(slot_mutex_);
       held_slots_.push_back(got);
+      if (got < kTrackedSlots) {
+        slot_layouts_[got] = used;
+        slot_known_[got] = true;
+      }
     }
+    if (out) fill_frame_meta(out, used);
     return got;
   }
 
   /* Pipelining: the plan is built here, on the caller's thread, and decoded on
    * another one. `plan` is a FramePlan the decoder owns until it is consumed
    * by decode_reference_planned or dropped by discard_frame_plan. */
-  bool plan_frame(const FrameSyntax& syntax, void** plan, std::string* error) override {
-    if (!plan) {
-      if (error) *error = "plan_frame: no output handle";
-      return false;
-    }
-    FramePlan* built = new FramePlan();
-    if (!plan_for(syntax, built, error)) {
-      delete built;
-      return false;
-    }
-    *plan = built;
-    return true;
+  bool plan_frame(const FrameSyntax& syntax, void** plan, std::string* error,
+                  std::atomic<bool>* cancel) override {
+    return plan_frame_impl(syntax, nullptr, plan, error, cancel);
+  }
+
+  /* The caller will not use `syntax` again, so the plan takes its pools over
+   * instead of copying them (the copy is ~16 ms a frame at 4K). */
+  bool plan_frame(FrameSyntax&& syntax, void** plan, std::string* error,
+                  std::atomic<bool>* cancel) override {
+    return plan_frame_impl(syntax, &syntax, plan, error, cancel);
   }
 
   int decode_reference_planned(void* plan, int slot, Frame* out,
-                               std::string* error) override {
+                               std::string* error, bool read_back = true) override {
     FramePlan* built = static_cast<FramePlan*>(plan);
     if (!built) {
       if (error) *error = "decode_reference_planned: no plan";
       return -1;
     }
+    /* The layout this slot's picture is decoded with: an output stage that
+     * packs the picture on the device later (Decoder::to_nv12) has to read it
+     * back through the same offsets, even when another frame has been prepared
+     * in between. */
+    const PlanLayout slot_layout = built->layout;
+    /* Skipping the read back is only safe for a backend that packs the slot on
+     * the device: without one there is no other copy of the picture, so the
+     * host planes are what the output stage packs and they have to be filled. */
+    const bool metadata_only = out && !read_back && backend_->packs_nv12_on_device();
     int got = -1;
     if (slot < 0) {
       /* no reserved slot: decode it and drop the device copy */
-      const bool ok = backend_->decode(*built, false, out, &got, &stats_, error);
-      delete built;
+      const bool ok = backend_->decode(*built, false, metadata_only ? nullptr : out,
+                                       &got, &stats_, error);
+      release_plan(built);
+      if (ok && got >= 0 && out) fill_frame_meta(out, slot_layout);
       return ok && got >= 0 ? got : -1;
     }
-    const bool ok = backend_->decode_reserved(*built, slot, out, &got, &stats_, error);
-    delete built;
+    const bool ok = backend_->decode_reserved(*built, slot, metadata_only ? nullptr : out,
+                                              &got, &stats_, error);
+    {
+      /* DEBUG: how long the plan's destruction takes - a frame's plan holds a
+       * hundred vectors of jobs and a copy of the coefficient pool. The pool
+       * recycles it instead of freeing it, so the release cost is a clear() of
+       * each container rather than a free. */
+      static const bool t_on = std::getenv("AV1GPU_ENGINE_TIME") != nullptr;
+      LARGE_INTEGER d0{}, d1{}, df;
+      if (t_on) {
+        QueryPerformanceFrequency(&df);
+        QueryPerformanceCounter(&d0);
+      }
+      release_plan(built);
+      if (t_on) {
+        QueryPerformanceCounter(&d1);
+        static double acc = 0;
+        static long n = 0;
+        acc += double(d1.QuadPart - d0.QuadPart) * 1000.0 / double(df.QuadPart);
+        if (++n % 100 == 0) {
+          std::fprintf(stderr, "[engine-time] plan release %.2f ms over %ld\n", acc / n, n);
+          acc = 0;
+          n = 0;
+        }
+      }
+    }
     if (!ok) return -1;
     if (got >= 0) {
       std::lock_guard<std::mutex> lk(slot_mutex_);
       held_slots_.push_back(got);
+      if (got < kTrackedSlots) {
+        slot_layouts_[got] = slot_layout;
+        slot_known_[got] = true;
+      }
     }
+    if (out) fill_frame_meta(out, slot_layout);
     return got;
   }
 
-  void discard_frame_plan(void* plan) override { delete static_cast<FramePlan*>(plan); }
+  void discard_frame_plan(void* plan) override {
+    if (!plan) return;
+    release_plan(static_cast<FramePlan*>(plan));
+  }
 
   bool supports_preplanning() const override { return true; }
 
+  /* Kept in sync with the member: the decoder asks the backend once, and the
+   * engine passes the answer into build_frame_plan. */
+  bool dequantises_on_device() const override { return device_dequant_; }
+
+  /* The CUDA backend refreshes a reference slot with the display picture after
+   * film grain, so a pipeline's output stage can pack the slot's picture on the
+   * device and never read the planes back. */
+  bool packs_nv12_on_device() const override {
+    return backend_->packs_nv12_on_device();
+  }
+
  private:
-  bool plan_for(const FrameSyntax& syntax, FramePlan* plan, std::string* error) {
+  /* ---- plan pool ---------------------------------------------------------
+   * A frame's plan is tens of megabytes (the raster pool, the per-wave job
+   * arrays, the filter passes) and it is created, filled and destroyed once
+   * per frame: the destruction alone was measured at 4.2 ms a frame at 4K, on
+   * the worker's critical path. A seek pays the same cost up to kPipeDepth
+   * times over, because a flush discards every queued plan.
+   *
+   * So the plans are recycled: `acquire_plan` takes one from a small pool and
+   * resets it (clearing every container, which keeps the allocations), and the
+   * decoder returns it when it is done. The pool is bounded by the pipeline's
+   * depth - a deeper queue would be memory held for nothing - and every plan
+   * it holds was fully reset, so nothing of the previous frame survives. */
+  static constexpr size_t kPlanPoolMax = 24;
+  std::mutex plan_pool_mutex_;
+  std::vector<std::unique_ptr<FramePlan>> plan_pool_;
+
+  std::unique_ptr<FramePlan> acquire_plan() {
+    std::lock_guard<std::mutex> lk(plan_pool_mutex_);
+    if (!plan_pool_.empty()) {
+      std::unique_ptr<FramePlan> plan = std::move(plan_pool_.back());
+      plan_pool_.pop_back();
+      return plan;
+    }
+    return std::make_unique<FramePlan>();
+  }
+
+  void release_plan(FramePlan* plan) {
+    if (!plan) return;
+    reset_plan(plan);
+    std::lock_guard<std::mutex> lk(plan_pool_mutex_);
+    if (plan_pool_.size() < kPlanPoolMax) {
+      plan_pool_.emplace_back(plan);
+      return;
+    }
+    delete plan; /* the pool is full: a plan that big is not worth keeping */
+  }
+
+  /* Clears everything the planner fills. The containers keep their
+   * allocations on purpose: that is what makes the pool worth having - a
+   * resize on the next frame then reuses the pages instead of asking the
+   * allocator (and the OS, for the big ones) for ~29 MB again every frame. A
+   * recycled plan must be indistinguishable from a fresh one, so this lists
+   * every member of FramePlan: the pools (which move, so they must be
+   * emptied), the filter job arrays and the waves, and the scalars. */
+  static void reset_plan(FramePlan* plan) {
+    plan->layout = PlanLayout();
+    plan->ref_slot[0] = plan->ref_slot[1] = -1;
+    plan->maxv = 255;
+    plan->blocks = 0;
+    plan->coefficients.clear();
+    plan->residual.clear();
+    plan->raster_from_levels = false;
+    plan->coef_pool_size = 0;
+    plan->residual_pool_size = 0;
+    plan->levels.clear();
+    plan->qm_pool.clear();
+    plan->palette_map.clear();
+    plan->tmp_size = 0;
+    plan->waves.clear();
+    plan->deblock_v.clear();
+    plan->deblock_h.clear();
+    plan->cdef.clear();
+    plan->upscale.clear();
+    plan->restoration.clear();
+    plan->grain_chroma.clear();
+    plan->grain_luma.clear();
+    plan->grain_noise = GrainNoise();
+  }
+
+  bool plan_frame_impl(const FrameSyntax& syntax, FrameSyntax* movable, void** plan,
+                       std::string* error, std::atomic<bool>* cancel = nullptr) {
+    if (!plan) {
+      if (error) *error = "plan_frame: no output handle";
+      return false;
+    }
+    std::unique_ptr<FramePlan> built = acquire_plan();
+    if (!plan_for(syntax, built.get(), error, movable, nullptr, cancel)) {
+      release_plan(built.release());
+      return false;
+    }
+    *plan = built.release();
+    return true;
+  }
+
+  bool plan_for(const FrameSyntax& syntax, FramePlan* plan, std::string* error,
+                FrameSyntax* movable = nullptr, PlanLayout* used_layout = nullptr,
+                std::atomic<bool>* cancel = nullptr) {
     std::string local;
     if (!error) error = &local;
     error->clear();
@@ -209,9 +370,23 @@ class EngineDecoder final : public av1gpu::Decoder {
       QueryPerformanceCounter(&p0);
     }
     const PlanLayout layout = backend_->prepare(geom, coded_width);
+    if (used_layout) *used_layout = layout;
     if (t_on2) QueryPerformanceCounter(&p1);
+    /* host_fills_pools is false when the backend builds the raster pool on the
+     * device, which saves the host the copy of (and the upload for) ~29 MB a
+     * frame at 4K.
+     *
+     * It also needs the syntax to describe its pool as *levels*: a syntax that
+     * hands over a finished raster (the synthetic encoder does exactly that,
+     * with no levels and no quantiser matrices) must keep the host path, or the
+     * device would be asked to expand a description that is not there and the
+     * itx kernels would read a pool nobody filled. So a frame with no coded
+     * levels takes the host path too, where its all-zero pool is built the
+     * cheap way. */
+    const bool host_fills_pools = !device_dequant_ || syntax.levels.empty();
     const bool ok = build_frame_plan(syntax, layout, options_,
-                                     backend_->reference_capacity(), plan, error);
+                                     backend_->reference_capacity(), plan, error, movable,
+                                     host_fills_pools, cancel);
     if (t_on2) {
       QueryPerformanceCounter(&p2);
       static double acc_prep = 0, acc_build = 0;
@@ -228,6 +403,18 @@ class EngineDecoder final : public av1gpu::Decoder {
     return ok;
   }
 
+  /* The picture's header, without its pixels: what a caller that packs the
+   * picture on the device (Decoder::to_nv12) still needs to name the frame.
+   * The planes are only (re)allocated when the geometry changed, so a pooled
+   * frame keeps its buffers and this costs one comparison. */
+  static void fill_frame_meta(Frame* out, const PlanLayout& g) {
+    if (!out) return;
+    if (!out->matches(g.frame.width, g.frame.height, g.frame.bit_depth, g.frame.ss_x,
+                      g.frame.ss_y))
+      out->allocate(g.frame.width, g.frame.height, g.frame.bit_depth, g.frame.ss_x,
+                    g.frame.ss_y);
+  }
+
  public:
 
   bool to_rgb(int slot, ColorMatrix matrix, ColorRange range, std::vector<uint8_t>* rgb,
@@ -237,13 +424,57 @@ class EngineDecoder final : public av1gpu::Decoder {
 
   bool to_nv12(int slot, size_t pitch, std::vector<uint8_t>* nv12,
                std::string* error) override {
-    return backend_->to_nv12(slot, pitch, nv12, error);
+    /* The layout is recorded per slot when the engine decodes into it: a
+     * pipeline's output stage packs the picture of slot N while the planner has
+     * already prepared another geometry for frame N+1, and the pack has to read
+     * the offsets its own picture was decoded with. A slot the engine did not
+     * decode (an uploaded reference, say) has none, and the backend falls back
+     * to its last prepared layout. */
+    const PlanLayout* layout = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      if (slot >= 0 && slot < kTrackedSlots && slot_known_[slot])
+        layout = &slot_layouts_[slot];
+    }
+    return backend_->to_nv12(slot, pitch, nv12, error, layout);
+  }
+
+  int nv12_pack_begin(int slot, size_t pitch, std::string* error) override {
+    const PlanLayout* layout = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(slot_mutex_);
+      if (slot >= 0 && slot < kTrackedSlots && slot_known_[slot])
+        layout = &slot_layouts_[slot];
+    }
+    return backend_->nv12_pack_begin(slot, pitch, error, layout);
+  }
+
+  bool nv12_pack_wait(int handle, std::vector<uint8_t>* nv12,
+                      std::string* error) override {
+    return backend_->nv12_pack_wait(handle, nv12, error);
+  }
+
+  void nv12_pack_release(int handle) override {
+    backend_->nv12_pack_release(handle);
   }
 
  private:
   std::unique_ptr<Backend> backend_;
   BackendOptions options_;
   DecodeStats stats_;
+  /* True when the backend turns the coded levels into the coefficient pool on
+   * the device: the host then leaves the raster pool empty (see
+   * build_frame_plan's host_fills_pools). */
+  bool device_dequant_ = false;
+  /* The layout each reference slot's picture was decoded with, for a device
+   * side pack (to_nv12) that runs after another frame has been prepared.
+   * kTrackedSlots covers every backend's reference pool (the CUDA one has 32)
+   * and the recording is best effort: an untracked slot packs through the
+   * backend's last prepared layout, which is the same thing for a caller that
+   * packs before it plans the next frame. */
+  static constexpr int kTrackedSlots = 64;
+  PlanLayout slot_layouts_[kTrackedSlots];
+  bool slot_known_[kTrackedSlots] = {false};
   /* held_slots_ is touched from the pipeline's worker (decode_reference_*
    * push the slot they decoded into) and from the caller's thread
    * (release_reference/reset on a seek or a failed queue), so it has its own
@@ -277,11 +508,25 @@ static int resolve_slot(const FrameSyntax& syntax, int ref_id) {
 
 bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
                       const BackendOptions& options, int reference_capacity,
-                      FramePlan* plan, std::string* error) {
+                      FramePlan* plan, std::string* error, FrameSyntax* movable,
+                      bool host_fills_pools,
+                      std::atomic<bool>* cancel) {
+    /* A flush abandons the plan that is in flight: the caller (a pipeline's
+     * planner thread) sets the flag and this function returns as soon as a
+     * phase boundary is reached, instead of spending the rest of a keyframe's
+     * 40-80 ms on a plan the seek is about to throw away. */
+    auto cancelled = [cancel]() {
+      return cancel && cancel->load(std::memory_order_relaxed);
+    };
+    if (cancelled()) {
+      *error = "planning cancelled";
+      return false;
+    }
     /* AV1GPU_PLAN_TIME=1: accumulate the section costs into this static table
      * and print it when the counter is re-set to 0 (the tool prints per run). */
     struct PlanTimer {
       double waves = 0, jobs = 0, deblock = 0, cdef = 0, rest = 0;
+      double jbuild = 0; /* the parallel build inside the jobs section */
       double total = 0;
       long n = 0, calls = 0;
       LARGE_INTEGER freq;
@@ -296,7 +541,11 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
                      "rest %.1f ms over %ld frame(s)\n",
                      waves / frame_n, jobs / frame_n, deblock / frame_n,
                      cdef / frame_n, rest / frame_n, frame_n);
+        std::fprintf(stderr,
+                     "[plan-time] jobs split: build %.1f  alloc+merge %.1f ms over %ld\n",
+                     jbuild / frame_n, (jobs - jbuild) / frame_n, frame_n);
         waves = jobs = deblock = cdef = rest = 0;
+        jbuild = 0;
         n = 0;
       }
       void tick() {
@@ -348,8 +597,12 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     };
 
     /* ---- coefficient and residual pools ---------------------------------- */
+    /* ~230k transforms at 4K: a cancel check every so often, so a flush does not
+     * have to wait out the whole scan (it is the longest stretch before the
+     * first phase boundary). */
     size_t coef_size = 0;
     size_t residual_size = 0;
+    size_t since_check = 0;
     for (const BlockSyntax& b : syntax.blocks) {
       for (const TransformBlock& tx : b.transforms) {
         const size_t end = tx.coef_offset +
@@ -358,15 +611,57 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
           residual_size = std::max(residual_size, end);
         else
           coef_size = std::max(coef_size, end);
+        if (cancel && ++since_check >= 8192) {
+          since_check = 0;
+          if (cancel->load(std::memory_order_relaxed)) {
+            *error = "planning cancelled";
+            return false;
+          }
+        }
       }
     }
-    /* The syntax's pools become the plan's pools. They are per-frame data the
-     * caller does not need again, but the interface takes the syntax by
-     * const reference, so this is one copy, not a zero fill plus a copy. */
-    plan->coefficients = syntax.coefficients;
-    plan->coefficients.resize(coef_size + 64, 0);
-    plan->residual = syntax.residual;
-    plan->residual.resize(residual_size + 64, 0);
+    /* The syntax's pools become the plan's pools. When the caller handed the
+     * syntax over (`movable`), they are *moved*: at 4K the coefficient pool is
+     * several megabytes and the copy was the largest single cost of planning
+     * a frame. The syntax must then not be used for a decode any more, which
+     * is what the caller promises by using the rvalue overload.
+     *
+     * When a device side dequantisation is in charge (`!host_fills_pools`),
+     * the *coefficient* raster travels empty: the device builds it from the
+     * levels, so the host neither copies nor resizes ~29 MB a frame. The sizes
+     * are carried separately (coef_pool_size) so the device buffers are still
+     * allocated to the full pool.
+     *
+     * `residual` is a different pool - the raw samples a residual-provided
+     * block adds directly - and the device dequant does not produce it, so it
+     * always travels, empty or not. */
+    if (movable) {
+      if (host_fills_pools) plan->coefficients = std::move(movable->coefficients);
+      plan->residual = std::move(movable->residual);
+    } else {
+      if (host_fills_pools) plan->coefficients = syntax.coefficients;
+      plan->residual = syntax.residual;
+    }
+    /* the levels and the QM matrices are small (the coded size of the frame),
+     * so they always travel; a ternary there would silently degrade the move
+     * into a copy, so this is spelled out */
+    if (movable) {
+      plan->levels = std::move(movable->levels);
+      plan->qm_pool = std::move(movable->qm_pool);
+    } else {
+      plan->levels = syntax.levels;
+      plan->qm_pool = syntax.qm_pool;
+    }
+    plan->coef_pool_size = coef_size + 64;
+    plan->residual_pool_size = residual_size + 64;
+    /* The raster the kernels read was left to the device only when the device
+     * was asked to build it from these levels; the flag travels with the plan
+     * so the backend does not have to guess. */
+    plan->raster_from_levels = !host_fills_pools && !plan->levels.empty();
+    if (host_fills_pools) {
+      plan->coefficients.resize(plan->coef_pool_size, 0);
+      plan->residual.resize(plan->residual_pool_size, 0);
+    }
     /* The palette maps are one byte per sample and indexed by the block that
      * codes them, so the pool is copied as it is. The trailing slack keeps a
      * backend's buffer allocation non-zero for a frame without a palette. */
@@ -375,6 +670,10 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
 
     /* ---- reference slots -------------------------------------------------- */
     AV1GPU_PT_MARK(ptimer.waves);
+    if (cancelled()) {
+      *error = "planning cancelled";
+      return false;
+    }
     for (int i = 0; i < 2; ++i) {
       plan->ref_slot[i] = -1;
       if (i < static_cast<int>(syntax.reference_slots.size())) {
@@ -426,6 +725,10 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     /* chroma blocks can be 2 samples wide (a 4x4 luma block with subsampling),
      * so the chroma grids use 2 sample cells */
     const int owner_cell[3] = {4, geom.ss_x ? 2 : 4, geom.ss_y ? 2 : 4};
+    /* The cell size is a power of two, so the cell index is a shift and not a
+     * division: the edge scans below look up a hundred thousand cells a frame
+     * and a division there is the whole cost of the stage. */
+    const int owner_shift[3] = {2, geom.ss_x ? 1 : 2, geom.ss_y ? 1 : 2};
     int cell_w[3], cell_h[3];
     for (int p = 0; p < 3; ++p) {
       cell_w[p] = (grid_w[p] + owner_cell[p] - 1) / owner_cell[p];
@@ -443,7 +746,7 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     }
     /* Blocks tile the frame, so no two of them write the same cell: the owner
      * grid builds in chunks on several threads. */
-    frontend::parallel_chunks(syntax.blocks.size(), 6, [&](size_t, size_t b0, size_t e0) {
+    frontend::parallel_chunks_urgent(syntax.blocks.size(), 6, [&](size_t, size_t b0, size_t e0) {
       for (size_t bi = b0; bi < e0; ++bi) {
         const BlockSyntax& b = syntax.blocks[bi];
         const int p = b.plane;
@@ -460,15 +763,18 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
     auto sample_owner = [&](int p, int x, int y) {
       if (x < 0 || y < 0 || x >= grid_w[p] || y >= grid_h[p]) return -1;
       if (owner[p].empty()) return -1;
-      const int oc = owner_cell[p];
-      return owner[p][static_cast<size_t>(y / oc) * cell_w[p] + x / oc];
+      const int sh = owner_shift[p];
+      return owner[p][static_cast<size_t>(y >> sh) * cell_w[p] + (x >> sh)];
     };
     /* True when every in-frame sample of the rectangle already belongs to a
      * block earlier in coding order - the question BlockDecoded answers for
-     * the above-right and below-left neighbours. */
+     * the above-right and below-left neighbours.  The grid has one entry per
+     * cell and every sample of a cell shares an owner, so the rectangle is
+     * walked cell by cell. */
     auto already_decoded = [&](int p, int x0, int x1, int y0, int y1, size_t bi) {
-      for (int y = y0; y <= y1; ++y) {
-        for (int x = x0; x <= x1; ++x) {
+      const int oc = 1 << owner_shift[p];
+      for (int y = y0 & ~(oc - 1); y <= y1; y += oc) {
+        for (int x = x0 & ~(oc - 1); x <= x1; x += oc) {
           const int o = sample_owner(p, x, y);
           if (o >= 0 && static_cast<size_t>(o) >= bi) return false;
         }
@@ -541,14 +847,25 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
             left_y1 = b.y - 1;
           }
           const int left_x = b.x - 1;
-          for (int y = b.y; y <= left_y1; ++y) {
-            const int o = sample_owner(p, left_x, y);
-            if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+          /* The owner grid has one entry per cell and every sample of a cell
+           * shares an owner, so the two edge scans walk the cells and not the
+           * samples: four times fewer lookups on the luma, and the answer is
+           * the same, because a cell's owner is the owner of every sample the
+           * scan would have looked at in it. */
+          {
+            const int oc = 1 << owner_shift[p];
+            for (int y = b.y & ~(oc - 1); y <= left_y1; y += oc) {
+              const int o = sample_owner(p, left_x, y);
+              if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+            }
           }
           const int above_y = b.y - 1;
-          for (int x = b.x; x <= above_x1; ++x) {
-            const int o = sample_owner(p, x, above_y);
-            if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+          {
+            const int oc = 1 << owner_shift[p];
+            for (int x = b.x & ~(oc - 1); x <= above_x1; x += oc) {
+              const int o = sample_owner(p, x, above_y);
+              if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
+            }
           }
           /* the sample diagonally above-left, used as the corner (and by the
            * recursive filter, which reads its 2x2 neighbourhood) */
@@ -570,8 +887,9 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
           const int sy = b.y + (b.mv[0][1] >> mv_shift_y);
           const int x1 = std::min(sx + b.w, grid_w[p]);
           const int y1 = std::min(sy + b.h, grid_h[p]);
-          for (int y = std::max(sy, 0); y < y1; ++y) {
-            for (int x = std::max(sx, 0); x < x1; ++x) {
+          const int oc = 1 << owner_shift[p];
+          for (int y = std::max(sy, 0) & ~(oc - 1); y < y1; y += oc) {
+            for (int x = std::max(sx, 0) & ~(oc - 1); x < x1; x += oc) {
               const int o = sample_owner(p, x, y);
               if (o >= 0) dep = std::max(dep, block_wave[static_cast<size_t>(o)]);
             }
@@ -620,6 +938,10 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
 
     /* ---- jobs ------------------------------------------------------------- */
     AV1GPU_PT_MARK(ptimer.waves);
+    if (cancelled()) {
+      *error = "planning cancelled";
+      return false;
+    }
     /* The transform scratch is handed out in job order, one w * h block per
      * job. Two jobs never share a region, so the passes of a wave stay
      * independent even when the coefficient areas are smaller. The prefix sum
@@ -877,6 +1199,13 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
         itx.lossless = b.lossless ? 1 : 0;
         itx.row_shift = b.lossless ? 0 : tables::tx_row_shift(tx.w, tx.h);
         itx.bitdepth = b.bit_depth;
+        itx.level_offset = tx.level_offset;
+        itx.qindex = tx.qindex;
+        itx.plane = b.plane;
+        itx.dc_step = tx.dc_step;
+        itx.ac_step = tx.ac_step;
+        itx.denominator = tx.denominator;
+        itx.qm_off = tx.qm_off;
         if (itx.eob <= 0) continue; /* nothing to add */
         if (b.residual_provided)
           wj.residual.push_back(itx);
@@ -890,12 +1219,17 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
      * merge below walks the chunks in order - the sequential order. */
     std::vector<std::vector<WaveJobs>> local(6);
     std::vector<char> used(6, 0);
-    frontend::parallel_chunks(syntax.blocks.size(), 6, [&](size_t t, size_t b0, size_t e0) {
+    frontend::parallel_chunks_urgent(syntax.blocks.size(), 6, [&](size_t t, size_t b0, size_t e0) {
       if (t >= local.size()) return;
       used[t] = 1;
       local[t].assign(static_cast<size_t>(max_wave) + 1, WaveJobs());
       build_jobs(b0, e0, local[t].data());
     });
+    AV1GPU_PT_MARK(ptimer.jbuild); /* the parallel build+alloc wall */
+    if (cancelled()) {
+      *error = "planning cancelled";
+      return false;
+    }
     for (int w = 0; w <= max_wave; ++w)
       for (size_t t = 0; t < local.size(); ++t) {
         if (!used[t]) continue;
@@ -914,13 +1248,17 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
 
     /* ---- deblock ---------------------------------------------------------- */
     AV1GPU_PT_MARK(ptimer.jobs);
+    if (cancelled()) {
+      *error = "planning cancelled";
+      return false;
+    }
     /* One chunk per thread, merged in chunk order: each chunk's edges keep
      * their relative order, so the merged vectors are the sequential ones. */
     const unsigned hw_deb = std::thread::hardware_concurrency();
     const unsigned k_deb =
         syntax.deblock.size() >= 256 && hw_deb > 1 ? std::min<unsigned>(6, hw_deb) : 1;
     std::vector<std::vector<Av1gDeblockJob>> deb_v(k_deb), deb_h(k_deb);
-    frontend::parallel_chunks(syntax.deblock.size(), 6, [&](size_t t, size_t b0, size_t e0) {
+    frontend::parallel_chunks_urgent(syntax.deblock.size(), 6, [&](size_t t, size_t b0, size_t e0) {
       for (size_t i = b0; i < e0; ++i) {
         const DeblockEdge& e = syntax.deblock[i];
         Av1gDeblockJob job;
@@ -950,11 +1288,15 @@ bool build_frame_plan(const FrameSyntax& syntax, const PlanLayout& layout,
 
     /* ---- CDEF -------------------------------------------------------------- */
     AV1GPU_PT_MARK(ptimer.deblock);
+    if (cancelled()) {
+      *error = "planning cancelled";
+      return false;
+    }
     const unsigned hw_cd = std::thread::hardware_concurrency();
     const unsigned k_cd =
         syntax.cdef.size() >= 256 && hw_cd > 1 ? std::min<unsigned>(6, hw_cd) : 1;
     std::vector<std::vector<Av1gCdefJob>> cdef_l(k_cd);
-    frontend::parallel_chunks(syntax.cdef.size(), 6, [&](size_t t, size_t b0, size_t e0) {
+    frontend::parallel_chunks_urgent(syntax.cdef.size(), 6, [&](size_t t, size_t b0, size_t e0) {
       for (size_t i = b0; i < e0; ++i) {
         const CdefBlock& c = syntax.cdef[i];
         Av1gCdefJob job;

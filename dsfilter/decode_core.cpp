@@ -331,7 +331,8 @@ void StreamDecoder::planner_loop() {
     std::string err;
     if (!dead && !job.show_existing && job.slot >= 0 && !job.frame_plan && plan_thread_) {
       if (ds_debug_enabled()) QueryPerformanceCounter(&p0);
-      ok = decoder_->plan_frame(job.syntax, &job.frame_plan, &err);
+      ok = decoder_->plan_frame(std::move(job.syntax), &job.frame_plan, &err,
+                                &flush_cancel_);
       if (ds_debug_enabled()) {
         QueryPerformanceCounter(&p1);
         const double ms = double(p1.QuadPart - p0.QuadPart) * 1000.0 / double(pf.QuadPart);
@@ -346,7 +347,15 @@ void StreamDecoder::planner_loop() {
           n = 0;
         }
       }
-      if (!ok) pipe_fail(err.empty() ? "planner: plan_frame failed" : err);
+      if (!ok) {
+        /* A flush abandoned this plan (a seek does not wait out a keyframe's
+         * 40-80 ms plan): drop the job, as the queue it came from was cleared
+         * anyway, and never treat it as a decode failure. */
+        if (err == "planning cancelled" || flush_cancel_.load(std::memory_order_relaxed))
+          ds_debug_log("planner: plan cancelled by a flush");
+        else
+          pipe_fail(err.empty() ? "planner: plan_frame failed" : err);
+      }
     }
     lk.lock();
     planner_busy_ = false;
@@ -368,11 +377,14 @@ void StreamDecoder::planner_loop() {
   }
 }
 
-void StreamDecoder::queue_output(Frame picture, size_t pitch, const Sink& sink) {
+void StreamDecoder::queue_output(Frame picture, size_t pitch, const Sink& sink,
+                                 std::vector<uint8_t> nv12, int pack_handle) {
   OutputJob job;
   job.picture = std::move(picture);
   job.pitch = pitch;
   job.sink = sink;
+  job.nv12 = std::move(nv12);
+  job.pack_handle = pack_handle;
   {
     std::lock_guard<std::mutex> lk(pipe_mutex_);
     out_jobs_.push_back(std::move(job));
@@ -395,7 +407,9 @@ void StreamDecoder::output_loop() {
       output_busy_ = true;
     }
     std::string err;
-    if (!emit(job.picture, job.pitch, job.sink, &err)) pipe_fail(err);
+    const std::vector<uint8_t>* pre = job.nv12.empty() ? nullptr : &job.nv12;
+    if (!emit(job.picture, job.pitch, job.sink, &err, pre, job.pack_handle))
+      pipe_fail(err);
     /* The picture goes back to the pool: the worker decodes the next frame
      * into a buffer that is already allocated. */
     give_frame(std::move(job.picture));
@@ -413,8 +427,14 @@ void StreamDecoder::worker_loop() {
   QueryPerformanceFrequency(&iff);
   for (;;) {
     if (ds_debug_enabled()) QueryPerformanceCounter(&i0);
-    worker_cv_.wait(lk,
-                    [&] { return (quitting_ && ready_jobs_.empty()) || !ready_jobs_.empty(); });
+    /* A flush (see worker_generation_) parks the queue: ready_jobs_ still
+     * holds the old stream's frames, but the worker must not run them. It
+     * waits for abort_pipe() to discard them and to bump the generation back
+     * in sync. */
+    worker_cv_.wait(lk, [&] {
+      if (ready_jobs_.empty()) return quitting_;
+      return quitting_ || worker_generation_ == generation_;
+    });
     if (ds_debug_enabled() && !ready_jobs_.empty()) {
       LARGE_INTEGER i1;
       QueryPerformanceCounter(&i1);
@@ -424,6 +444,7 @@ void StreamDecoder::worker_loop() {
     if (ready_jobs_.empty()) return; /* quitting_ */
     PipeJob job = std::move(ready_jobs_.front());
     ready_jobs_.pop_front();
+    worker_generation_ = generation_; /* the queue is this generation's */
     pipe_cv_.notify_all(); /* in-flight space for queue_job() */
     busy_ = true;
     lk.unlock();
@@ -445,13 +466,21 @@ void StreamDecoder::run_job(PipeJob* job) {
     QueryPerformanceCounter(&j0);
   }
   if (job->show_existing) {
-    Frame picture = take_frame();
+    /* The re-shown frame was packed when it was decoded (the worker packs off
+     * the slot the picture is still in), so its bytes are simply re-emitted -
+     * no device read, no host picture. A frame that was not packed keeps its
+     * host picture, which emit packs here. */
+    Frame picture;
+    std::vector<uint8_t> existing_nv12;
     bool valid = false;
     {
       std::lock_guard<std::mutex> lk(pipe_mutex_);
       valid = job->existing_idx >= 0 && job->existing_idx < 8 &&
               pipe_valid_[job->existing_idx];
-      if (valid) picture = pipe_picture_[job->existing_idx];
+      if (valid) {
+        picture = pipe_picture_[job->existing_idx];
+        existing_nv12 = pipe_nv12_[job->existing_idx];
+      }
     }
     if (!valid) {
       /* the frames this re-show depends on were dropped; skip it rather than
@@ -459,8 +488,34 @@ void StreamDecoder::run_job(PipeJob* job) {
       ds_debug_log("show_existing_frame names a slot that was never decoded");
       return;
     }
-    std::string err;
-    queue_output(std::move(picture), job->pitch, job->sink);
+    /* If the frame it re-shows was packed on the device and its copy is still in
+     * flight, this is where it lands: wait for it here (this stage has the time
+     * a keystroke gives it), keep the bytes for any later re-show, and hand the
+     * entry back. A frame that was never packed keeps its host picture. */
+    int existing_handle = -1;
+    {
+      std::lock_guard<std::mutex> lk(pipe_mutex_);
+      existing_handle = pipe_pack_handle_[job->existing_idx];
+      pipe_pack_handle_[job->existing_idx] = -1;
+    }
+    if (existing_handle >= 0) {
+      std::string werr;
+      if (!decoder_->nv12_pack_wait(existing_handle, &existing_nv12, &werr)) {
+        ds_debug_log("show_existing_frame: the streamed pack failed: %s",
+                     werr.c_str());
+        decoder_->nv12_pack_release(existing_handle);
+        return;
+      }
+      decoder_->nv12_pack_release(existing_handle);
+      std::lock_guard<std::mutex> lk(pipe_mutex_);
+      pipe_nv12_[job->existing_idx] = existing_nv12;
+    }
+    if (existing_nv12.empty() && picture.empty()) {
+      ds_debug_log("show_existing_frame names a frame with no picture");
+      return;
+    }
+    queue_output(std::move(picture), job->pitch, job->sink,
+                 std::move(existing_nv12));
     return;
   }
 
@@ -469,23 +524,40 @@ void StreamDecoder::run_job(PipeJob* job) {
   LARGE_INTEGER b0{}, b1{};
   if (jtimed) QueryPerformanceCounter(&b0);
   if (job->frame_plan && job->slot < 0) {
-    /* a frame nobody keeps has no reserved slot to decode into: drop the plan
-     * and take the ordinary synchronous path */
+    /* A frame nobody keeps has no reserved slot to decode into. Planning only
+     * runs for a job that has one, so this cannot happen; it used to drop the
+     * plan and decode from the syntax, which the planner's move path may have
+     * emptied. Fail loudly instead of decoding from moved-out pools. */
     decoder_->discard_frame_plan(job->frame_plan);
     job->frame_plan = nullptr;
+    pipe_fail("queued frame lost its reserved slot after planning");
+    return;
   }
+  /* The pack and the read back are two ways of getting one picture out of the
+   * frame, and only one of them can run. A frame that has a reserved slot keeps
+   * its picture on the device (the pack makes the NV12 bytes there), so the
+   * host planes are not read back at all: at 4K that is ~38 MB of PCIe traffic
+   * a frame, replaced by the ~12 MB the packed output needs. A frame without a
+   * slot has nothing on the device to pack from, so it keeps the host path. */
+  const bool keep_on_device = device_pack_ >= 1 && job->slot >= 0;
   if (job->frame_plan) {
-    /* pre-planned on the demuxer's thread: submit it and read the picture
-     * back here, on the worker */
+    /* pre-planned on the demuxer's thread: submit it and read the picture back
+     * here, on the worker - unless the device pack takes its place, in which
+     * case only the metadata the output stage needs (the size and the chroma
+     * siting, from the plan's layout) is filled. */
+    const bool read_back = !keep_on_device;
     const int slot =
-        decoder_->decode_reference_planned(job->frame_plan, job->slot, &picture, &err);
+        decoder_->decode_reference_planned(job->frame_plan, job->slot, &picture, &err,
+                                          read_back);
     job->frame_plan = nullptr; /* consumed either way */
     if (slot < 0) {
       pipe_fail(err.empty() ? "queued frame decode failed" : err);
       return;
     }
   } else if (job->slot >= 0) {
-    const int slot = decoder_->decode_reference_reserved(job->syntax, job->slot, &picture, &err);
+    const int slot =
+        decoder_->decode_reference_reserved(job->syntax, job->slot, &picture, &err,
+                                           !keep_on_device);
     if (slot < 0) {
       pipe_fail(err.empty() ? "queued frame decode failed" : err);
       return;
@@ -514,25 +586,90 @@ void StreamDecoder::run_job(PipeJob* job) {
     }
   }
 
+  /* ---- pack the frame's picture into NV12, here, on the worker ----------- */
+  /* Straight after the decode: this thread holds the slot the picture is in
+   * and nothing has decoded since, so the pack reads exactly the picture this
+   * frame produced. (Doing it on the output stage instead let the worker's next
+   * decode recycle the slot first - the race that kept this path opt-in for a
+   * while - and releasing the slot there cost later frames their reference.)
+   *
+   * A kept frame is packed even when it is not shown: a show_existing_frame can
+   * name any of the eight reference slots later, and its bytes are re-emitted
+   * from here. */
+  const int pack_slot = (keep_on_device && picture.ss_x == 1 && picture.ss_y == 1)
+                            ? job->slot
+                            : -1;
+  std::vector<uint8_t> packed;
+  int pack_handle = -1;
+  if (pack_slot >= 0) {
+    LARGE_INTEGER pk0{}, pk1{}, pkf{};
+    if (jtimed) QueryPerformanceCounter(&pk0);
+    /* Start the pack here and finish it on the output stage: the kernel runs on
+     * this stream, so it reads the slot's picture before any later frame can
+     * reuse it, and the copy runs on a side stream - the next frame's kernels
+     * overlap it and this thread never waits for the ~12 MB it moves.
+     *
+     * Only a *shown* frame streams: a kept frame that is not shown has no output
+     * job to finish (and release) its pack, so it takes the synchronous one,
+     * which fills the bytes the table keeps for a later show_existing_frame. */
+    const bool stream_pack = job->show_frame;
+    if (stream_pack) {
+      pack_handle = decoder_->nv12_pack_begin(pack_slot, job->pitch, &err);
+      if (pack_handle < 0 && !err.empty())
+        ds_debug_log("nv12_pack_begin fell back: %s", err.c_str());
+    }
+    if (pack_handle < 0) {
+      /* the backend cannot stream one (no async copy entry point, or its ring
+       * is busy), or this frame is not shown: the synchronous pack, which waits
+       * for the copy right here */
+      if (!decoder_->to_nv12(pack_slot, job->pitch, &packed, &err)) {
+        pipe_fail("NV12 pack failed on slot " + std::to_string(pack_slot) + " (" +
+                  err + ")");
+        return;
+      }
+    }
+    if (jtimed) {
+      QueryPerformanceCounter(&pk1);
+      QueryPerformanceFrequency(&pkf);
+      static double acc_pack = 0;
+      static long np = 0;
+      acc_pack += double(pk1.QuadPart - pk0.QuadPart) * 1000.0 / double(pkf.QuadPart);
+      if (++np % 50 == 0) {
+        ds_debug_log("perf stage nv12_pack (start, worker): avg %.1f ms over %ld",
+                     acc_pack / np, np);
+        acc_pack = 0;
+        np = 0;
+      }
+    }
+  }
+
   if (job->show_frame) {
     /* The picture goes to the output stage: the worker starts the next frame's
-     * kernels while this one is packed into NV12 and shown. The reference
-     * pool keeps its own copy below, so the picture can be moved. */
+     * kernels while this one is shown. The reference pool keeps its own copy on
+     * the device, so a packed copy is what the stage gets. */
     if (job->slot >= 0) {
       std::lock_guard<std::mutex> lk(pipe_mutex_);
       for (int i = 0; i < 8; ++i) {
         if (!(job->refresh_flags & (1 << i))) continue;
         pipe_picture_[i] = picture;
         pipe_valid_[i] = true;
+        /* the packed bytes, or the handle that produces them: a
+         * show_existing_frame names this slot later and re-emits the same
+         * picture, so whichever form it is in has to be kept here */
+        pipe_nv12_[i] = packed;
+        pipe_pack_handle_[i] = pack_handle;
       }
     }
-    queue_output(std::move(picture), job->pitch, job->sink);
+    queue_output(std::move(picture), job->pitch, job->sink, std::move(packed),
+                 pack_handle);
   } else if (job->slot >= 0) {
     std::lock_guard<std::mutex> lk(pipe_mutex_);
     for (int i = 0; i < 8; ++i) {
       if (!(job->refresh_flags & (1 << i))) continue;
       pipe_picture_[i] = picture;
       pipe_valid_[i] = true;
+      pipe_nv12_[i] = packed;
+      pipe_pack_handle_[i] = pack_handle;
     }
   }
 
@@ -595,6 +732,9 @@ void StreamDecoder::abort_pipe() {
   std::vector<int> orphan_slots;
   if (worker_.joinable()) {
     std::unique_lock<std::mutex> lk(pipe_mutex_);
+    /* Tell the planner to abandon the plan it is building: a keyframe plan at 4K
+     * costs 40-80 ms, and waiting it out is most of what a seek's reset paid. */
+    flush_cancel_.store(true, std::memory_order_relaxed);
     /* Everything queued so far belongs to the old stream. */
     ++generation_;
     for (auto& job : jobs_) {
@@ -614,8 +754,18 @@ void StreamDecoder::abort_pipe() {
       job.frame_plan = nullptr;
     }
     ready_jobs_.clear();
+    /* The queue is empty and everything that comes next is the new stream's:
+     * the worker may run again (see worker_generation_). */
+    worker_generation_ = generation_;
     /* The pictures that were decoded but not shown yet belong to the old
-     * stream as well. */
+     * stream as well. A streamed pack's handle has to be handed back even
+     * though its bytes are dropped, or the ring entry stays busy forever. */
+    for (auto& job : out_jobs_) {
+      if (job.pack_handle >= 0) {
+        decoder_->nv12_pack_release(job.pack_handle);
+        job.pack_handle = -1;
+      }
+    }
     out_jobs_.clear();
     ds_debug_log("abort_pipe: planner/worker idle, waiting for output idle");
     /* output_busy_ is true while output_loop() is inside emit(), which calls
@@ -627,7 +777,21 @@ void StreamDecoder::abort_pipe() {
       ds_debug_log("abort_pipe: output busy timeout, forcing output_busy_=false");
       output_busy_ = false;
     }
-    for (int i = 0; i < 8; ++i) pipe_valid_[i] = false;
+    for (int i = 0; i < 8; ++i) {
+      pipe_valid_[i] = false;
+      pipe_nv12_[i].clear();
+      /* the queued output jobs' handles were handed back above; the ones only
+       * this table holds belong to frames that were dropped, so they are freed
+       * here */
+      if (pipe_pack_handle_[i] >= 0) {
+        decoder_->nv12_pack_release(pipe_pack_handle_[i]);
+        pipe_pack_handle_[i] = -1;
+      }
+    }
+    /* The pictures that were queued but not shown are gone, so no output job
+     * holds a slot any more: the deferred releases (the holds list) become
+     * ordinary ones again. The output thread was forced idle above, so it will
+     * not come back for them. */
     pipe_failed_ = false;
     ds_debug_log("abort_pipe: output idle, pipe_valid cleared");
   }
@@ -635,6 +799,9 @@ void StreamDecoder::abort_pipe() {
   planner_cv_.notify_all();
   worker_cv_.notify_all();
   front_cv_.notify_all(); /* wake any submit_frontend_task() waiting on space */
+  /* The planner is idle again (waited for above), so no plan is being built:
+   * clear the cancel flag before the new stream's frames are planned. */
+  flush_cancel_.store(false, std::memory_order_relaxed);
 
   /* Now the in-flight frontend task can leave queue_job() (generation changed)
    * and finish, which releases front_busy_. */
@@ -704,6 +871,29 @@ bool StreamDecoder::init(std::string* error) {
    * decode_obu). AV1GPU_SKIP_INVISIBLE=0 turns the skip off. */
   skip_invisible_ = true;
   if (const char* e = std::getenv("AV1GPU_SKIP_INVISIBLE")) skip_invisible_ = e[0] != '0';
+  /* The device pack: a shown frame's picture is packed into NV12 on the device
+   * (from the reference slot it is still in, straight after the decode, on the
+   * worker thread) instead of being read back to the host and packed there. It
+   * moves far less data - at 4K the ~38 MB picture read back becomes the ~12 MB
+   * packed output - and it makes the output stage 3.7 ms faster (4.7 against
+   * 8.4), but it measures neutral end to end on this driver, so it is off by
+   * default. Back to back, 200 frames at a time: 4K 52.7 ms/frame with the host
+   * pack against 52.8 with the streamed one, while the worker itself is 4 ms
+   * faster (its read back goes from 6.3 ms to 0.3) - the cadence is bound
+   * elsewhere, so a faster worker does not show up in it.
+   *
+   * The plumbing is complete and bit exact (ctest 35/35, the recorded hashes,
+   * test_ds_core's device comparison): the engine records the layout of every
+   * slot it decodes into, the kernel and its copy share the decode stream, and
+   * the ring is released by whichever stage holds the handle. Two things had to
+   * be true for it to be correct at all: an event recorded on the legacy stream
+   * does not order a non-blocking stream's work (so the copy shares the decode
+   * stream), and only a *shown* frame streams, because a frame that is merely
+   * kept has no output job to release its ring entry.
+   * AV1GPU_DEVICE_PACK=1 turns it on. */
+  device_pack_ = 0;
+  if (const char* e = std::getenv("AV1GPU_DEVICE_PACK"))
+    device_pack_ = (e[0] == '0') ? 0 : (decoder_->packs_nv12_on_device() ? 1 : 0);
   return true;
 }
 
@@ -786,7 +976,8 @@ bool StreamDecoder::push(const uint8_t* data, size_t size, size_t pitch,
 }
 
 bool StreamDecoder::emit(const Frame& picture, size_t pitch, const Sink& sink,
-                         std::string* error) {
+                         std::string* error, const std::vector<uint8_t>* pre_packed,
+                         int pack_handle) {
   if (picture.ss_x != 1 || picture.ss_y != 1) {
     /* NV12 cannot carry 4:4:4 or 4:2:2; the output negotiates NV12, so a frame
      * like this is dropped rather than shown with wrong chroma. */
@@ -800,9 +991,25 @@ bool StreamDecoder::emit(const Frame& picture, size_t pitch, const Sink& sink,
   }
   std::vector<uint8_t> nv12;
   const auto pc0 = std::chrono::steady_clock::now();
-  if (!frame_to_nv12(picture, pitch, &nv12)) {
-    *error = "NV12 pack failed (geometry " + std::to_string(picture.width) + "x" +
-             std::to_string(picture.height) + ", pitch " + std::to_string(pitch) + ")";
+  if (pack_handle >= 0) {
+    /* The pack was started on the worker, on the decode stream, and the copy on
+     * a side stream into page locked memory: waiting for it here is the whole
+     * point - the decode of the next frame overlapped it. */
+    if (!decoder_->nv12_pack_wait(pack_handle, &nv12, error)) return false;
+    decoder_->nv12_pack_release(pack_handle);
+  } else if (pre_packed) {
+    /* The pack already ran, on the worker, off the slot the picture is still
+     * in: it is the only copy of the pixels, so nothing is read back here. */
+    nv12 = *pre_packed;
+  } else if (!picture.empty()) {
+    /* The host picture is the one that was read back. */
+    if (!frame_to_nv12(picture, pitch, &nv12)) {
+      *error = "NV12 pack failed (geometry " + std::to_string(picture.width) + "x" +
+               std::to_string(picture.height) + ", pitch " + std::to_string(pitch) + ")";
+      return false;
+    }
+  } else {
+    *error = "the picture was not read back and no packed copy was made";
     return false;
   }
   const auto pc1 = std::chrono::steady_clock::now();
@@ -989,7 +1196,15 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
 
   frontend::DequantisedTile quant;
   QueryPerformanceCounter(&pc0);
-  frontend::dequantise_tile(frame, st->seq.bit_depth, decoded, &quant);
+  /* The device expands the levels into the raster pool itself when the backend
+   * says it does (the CUDA backend's av1g_k_dequant): the fill here would be
+   * ~10 ms a frame of work whose result then travels over the bus, so it is
+   * skipped and only the bookkeeping the plan needs is produced. The engine
+   * takes the same decision when it builds the plan - see plan_for's
+   * host_fills_pools - and a syntax with no coded levels takes the host path
+   * either way, where there is nothing to fill. */
+  const bool levels_only = decoder_ && decoder_->dequantises_on_device();
+  frontend::dequantise_tile(frame, st->seq.bit_depth, decoded, &quant, levels_only);
   QueryPerformanceCounter(&pc1);
   deq_ms = perf.ms(pc0, pc1);
   st_deq.add(deq_ms);
@@ -1169,7 +1384,7 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
       LARGE_INTEGER f0{}, f1{}, ff{};
       QueryPerformanceFrequency(&ff);
       QueryPerformanceCounter(&f0);
-      if (!frontend::plan_from_tile(seq_copy, frame_copy, decoded_move, std::move(quant_move),
+      if (!frontend::plan_from_tile(seq_copy, frame_copy, std::move(decoded_move), std::move(quant_move),
                                     &syntax, &err, &refs_copy)) {
         pipe_fail(err.empty() ? "frontend: the frame could not be planned" : err);
         return;
@@ -1224,7 +1439,10 @@ bool StreamDecoder::decode_obu(frontend::ObuType type, const uint8_t* data, size
   ++decoded_;
 
   if (frame.show_frame) {
-    if (!emit(picture, pitch, sink, error)) return false;
+    /* The synchronous path: this call read the picture back, so the pack runs
+     * on the host (there is no slot the output stage could use - the slot this
+     * frame took is released by the caller, and the picture is the only copy). */
+    if (!emit(picture, pitch, sink, error, nullptr, -1)) return false;
   }
 
   /* Hand the picture to the AV1 slots this frame refreshes. */

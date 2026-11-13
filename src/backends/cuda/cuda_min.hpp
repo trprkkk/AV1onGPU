@@ -37,14 +37,16 @@ using CUcontext = void*;
 using CUmodule = void*;
 using CUfunction = void*;
 using CUstream = void*;
+using CUevent = void*;
 using CUdeviceptr = unsigned long long;
 using CUgraph = void*;
 using CUgraphNode = void*;
 using CUgraphExec = void*;
 
-/* CUDA 12 changed cuGraphAddKernelNode to take this struct instead of the
- * (function, parameter array) pair of CUDA 10/11; the layout below is the one
- * the CUDA 12 and 13 headers define. */
+/* CUDA 11.8 header layout (which the 13.x driver accepts via the unversioned
+ * cuGraphAddKernelNode symbol): no hStream field. The CUDA 12 layout inserts
+ * hStream before kernelParams, which shifts the fields and is rejected by
+ * this driver with rc=700/1. */
 struct CUDA_KERNEL_NODE_PARAMS {
   CUfunction func;
   unsigned int gridDimX;
@@ -54,7 +56,6 @@ struct CUDA_KERNEL_NODE_PARAMS {
   unsigned int blockDimY;
   unsigned int blockDimZ;
   unsigned int sharedMemBytes;
-  CUstream hStream;
   void** kernelParams;
   void** extra;
 };
@@ -90,6 +91,10 @@ struct Driver {
   CUresult (*MemFree)(CUdeviceptr);
   CUresult (*MemcpyHtoD)(CUdeviceptr, const void*, size_t);
   CUresult (*MemcpyDtoH)(void*, CUdeviceptr, size_t);
+  /* the asynchronous copy, for a read back that runs beside the decode it
+   * follows; may be null on a driver that does not export it, in which case
+   * the caller falls back to the synchronous one */
+  CUresult (*MemcpyDtoHAsync)(void*, CUdeviceptr, size_t, CUstream);
   CUresult (*MemcpyDtoD)(CUdeviceptr, CUdeviceptr, size_t);
   CUresult (*MemAllocHost)(void**, size_t); /* page-locked host memory */
   CUresult (*MemFreeHost)(void*);
@@ -97,17 +102,30 @@ struct Driver {
   CUresult (*ModuleGetFunction)(CUfunction*, CUmodule, const char*);
   CUresult (*LaunchKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned,
                            unsigned, unsigned, CUstream, void**, void**);
+  /* cuLaunchKernelEx (CUDA 11.8+), may be null. CUlaunchConfig layout:
+   * gridDimX/Y/Z, blockDimX/Y/Z, sharedMemBytes, hStream, attrs, numAttrs */
+  CUresult (*LaunchKernelEx)(const void* config, CUfunction,
+                             void** kernelParams, void** extra);
   /* graphs: one submission for the whole frame instead of a kernel launch per
-   * wave, which is what a keyframe's several hundred waves cost on WDDM */
+   * wave, which is what a keyframe's several hundred waves cost on WDDM.
+   * CUDA 12 API: parameters ride in a struct. */
   CUresult (*GraphCreate)(CUgraph*, unsigned);
-  /* CUDA 12 and up: the parameters ride in a struct */
   CUresult (*GraphAddKernelNode)(CUgraphNode*, CUgraph, const CUgraphNode*, size_t,
-                                 const CUDA_KERNEL_NODE_PARAMS*);
-  CUresult (*GraphAddDependencies)(CUgraph, const CUgraphNode*, const CUgraphNode*, size_t);
-  CUresult (*GraphInstantiate)(CUgraphExec*, CUgraph, unsigned long long);
+                                 const CUDA_KERNEL_NODE_PARAMS*);  CUresult (*GraphAddDependencies)(CUgraph, const CUgraphNode*, const CUgraphNode*, size_t);
+  /* cuGraphInstantiate unversioned symbol = v2: 5 args (errorNode, logBuf, logBufSize) */
+  CUresult (*GraphInstantiate)(CUgraphExec*, CUgraph, CUgraphNode*, char*, size_t);
   CUresult (*GraphLaunch)(CUgraphExec, CUstream);
   CUresult (*GraphExecDestroy)(CUgraphExec);
   CUresult (*GraphDestroy)(CUgraph);
+  /* Stream for graph kernel nodes - WDDM drivers may reject nullptr hStream */
+  CUresult (*StreamCreate)(CUstream*, unsigned);
+  CUresult (*StreamDestroy)(CUstream);
+  CUresult (*StreamWaitEvent)(CUstream, CUevent, unsigned);
+  CUresult (*StreamSynchronize)(CUstream);
+  /* stream capture: records the kernel launches of a frame into a CUDA graph
+   * without touching the versioned CUDA_KERNEL_NODE_PARAMS ABI. Optional. */
+  CUresult (*StreamBeginCapture)(CUstream, unsigned);
+  CUresult (*StreamEndCapture)(CUstream, CUgraph*);
 };
 
 struct Nvrtc {

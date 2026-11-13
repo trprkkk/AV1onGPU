@@ -166,10 +166,16 @@ int main(int argc, char** argv) {
       if (has_size) {
         size_t v = 0;
         int shift = 0;
-        for (int k = 0; k < 8 && body < n; ++k, ++body) {
-          v |= static_cast<size_t>(u[body] & 0x7f) << shift;
+        for (int k = 0; k < 8 && body < n; ++k) {
+          /* the size byte itself is consumed either way: the old loop left
+           * `body` pointing at the last size byte (the `break` skipped the
+           * increment), so the frame header byte below was really the size
+           * byte - and a mid sized frame's final leb128 byte is small enough
+           * to look like a key frame header. */
+          const uint8_t byte = u[body++];
+          v |= static_cast<size_t>(byte & 0x7f) << shift;
           shift += 7;
-          if (!(u[body] & 0x80)) break;
+          if (!(byte & 0x80)) break;
         }
         len = v;
       }
@@ -214,6 +220,16 @@ int main(int argc, char** argv) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
         .count();
   };
+  /* What a player sees as seek latency: the time reset_stream() (EndFlush /
+   * NewSegment) takes to drain the pipe, and the time from there to the first
+   * frame the renderer receives. The seek happens on this thread and the
+   * delivery on the output thread, so the flag is an atomic and the sink only
+   * reads it. */
+  std::atomic<bool> seek_waiting{false};
+  double seek_pending_since = 0.0;
+  std::vector<double> seek_latency;
+  double seek_reset_total = 0.0, seek_reset_worst = 0.0;
+  size_t seek_count = 0;
   av1gpu::dsfilter::StreamDecoder::Sink sink =
       [&](const std::vector<uint8_t>& nv12, int w, int h, std::string* sink_error) -> bool {
     (void)w;
@@ -222,6 +238,10 @@ int main(int argc, char** argv) {
     if (copy_sink) {
       renderer.resize(nv12.size());
       std::memcpy(renderer.data(), nv12.data(), nv12.size());
+    }
+    if (seek_waiting.load(std::memory_order_acquire)) {
+      seek_latency.push_back(since0() - seek_pending_since);
+      seek_waiting.store(false, std::memory_order_release);
     }
     if (cadence) {
       const auto now = std::chrono::steady_clock::now();
@@ -261,7 +281,15 @@ int main(int argc, char** argv) {
                          (seek_every > 0 && unit > (seek_at < 0 ? 0 : seek_at) &&
                           (unit - (seek_at < 0 ? 0 : seek_at)) % seek_every == 0);
     if (do_seek) {
+      const auto s0 = std::chrono::steady_clock::now();
       decoder.reset_stream(); /* what EndFlush/NewSegment do on a seek */
+      const auto s1 = std::chrono::steady_clock::now();
+      const double reset_ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
+      seek_reset_total += reset_ms;
+      if (reset_ms > seek_reset_worst) seek_reset_worst = reset_ms;
+      ++seek_count;
+      seek_pending_since = since0();
+      seek_waiting.store(true, std::memory_order_release);
       if (push_log.is_open()) push_log << "SEEK at unit " << i << "\n";
       /* like a real seek: resume at the next keyframe unit */
       size_t j = i + 1;
@@ -323,6 +351,21 @@ int main(int argc, char** argv) {
                 "over 41.7 ms: %zu/%zu\n",
                 sum / static_cast<double>(intervals.size()), pct(0.50), pct(0.90),
                 pct(0.99), sorted.back(), over, intervals.size());
+  }
+  if (seek_count > 0) {
+    std::vector<double> sorted = seek_latency;
+    std::sort(sorted.begin(), sorted.end());
+    const auto pct = [&](double p) {
+      return sorted.empty() ? 0.0 : sorted[static_cast<size_t>(p * (sorted.size() - 1))];
+    };
+    double sum = 0;
+    for (double v : seek_latency) sum += v;
+    std::printf("seek: %zu seek(s), reset avg %.2f ms (worst %.2f), first frame after "
+                "seek: %zu delivered, avg %.2f, p90 %.2f, max %.2f ms\n",
+                seek_count, seek_reset_total / static_cast<double>(seek_count), seek_reset_worst,
+                seek_latency.size(),
+                seek_latency.empty() ? 0.0 : sum / static_cast<double>(seek_latency.size()),
+                pct(0.90), sorted.empty() ? 0.0 : sorted.back());
   }
   return 0;
 }
