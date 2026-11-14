@@ -1075,20 +1075,28 @@ HRESULT InputPin::Receive(IMediaSample* sample) {
        * into a renderer that is not there any more */
       return true;
     }
+    /* A frame that ends before the segment starts is one the renderer would
+     * drop: the splitter resumed at the keyframe before the seek point. The
+     * hold has to be re-evaluated for *every* frame - a frame the decoder held
+     * never reaches the delivery below, so without this a gate that closed once
+     * would never open again and the picture would freeze after a seek. */
+    const REFERENCE_TIME next_start = timing->start + timing->dur;
+    const bool past = next_start <= filter->segment_start();
+    const bool hold_next = next_start + timing->dur <= filter->segment_start();
+    if (core_shared) core_shared->hold_output(hold_next);
     if (nv12.empty()) {
-      /* held by the decoder (a seek's catch-up frames): nothing to deliver,
-       * but the timing advances in step so the later frames keep theirs */
-      timing->start += timing->dur;
+      /* held by the decoder: nothing to deliver, but the timing advances in
+       * step so the later frames keep theirs */
+      timing->start = next_start;
       return true;
     }
-    /* A frame that ends before the segment starts is one the renderer would
-     * drop: the splitter resumed at the keyframe before the seek point. Tell
-     * the decoder to hold the next ones too, so the catch-up neither spends
-     * the pack on them nor shows up as a burst of out-of-order frames. */
-    const bool past = timing->start + timing->dur <= filter->segment_start();
-    if (core_shared) core_shared->hold_output(past);
-    const HRESULT hr = out->deliver(nv12, w, h, timing->start,
-                                    timing->start + timing->dur,
+    if (past) {
+      /* dropped: past the renderer's discard point, and no pack should be
+       * spent on it (the decoder's hold makes the next ones cheaper) */
+      timing->start = next_start;
+      return true;
+    }
+    const HRESULT hr = out->deliver(nv12, w, h, timing->start, next_start,
                                     timing->discontinuity);
     timing->discontinuity = false; /* only the first frame after a seek carries it */
     timing->start += timing->dur;

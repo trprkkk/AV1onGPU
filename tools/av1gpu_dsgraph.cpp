@@ -890,6 +890,41 @@ int main(int argc, char** argv) {
     if (after == 0) die("no frames after a flush and re-feed");
   }
 
+  /* 6b. a seek into the middle of the GOP: the splitter resumes at the key
+   * frame *before* the seek point and delivers the frames between with
+   * timestamps in the past. The decoder must hold them (the renderer would
+   * drop them) and then resume delivering - a hold that never reopened froze
+   * the picture after a seek, which is what this round guards. */
+  {
+    in_pin->BeginFlush();
+    in_pin->EndFlush();
+    /* seek to the third frame: the units arrive from the key frame before it */
+    const REFERENCE_TIME target = 2 * 333667;
+    in_pin->NewSegment(target, 0, 1.0);
+    const size_t before = sink.frames();
+    now = 0;
+    for (size_t i = 0; i < units.size() && i < 4; ++i) {
+      const REFERENCE_TIME start = now;
+      now += 333667;
+      FakeSample sample(units[i].data.data(), static_cast<long>(units[i].data.size()),
+                        start, now, i == 0);
+      hr = input->Receive(&sample);
+      if (FAILED(hr)) {
+        input->Release();
+        die("Receive after the seek failed on unit " + std::to_string(i), hr);
+      }
+    }
+    hr = in_pin->EndOfStream();
+    if (FAILED(hr)) die("EndOfStream after the seek", hr);
+    const size_t after = sink.frames() - before;
+    std::printf("  seek to frame 3 with the GOP resuming at frame 0: %zu frame(s) "
+                "delivered of 4 fed\n", after);
+    if (after == 0)
+      die("the output gate stayed closed after the seek: the picture would freeze");
+    if (after >= 4)
+      die("the catch-up frames were delivered: a renderer shows them as a burst");
+  }
+
   /* 6. a Stop/Pause cycle: Stop decommits the allocator, Pause commits it
    * again, and the decoder still decodes */
   hr = filter->Stop();
